@@ -1,0 +1,25 @@
+# Core framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9   # required for UploadFile
+pydantic>=2.7.0
+httpx>=0.27.0              # used by Ollama provider
+
+# OCR – install ONE of these depending on your OCR_PROVIDER:
+# tesseract (default, free, local):
+pytesseract>=0.3.10
+Pillow>=10.3.0
+pdf2image>=1.17.0          # converts PDF pages to PIL images for Tesseract
+
+# AWS Textract (optional):
+# boto3>=1.34.0
+
+# Google Vision (optional):
+# google-cloud-vision>=3.7.0
+
+# LLM – install ONE of these depending on your LLM_PROVIDER:
+# OpenAI (default):
+openai>=1.30.0
+
+# Ollama (optional, free local LLM):
+# No extra pip install needed – uses httpx (already listed above)

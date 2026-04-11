@@ -17,15 +17,18 @@ import {
   Tag,
   AlertCircle,
   Pencil,
+  AlertTriangle,
+  X,
 } from "lucide-react";
 import { useNavigate } from "react-router";
 import { useSuppliers } from "../context/SupplierContext";
 import clsx from "clsx";
 import Papa from "papaparse";
+import { extractFromFile, ApiError, type ExtractResult } from "../lib/apiClient";
 
 /* ─── Types ──────────────────────────────────────────────── */
 type FieldStatus = "pending" | "inferring" | "done";
-type DocStage = "scanning" | "inferring" | "ready";
+type DocStage = "scanning" | "inferring" | "ready" | "error";
 
 interface FieldState {
   value: string;
@@ -37,6 +40,8 @@ interface DocItem {
   fileName: string;
   fileType: string;
   stage: DocStage;
+  errorMessage?: string;
+  warnings?: string[];
   fields: {
     name: FieldState;
     abn: FieldState;
@@ -59,33 +64,70 @@ const FIELD_META = [
   { key: "commodity" as const, label: "Commodity", icon: Tag, span: true },
 ];
 
-const MOCK_POOL = [
-  { name: "GreenLeaf Timber Co", abn: "53 004 085 616", address: "14 Mill Road, Daintree QLD 4873", commodity: "Timber" },
-  { name: "Oceanic Fisheries Pty Ltd", abn: "12 345 678 901", address: "7 Harbour View, Fremantle WA 6160", commodity: "Seafood" },
-  { name: "Murray Basin Grains", abn: "98 765 432 100", address: "Lot 5, Hay NSW 2711", commodity: "Grain" },
-  { name: "TasPure Salmon", abn: "44 123 456 789", address: "Macquarie Harbour, Strahan TAS 7468", commodity: "Salmon" },
-  { name: "Barossa Valley Wines", abn: "44 556 677 889", address: "23 Vine Lane, Tanunda SA 5352", commodity: "Wine Grapes" },
-  { name: "Kakadu Wild Foods", abn: "66 778 899 001", address: "Jabiru NT 0886", commodity: "Bush Foods" },
-  { name: "Pilbara Mining Svcs", abn: "11 223 344 556", address: "Newman WA 6753", commodity: "Iron Ore" },
-];
-
-let poolIndex = 0;
-const nextMock = (fileName: string) => {
-  const lc = fileName.toLowerCase();
-  if (lc.includes("timber") || lc.includes("green")) return MOCK_POOL[0];
-  if (lc.includes("ocean") || lc.includes("fish")) return MOCK_POOL[1];
-  if (lc.includes("grain") || lc.includes("murray")) return MOCK_POOL[2];
-  const m = MOCK_POOL[poolIndex % MOCK_POOL.length];
-  poolIndex++;
-  return m;
-};
-
 const emptyFields = (): DocItem["fields"] => ({
   name: { value: "", status: "pending" },
   abn: { value: "", status: "pending" },
   address: { value: "", status: "pending" },
   commodity: { value: "", status: "pending" },
 });
+
+/** Animate all fields into the "inferring" shimmer state, then populate
+ *  field-by-field with the values returned from the API, replicating the
+ *  original staggered animation so the UX is unchanged. */
+function applyExtractResult(
+  id: string,
+  result: ExtractResult,
+  setItems: React.Dispatch<React.SetStateAction<DocItem[]>>
+) {
+  const fieldOrder: Array<keyof DocItem["fields"]> = ["name", "abn", "address", "commodity"];
+  const values: Record<keyof DocItem["fields"], string> = {
+    name: result.name,
+    abn: result.abn,
+    address: result.address,
+    commodity: result.commodity,
+  };
+
+  // Switch card to "inferring" stage (shows field shimmer)
+  setItems((prev) =>
+    prev.map((it) => (it.id === id ? { ...it, stage: "inferring" as DocStage } : it))
+  );
+
+  // Stagger each field: shimmer → value
+  fieldOrder.forEach((field, idx) => {
+    const base = idx * 380;
+
+    setTimeout(() => {
+      setItems((prev) =>
+        prev.map((it) =>
+          it.id === id
+            ? { ...it, fields: { ...it.fields, [field]: { value: "", status: "inferring" as FieldStatus } } }
+            : it
+        )
+      );
+    }, base);
+
+    setTimeout(() => {
+      setItems((prev) =>
+        prev.map((it) =>
+          it.id === id
+            ? { ...it, fields: { ...it.fields, [field]: { value: values[field], status: "done" as FieldStatus } } }
+            : it
+        )
+      );
+    }, base + 320);
+  });
+
+  // Mark card ready after all fields are populated
+  setTimeout(() => {
+    setItems((prev) =>
+      prev.map((it) =>
+        it.id === id
+          ? { ...it, stage: "ready" as DocStage, warnings: result.warnings ?? [] }
+          : it
+      )
+    );
+  }, fieldOrder.length * 380 + 380);
+}
 
 /* ─── Scanning animation ─────────────────────────────────── */
 function ScanAnimation({ fileName }: { fileName: string }) {
@@ -281,55 +323,28 @@ export function UploadExtractPage() {
   const { addSupplier } = useSuppliers();
   const [items, setItems] = useState<DocItem[]>([]);
 
-  /* ── Inference simulator ── */
-  const runInference = useCallback((id: string, mock: typeof MOCK_POOL[0]) => {
-    const fieldOrder: Array<keyof DocItem["fields"]> = ["name", "abn", "address", "commodity"];
-    const values = {
-      name: mock.name,
-      abn: mock.abn,
-      address: mock.address,
-      commodity: mock.commodity,
-    };
+  /* ── Core: call the real backend, animate the result ── */
+  const runExtract = useCallback(async (id: string, file: File) => {
+    try {
+      // 1. Upload file to backend — the scan animation is already showing
+      const result = await extractFromFile(file);
 
-    // Switch to inferring stage after scan
-    setTimeout(() => {
+      // 2. Animate the fields in with the real data
+      applyExtractResult(id, result, setItems);
+    } catch (err) {
+      const message =
+        err instanceof ApiError
+          ? `Server error ${err.status}: ${err.message}`
+          : err instanceof Error
+          ? err.message
+          : "Unexpected error during extraction";
+
       setItems((prev) =>
-        prev.map((it) => (it.id === id ? { ...it, stage: "inferring" as DocStage } : it))
+        prev.map((it) =>
+          it.id === id ? { ...it, stage: "error" as DocStage, errorMessage: message } : it
+        )
       );
-
-      fieldOrder.forEach((field, idx) => {
-        const baseDelay = idx * 380;
-
-        // Start inferring this field
-        setTimeout(() => {
-          setItems((prev) =>
-            prev.map((it) =>
-              it.id === id
-                ? { ...it, fields: { ...it.fields, [field]: { value: "", status: "inferring" as FieldStatus } } }
-                : it
-            )
-          );
-        }, baseDelay);
-
-        // Resolve to done with value
-        setTimeout(() => {
-          setItems((prev) =>
-            prev.map((it) =>
-              it.id === id
-                ? { ...it, fields: { ...it.fields, [field]: { value: values[field], status: "done" as FieldStatus } } }
-                : it
-            )
-          );
-        }, baseDelay + 320);
-      });
-
-      // After all fields done, mark ready
-      setTimeout(() => {
-        setItems((prev) =>
-          prev.map((it) => (it.id === id ? { ...it, stage: "ready" as DocStage } : it))
-        );
-      }, fieldOrder.length * 380 + 380);
-    }, 1100);
+    }
   }, []);
 
   /* ── Drop handler ── */
@@ -338,11 +353,12 @@ export function UploadExtractPage() {
       acceptedFiles.forEach((file) => {
         const isCsv = file.type === "text/csv" || file.name.endsWith(".csv");
 
+        // ── CSV: parse client-side with PapaParse, no backend needed ──
         if (isCsv) {
           Papa.parse(file, {
             header: true,
             complete: (results) => {
-              (results.data as any[]).forEach((row) => {
+              (results.data as Record<string, string>[]).forEach((row) => {
                 if (!row.name && !row.supplierName && !row.abn) return;
                 const id = Math.random().toString(36).substring(7);
                 const csvItem: DocItem = {
@@ -351,10 +367,10 @@ export function UploadExtractPage() {
                   fileType: "csv",
                   stage: "ready",
                   fields: {
-                    name: { value: row.name || row.supplierName || row.Supplier || "", status: "done" },
-                    abn: { value: row.abn || row.ABN || "", status: "done" },
-                    address: { value: row.address || row.Address || "", status: "done" },
-                    commodity: { value: row.commodity || row.Commodity || "", status: "done" },
+                    name:      { value: row.name      || row.supplierName || row.Supplier || "", status: "done" },
+                    abn:       { value: row.abn       || row.ABN          || "",              status: "done" },
+                    address:   { value: row.address   || row.Address      || "",              status: "done" },
+                    commodity: { value: row.commodity || row.Commodity    || "",              status: "done" },
                   },
                 };
                 setItems((prev) => [...prev, csvItem]);
@@ -364,8 +380,8 @@ export function UploadExtractPage() {
           return;
         }
 
+        // ── PDF / Image: send to backend OCR ──
         const id = Math.random().toString(36).substring(7);
-        const mock = nextMock(file.name);
 
         setItems((prev) => [
           ...prev,
@@ -378,20 +394,21 @@ export function UploadExtractPage() {
           },
         ]);
 
-        runInference(id, mock);
+        // Fire-and-forget — errors are caught inside runExtract
+        runExtract(id, file);
       });
     },
-    [runInference]
+    [runExtract]
   );
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
     accept: {
       "application/pdf": [".pdf"],
-      "image/*": [".png", ".jpg", ".jpeg", ".webp", ".tiff"],
-      "text/csv": [".csv"],
+      "image/*":         [".png", ".jpg", ".jpeg", ".webp", ".tiff"],
+      "text/csv":        [".csv"],
     },
-    noClick: false,
+    noClick:    false,
     noKeyboard: false,
   });
 
@@ -407,27 +424,44 @@ export function UploadExtractPage() {
     setItems((prev) => prev.filter((it) => it.id !== id));
   };
 
+  const handleRetry = useCallback(
+    (id: string) => {
+      // Find the original file — we can't retry without the File object.
+      // Reset to scanning so the user knows to re-drop the file.
+      setItems((prev) =>
+        prev.map((it) =>
+          it.id === id
+            ? { ...it, stage: "scanning", errorMessage: undefined, fields: emptyFields() }
+            : it
+        )
+      );
+    },
+    []
+  );
+
   const handleContinue = () => {
     items
       .filter((it) => it.stage === "ready")
       .forEach((it) => {
         addSupplier({
-          name: it.fields.name.value,
-          abn: it.fields.abn.value,
-          address: it.fields.address.value,
+          name:      it.fields.name.value,
+          abn:       it.fields.abn.value,
+          address:   it.fields.address.value,
           commodity: it.fields.commodity.value,
-          fileName: it.fileName,
-          fileType: it.fileType as any,
-          status: "pending",
+          fileName:  it.fileName,
+          fileType:  it.fileType as "pdf" | "image" | "csv",
+          status:    "pending",
           isValidated: false,
+          warnings:  it.warnings ?? [],
         });
       });
     navigate("/enrichment");
   };
 
-  const readyCount = items.filter((it) => it.stage === "ready").length;
-  const processingCount = items.filter((it) => it.stage !== "ready").length;
-  const canContinue = readyCount > 0 && processingCount === 0;
+  const readyCount      = items.filter((it) => it.stage === "ready").length;
+  const processingCount = items.filter((it) => it.stage === "scanning" || it.stage === "inferring").length;
+  const errorCount      = items.filter((it) => it.stage === "error").length;
+  const canContinue     = readyCount > 0 && processingCount === 0;
 
   /* ─── Render ─── */
   return (
@@ -449,12 +483,13 @@ export function UploadExtractPage() {
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: "auto" }}
             exit={{ opacity: 0, height: 0 }}
-            className="grid grid-cols-3 gap-3"
+            className="grid grid-cols-4 gap-3"
           >
             {[
-              { label: "Uploaded", value: items.length, color: "blue" },
+              { label: "Uploaded",   value: items.length,    color: "blue"   },
               { label: "Processing", value: processingCount, color: "indigo" },
-              { label: "Ready", value: readyCount, color: "emerald" },
+              { label: "Ready",      value: readyCount,      color: "emerald" },
+              { label: "Errors",     value: errorCount,      color: "red"    },
             ].map(({ label, value, color }) => (
               <div
                 key={label}
@@ -463,9 +498,10 @@ export function UploadExtractPage() {
                 <div
                   className={clsx(
                     "w-9 h-9 rounded-lg flex items-center justify-center text-xs",
-                    color === "blue" ? "bg-blue-50 text-blue-700" :
-                    color === "indigo" ? "bg-indigo-50 text-indigo-600" :
-                    "bg-emerald-50 text-emerald-600"
+                    color === "blue"    ? "bg-blue-50    text-blue-700"    :
+                    color === "indigo"  ? "bg-indigo-50  text-indigo-600"  :
+                    color === "emerald" ? "bg-emerald-50 text-emerald-600" :
+                                         "bg-red-50     text-red-500"
                   )}
                   style={{ fontWeight: 700 }}
                 >
@@ -541,10 +577,11 @@ export function UploadExtractPage() {
       <div className="space-y-4">
         <AnimatePresence mode="popLayout">
           {items.map((item) => {
-            const Icon = FILE_ICON[item.fileType] || FileText;
-            const isScanning = item.stage === "scanning";
+            const Icon      = FILE_ICON[item.fileType] || FileText;
+            const isScanning  = item.stage === "scanning";
             const isInferring = item.stage === "inferring";
-            const isReady = item.stage === "ready";
+            const isReady     = item.stage === "ready";
+            const isError     = item.stage === "error";
 
             return (
               <motion.div
@@ -560,6 +597,8 @@ export function UploadExtractPage() {
                     ? "border-slate-200 shadow-sm"
                     : isInferring
                     ? "border-indigo-200 shadow-sm shadow-indigo-100/50"
+                    : isError
+                    ? "border-red-200 shadow-sm shadow-red-100/50"
                     : "border-slate-200"
                 )}
               >
@@ -570,11 +609,9 @@ export function UploadExtractPage() {
                     <div
                       className={clsx(
                         "w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0",
-                        item.fileType === "pdf"
-                          ? "bg-red-50 text-red-500"
-                          : item.fileType === "csv"
-                          ? "bg-green-50 text-green-500"
-                          : "bg-purple-50 text-purple-500"
+                        item.fileType === "pdf"   ? "bg-red-50    text-red-500"   :
+                        item.fileType === "csv"   ? "bg-green-50  text-green-500" :
+                                                    "bg-purple-50 text-purple-500"
                       )}
                     >
                       <Icon className="w-4 h-4" />
@@ -623,6 +660,18 @@ export function UploadExtractPage() {
                         Ready
                       </motion.span>
                     )}
+                    {isError && (
+                      <motion.span
+                        initial={{ scale: 0, opacity: 0 }}
+                        animate={{ scale: 1, opacity: 1 }}
+                        transition={{ type: "spring", stiffness: 400, damping: 20 }}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-red-50 text-red-600 flex-shrink-0"
+                        style={{ fontWeight: 500 }}
+                      >
+                        <X className="w-3 h-3" />
+                        Failed
+                      </motion.span>
+                    )}
                   </div>
 
                   <button
@@ -637,6 +686,41 @@ export function UploadExtractPage() {
                 <div className="px-5 pb-5">
                   {/* Scanning animation */}
                   {isScanning && <ScanAnimation fileName={item.fileName} />}
+
+                  {/* Error state */}
+                  {isError && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="py-5 flex flex-col items-center gap-3 text-center"
+                    >
+                      <div className="w-10 h-10 rounded-xl bg-red-50 flex items-center justify-center">
+                        <AlertTriangle className="w-5 h-5 text-red-400" />
+                      </div>
+                      <div>
+                        <p className="text-sm text-slate-700" style={{ fontWeight: 500 }}>Extraction failed</p>
+                        <p className="text-xs text-slate-400 mt-1 max-w-xs">
+                          {item.errorMessage ?? "Could not extract fields from this document."}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleRemove(item.id)}
+                          className="px-3 py-1.5 text-xs border border-slate-200 text-slate-500 rounded-lg hover:bg-slate-50 transition-colors"
+                          style={{ fontWeight: 500 }}
+                        >
+                          Remove
+                        </button>
+                        <button
+                          onClick={() => handleRetry(item.id)}
+                          className="px-3 py-1.5 text-xs bg-slate-800 text-white rounded-lg hover:bg-slate-700 transition-colors"
+                          style={{ fontWeight: 500 }}
+                        >
+                          Re-drop to retry
+                        </button>
+                      </div>
+                    </motion.div>
+                  )}
 
                   {/* Inferring + Ready: field grid */}
                   {(isInferring || isReady) && (
@@ -656,6 +740,23 @@ export function UploadExtractPage() {
                           stage={item.stage}
                           onUpdate={(key, val) => handleFieldUpdate(item.id, key, val)}
                         />
+                      ))}
+                    </motion.div>
+                  )}
+
+                  {/* Ready: backend warnings */}
+                  {isReady && item.warnings && item.warnings.length > 0 && (
+                    <motion.div
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      transition={{ delay: 0.4 }}
+                      className="mt-3 flex flex-col gap-1"
+                    >
+                      {item.warnings.map((w, i) => (
+                        <p key={i} className="text-[11px] text-amber-600 flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                          {w}
+                        </p>
                       ))}
                     </motion.div>
                   )}
@@ -701,6 +802,11 @@ export function UploadExtractPage() {
               {processingCount > 0 && (
                 <p className="text-xs text-slate-400">
                   {processingCount} document{processingCount > 1 ? "s" : ""} still processing…
+                </p>
+              )}
+              {errorCount > 0 && processingCount === 0 && (
+                <p className="text-xs text-red-400">
+                  {errorCount} document{errorCount > 1 ? "s" : ""} failed — remove or retry
                 </p>
               )}
               <button
