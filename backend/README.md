@@ -1,61 +1,128 @@
-# eco – Backend API
+# eco — Backend
 
-FastAPI service that powers the `UploadExtractPage` OCR + AI extraction flow.
+FastAPI backend for the eco supply-chain risk platform.  
+All components are **free and run 100 % locally** — no API keys required.
 
-## Quick start
+---
+
+## Stack
+
+| Layer | Tool | Cost |
+|-------|------|------|
+| Web framework | FastAPI + Uvicorn | Free |
+| OCR | Tesseract (pytesseract) | Free |
+| LLM | Ollama (llama3.2 / mistral) | Free |
+| ABN enrichment | ABR public JSON API | Free |
+| Geocoding | Nominatim (OpenStreetMap) | Free |
+
+---
+
+## Prerequisites
+
+### 1 — Python 3.11+
+```bash
+python --version   # must be 3.11 or higher
+```
+
+### 2 — System dependencies for Tesseract
+```bash
+# macOS
+brew install tesseract poppler
+
+# Ubuntu / Debian
+sudo apt update && sudo apt install tesseract-ocr poppler-utils -y
+```
+
+### 3 — Ollama (local LLM server)
+```bash
+# macOS
+brew install ollama
+
+# Linux
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull the default model (~2 GB)
+ollama pull llama3.2
+
+# Or a lighter model for slower machines
+ollama pull mistral
+```
+
+---
+
+## Setup
 
 ```bash
 cd backend
+
+# Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+# Install Python dependencies
 pip install -r requirements.txt
 
-# System deps for Tesseract OCR (macOS):
-brew install tesseract poppler
-# Ubuntu / Debian:
-# sudo apt install tesseract-ocr poppler-utils
-
+# Copy the env template (no keys needed!)
 cp .env.example .env
-# Edit .env — set OPENAI_API_KEY (or switch to LLM_PROVIDER=ollama)
+```
 
+---
+
+## Run
+
+```bash
+# Terminal 1 — start Ollama
+ollama serve
+
+# Terminal 2 — start FastAPI
+cd backend
+source .venv/bin/activate
 uvicorn main:app --reload --port 8000
 ```
 
-Health check: http://localhost:8000/api/health
+API docs available at: http://localhost:8000/docs
 
-Swagger UI: http://localhost:8000/docs
+---
 
-## Endpoints
+## Environment variables
 
-| Method | Path          | Description                          |
-|--------|---------------|--------------------------------------|
-| GET    | /api/health   | Liveness check                       |
-| POST   | /api/extract  | Upload PDF/image → extracted fields  |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_MODEL` | `llama3.2` | Ollama model name |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 
-## Configuration
+---
 
-All config is via environment variables (see `.env.example`).
+## API Endpoints
 
-| Variable            | Default        | Description                              |
-|---------------------|----------------|------------------------------------------|
-| `OCR_PROVIDER`      | `tesseract`    | `tesseract` \| `textract` \| `vision`   |
-| `LLM_PROVIDER`      | `openai`       | `openai` \| `ollama`                    |
-| `OPENAI_API_KEY`    | —              | Required when `LLM_PROVIDER=openai`     |
-| `OPENAI_MODEL`      | `gpt-4o-mini`  | Any OpenAI chat model                   |
-| `OLLAMA_MODEL`      | `llama3.2`     | Model name served by local Ollama       |
-| `OLLAMA_BASE_URL`   | `http://localhost:11434` | Ollama server URL           |
+### `POST /api/extract`
+Upload a PDF or image. Returns extracted supplier fields.
 
-## Swapping OCR providers
+**Request:** `multipart/form-data` — field `file`  
+**Response:**
+```json
+{
+  "name":       "Acme Timber Pty Ltd",
+  "abn":        "12 345 678 901",
+  "address":    "42 Forest Rd, Brisbane QLD 4000",
+  "commodity":  "Timber",
+  "confidence": { "name": 0.95, "abn": 0.99, "address": 0.88, "commodity": 0.91 },
+  "warnings":   []
+}
+```
 
-- **Tesseract** (default): Free, runs locally. Best for clean PDFs/images.
-- **AWS Textract**: Higher accuracy on complex layouts. Requires `boto3` + AWS creds.
-- **Google Vision**: Excellent handwriting support. Requires `google-cloud-vision` + service account key.
+**Supported file types:** PDF, PNG, JPEG, WEBP, TIFF  
+**Size limit:** 10 MB
 
-Set `OCR_PROVIDER=textract` or `OCR_PROVIDER=vision` in `.env` and install the corresponding
-package from `requirements.txt`.
+---
 
-## Swapping LLM providers
+## Changing the LLM model
 
-- **OpenAI** (default): Uses `gpt-4o-mini` — fast and cheap. Needs `OPENAI_API_KEY`.
-- **Ollama**: Runs LLaMA 3.2 locally — completely free, no API key needed.
-  Install Ollama from https://ollama.ai then run `ollama pull llama3.2`.
+Edit `.env`:
+```bash
+OLLAMA_MODEL=mistral        # faster on CPU-only machines
+OLLAMA_MODEL=llama3.1:8b   # larger, more accurate
+OLLAMA_MODEL=phi3           # Microsoft Phi-3, very lightweight
+```
+
+Then restart Uvicorn. No code changes needed.

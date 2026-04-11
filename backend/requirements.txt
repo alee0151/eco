@@ -1,25 +1,22 @@
-# Core framework
+# ── Core framework ────────────────────────────────────────────────────────────
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
-python-multipart>=0.0.9   # required for UploadFile
+python-multipart>=0.0.9   # required for UploadFile / multipart form data
 pydantic>=2.7.0
-httpx>=0.27.0              # used by Ollama provider
+httpx>=0.27.0              # used to call Ollama REST API
 
-# OCR – install ONE of these depending on your OCR_PROVIDER:
-# tesseract (default, free, local):
+# ── OCR (Tesseract — free, local) ─────────────────────────────────────────────
+# System dependencies (install once):
+#   macOS  : brew install tesseract poppler
+#   Ubuntu : sudo apt install tesseract-ocr poppler-utils
 pytesseract>=0.3.10
 Pillow>=10.3.0
-pdf2image>=1.17.0          # converts PDF pages to PIL images for Tesseract
+pdf2image>=1.17.0          # converts PDF pages → PIL images for Tesseract
 
-# AWS Textract (optional):
-# boto3>=1.34.0
-
-# Google Vision (optional):
-# google-cloud-vision>=3.7.0
-
-# LLM – install ONE of these depending on your LLM_PROVIDER:
-# OpenAI (default):
-openai>=1.30.0
-
-# Ollama (optional, free local LLM):
-# No extra pip install needed – uses httpx (already listed above)
+# ── LLM (Ollama — free, local) ────────────────────────────────────────────────
+# No pip package needed — Ollama exposes a local REST API.
+# 1. Install Ollama : https://ollama.com/download
+# 2. Start server   : ollama serve
+# 3. Pull a model   : ollama pull llama3.2
+#    (lighter alt)  : ollama pull mistral
+# httpx (already listed above) is used to call http://localhost:11434

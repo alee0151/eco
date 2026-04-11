@@ -2,18 +2,17 @@
 POST /api/extract
 
 Accepts a multipart upload of a PDF or image file.
-Runs OCR via pytesseract (or swaps in a cloud provider),
-then uses an LLM prompt (OpenAI GPT-4o-mini by default, or a
-local Ollama model) to extract the four supplier fields.
+
+OCR  : Tesseract (pytesseract) — free, runs 100 % locally.
+LLM  : Ollama — free, runs 100 % locally.
+        Install Ollama from https://ollama.com and pull a model:
+          ollama pull llama3.2          # default
+          ollama pull mistral            # lighter alternative
 
 Environment variables
 ---------------------
-OCR_PROVIDER          tesseract | textract | vision   (default: tesseract)
-LLM_PROVIDER          openai | ollama                 (default: openai)
-OPENAI_API_KEY        Required when LLM_PROVIDER=openai
-OPENAI_MODEL          default: gpt-4o-mini
-OLLAMA_MODEL          default: llama3.2
-OLLAMA_BASE_URL       default: http://localhost:11434
+OLLAMA_MODEL      Model name to use (default: llama3.2)
+OLLAMA_BASE_URL   Ollama server URL   (default: http://localhost:11434)
 """
 
 import io
@@ -21,8 +20,6 @@ import json
 import logging
 import os
 import re
-import tempfile
-from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File
@@ -30,6 +27,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
 
 # ── Response schema ───────────────────────────────────────────────────────────
 
@@ -49,104 +47,51 @@ class ExtractResult(BaseModel):
     warnings: list[str] = []
 
 
-# ── OCR helpers ───────────────────────────────────────────────────────────────
+# ── OCR — Tesseract only ──────────────────────────────────────────────────────
 
-def _ocr_tesseract(file_bytes: bytes, content_type: str) -> str:
+def run_ocr(file_bytes: bytes, content_type: str) -> str:
     """
     Run Tesseract OCR locally.
-    Requires: pip install pytesseract Pillow pdf2image
-    System dep: apt install tesseract-ocr poppler-utils  (or brew equivalent)
+    Requires:
+      pip install pytesseract Pillow pdf2image
+      macOS  : brew install tesseract poppler
+      Ubuntu : sudo apt install tesseract-ocr poppler-utils
     """
     try:
         import pytesseract
         from PIL import Image
-    except ImportError as e:
+    except ImportError as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"pytesseract / Pillow not installed: {e}",
+            detail=(
+                "pytesseract or Pillow is not installed. "
+                f"Run: pip install pytesseract Pillow pdf2image  ({exc})"
+            ),
         )
 
     if "pdf" in content_type:
         try:
             from pdf2image import convert_from_bytes
-        except ImportError as e:
+        except ImportError as exc:
             raise HTTPException(
                 status_code=500,
-                detail=f"pdf2image not installed: {e}",
+                detail=(
+                    "pdf2image is not installed. "
+                    f"Run: pip install pdf2image  ({exc})"
+                ),
             )
         pages = convert_from_bytes(file_bytes, dpi=200)
-        # OCR first page only for now; extend for multi-page if needed
-        return pytesseract.image_to_string(pages[0])
+        # OCR first two pages to cover cover-sheets that put ABN on page 2
+        texts = [pytesseract.image_to_string(p) for p in pages[:2]]
+        return "\n".join(texts)
     else:
         img = Image.open(io.BytesIO(file_bytes))
         return pytesseract.image_to_string(img)
 
 
-def _ocr_textract(file_bytes: bytes, content_type: str) -> str:
-    """
-    AWS Textract – DetectDocumentText (sync, single page).
-    Requires: pip install boto3
-    IAM permission: textract:DetectDocumentText
-    """
-    try:
-        import boto3
-    except ImportError as e:
-        raise HTTPException(
-            status_code=500, detail=f"boto3 not installed: {e}"
-        )
-    client = boto3.client("textract")
-    response = client.detect_document_text(
-        Document={"Bytes": file_bytes}
-    )
-    lines = [
-        block["Text"]
-        for block in response["Blocks"]
-        if block["BlockType"] == "LINE"
-    ]
-    return "\n".join(lines)
+# ── LLM — Ollama only (free) ──────────────────────────────────────────────────
 
-
-def _ocr_vision(file_bytes: bytes, content_type: str) -> str:
-    """
-    Google Cloud Vision – document_text_detection.
-    Requires: pip install google-cloud-vision
-    Env var:  GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
-    """
-    try:
-        from google.cloud import vision
-    except ImportError as e:
-        raise HTTPException(
-            status_code=500, detail=f"google-cloud-vision not installed: {e}"
-        )
-    client = vision.ImageAnnotatorClient()
-    image = vision.Image(content=file_bytes)
-    response = client.document_text_detection(image=image)
-    return response.full_text_annotation.text
-
-
-OCR_PROVIDERS = {
-    "tesseract": _ocr_tesseract,
-    "textract":  _ocr_textract,
-    "vision":    _ocr_vision,
-}
-
-
-def run_ocr(file_bytes: bytes, content_type: str) -> str:
-    provider = os.getenv("OCR_PROVIDER", "tesseract")
-    fn = OCR_PROVIDERS.get(provider)
-    if fn is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unknown OCR_PROVIDER '{provider}'. Choose: {list(OCR_PROVIDERS)}",
-        )
-    text = fn(file_bytes, content_type)
-    logger.debug("OCR (%s) produced %d chars", provider, len(text))
-    return text
-
-
-# ── LLM helpers ───────────────────────────────────────────────────────────────
-
-EXTRACT_PROMPT = """
+EXTRACT_PROMPT = """\
 You are a data-extraction assistant for an Australian supply-chain risk platform.
 
 From the raw OCR text below, extract EXACTLY these four fields:
@@ -156,19 +101,19 @@ From the raw OCR text below, extract EXACTLY these four fields:
   - commodity  : The primary product or commodity supplied (e.g. Timber, Seafood, Grain)
 
 Return ONLY valid JSON in this exact shape (no prose, no markdown fences):
-{
+{{
   "name":      "...",
   "abn":       "...",
   "address":   "...",
   "commodity": "...",
-  "confidence": {
+  "confidence": {{
     "name":      0.0,
     "abn":       0.0,
     "address":   0.0,
     "commodity": 0.0
-  },
+  }},
   "warnings": []
-}
+}}
 
 Rules:
 - If a field cannot be found, use an empty string "".
@@ -184,89 +129,71 @@ OCR TEXT:
 """
 
 
-def _llm_openai(ocr_text: str) -> dict:
-    try:
-        from openai import OpenAI
-    except ImportError as e:
-        raise HTTPException(
-            status_code=500, detail=f"openai package not installed: {e}"
-        )
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY environment variable is not set.",
-        )
-
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    client = OpenAI(api_key=api_key)
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a JSON-only data extraction assistant."},
-            {"role": "user",   "content": EXTRACT_PROMPT.format(ocr_text=ocr_text[:12000])},
-        ],
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
-    raw = response.choices[0].message.content or "{}"
-    return json.loads(raw)
-
-
-def _llm_ollama(ocr_text: str) -> dict:
+def run_llm(ocr_text: str) -> dict:
+    """
+    Call Ollama's local REST API to extract structured fields from OCR text.
+    Ollama must be running:  ollama serve
+    Model must be pulled:    ollama pull llama3.2
+    """
     model    = os.getenv("OLLAMA_MODEL",    "llama3.2")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    url      = f"{base_url}/api/generate"
 
     payload = {
         "model":  model,
         "prompt": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
         "stream": False,
-        "format": "json",
+        "format": "json",   # Ollama native JSON mode — guarantees JSON output
     }
-    resp = httpx.post(f"{base_url}/api/generate", json=payload, timeout=120)
-    resp.raise_for_status()
+
+    try:
+        resp = httpx.post(url, json=payload, timeout=120)
+        resp.raise_for_status()
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot reach Ollama at {url}. "
+                "Make sure Ollama is running: ollama serve"
+            ),
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama returned HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+        )
+
     raw = resp.json().get("response", "{}")
-    # Ollama sometimes wraps in markdown fences — strip them
+
+    # Strip markdown fences if the model ignores format=json
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
     raw = re.sub(r"\n?```$",       "", raw.strip())
-    return json.loads(raw)
 
-
-LLM_PROVIDERS = {
-    "openai": _llm_openai,
-    "ollama": _llm_ollama,
-}
-
-
-def run_llm(ocr_text: str) -> dict:
-    provider = os.getenv("LLM_PROVIDER", "openai")
-    fn = LLM_PROVIDERS.get(provider)
-    if fn is None:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("Ollama non-JSON response: %s", raw[:500])
         raise HTTPException(
-            status_code=500,
-            detail=f"Unknown LLM_PROVIDER '{provider}'. Choose: {list(LLM_PROVIDERS)}",
+            status_code=502,
+            detail=f"Ollama returned unparseable JSON: {exc}",
         )
-    return fn(ocr_text)
 
 
-# ── Validation helpers ────────────────────────────────────────────────────────
+# ── ABN validation (ATO checksum) ─────────────────────────────────────────────
 
 def _validate_abn(abn: str) -> list[str]:
-    """Apply the ATO's ABN checksum algorithm. Returns a list of warnings."""
-    warnings = []
+    """Apply the ATO's 11-digit weighted-sum algorithm. Returns warning strings."""
+    warnings: list[str] = []
     digits = re.sub(r"\D", "", abn)
     if not digits:
-        return warnings  # empty is handled upstream
+        return warnings  # empty field — handled elsewhere
     if len(digits) != 11:
         warnings.append(f"ABN '{abn}' does not have 11 digits.")
         return warnings
 
-    # ATO weighting
     weights = [10, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
     d = [int(c) for c in digits]
-    d[0] -= 1  # subtract 1 from first digit
+    d[0] -= 1  # subtract 1 from the first digit per ATO spec
     total = sum(w * v for w, v in zip(weights, d))
     if total % 89 != 0:
         warnings.append(f"ABN '{abn}' fails the ATO checksum — may be invalid.")
@@ -288,55 +215,52 @@ ALLOWED_TYPES = {
 @router.post("/extract", response_model=ExtractResult)
 async def extract(
     file: UploadFile = File(..., description="PDF or image of a supplier document"),
-):
+) -> ExtractResult:
     """
-    1. Read the uploaded file into memory.
-    2. Run OCR to get raw text.
-    3. Pass text to LLM to extract structured fields.
-    4. Validate ABN checksum.
-    5. Return ExtractResult.
+    Pipeline:
+      1. Validate file type & size.
+      2. Run Tesseract OCR  →  raw text.
+      3. Send raw text to Ollama  →  structured JSON.
+      4. Validate ABN checksum.
+      5. Return ExtractResult.
     """
-    # ── Content-type guard ──
+    # ── Content-type guard ──────────────────────────────────────────────────
     ct = (file.content_type or "").lower()
-    # Allow missing content-type for .pdf uploads that browsers sometimes mislabel
     if file.filename and file.filename.lower().endswith(".pdf"):
-        ct = "application/pdf"
+        ct = "application/pdf"  # browsers sometimes mislabel PDFs
     if ct not in ALLOWED_TYPES and not ct.startswith("image/"):
         raise HTTPException(
             status_code=415,
-            detail=f"Unsupported file type '{ct}'. Upload a PDF or image.",
+            detail=f"Unsupported file type '{ct}'. Please upload a PDF or image.",
         )
 
-    # ── Read file ──
+    # ── Size guard ──────────────────────────────────────────────────────────
     file_bytes = await file.read()
     if len(file_bytes) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    if len(file_bytes) > 10 * 1024 * 1024:  # 10 MB
+    if len(file_bytes) > 10 * 1024 * 1024:  # 10 MB hard cap
         raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit.")
 
-    # ── OCR ──
+    # ── OCR ─────────────────────────────────────────────────────────────────
     ocr_text = run_ocr(file_bytes, ct)
+    logger.debug("OCR produced %d chars for '%s'", len(ocr_text), file.filename)
+
     if not ocr_text.strip():
-        # Return empty result with a warning rather than a hard 422
         return ExtractResult(
-            warnings=["OCR returned no text. The document may be blank, encrypted, or purely image-based with low resolution."]
+            warnings=[
+                "OCR returned no text. The document may be blank, "
+                "encrypted, or a scanned image with very low resolution."
+            ]
         )
 
-    # ── LLM extraction ──
-    try:
-        raw = run_llm(ocr_text)
-    except (json.JSONDecodeError, KeyError) as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM returned unparseable JSON: {e}",
-        )
+    # ── LLM extraction ──────────────────────────────────────────────────────
+    raw = run_llm(ocr_text)
 
-    # ── Build result ──
+    # ── Assemble result ─────────────────────────────────────────────────────
     conf_raw  = raw.get("confidence", {})
     warnings  = list(raw.get("warnings", []))
     abn_value = str(raw.get("abn", "")).strip()
 
-    # Server-side ABN validation
     if abn_value:
         warnings.extend(_validate_abn(abn_value))
 
