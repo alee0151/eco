@@ -1,5 +1,7 @@
 import { useState } from 'react';
-import { Leaf, Layers, BarChart3, Download } from 'lucide-react';
+import { Download, List, Map as MapIcon } from 'lucide-react';
+import clsx from 'clsx';
+import { motion } from 'motion/react';
 import SupplierList from './SupplierList';
 import MapView from './MapView';
 import RiskProfile from './RiskProfile';
@@ -8,69 +10,77 @@ import { suppliers } from '../../data/epic2-data';
 export default function BiodiversityDashboard() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [mobileTab, setMobileTab] = useState<'map' | 'list'>('list');
 
   const selectedSupplier = suppliers.find(s => s.id === selectedId) || null;
 
-  const avgRisk = Math.round(suppliers.reduce((sum, s) => sum + s.riskScore, 0) / suppliers.length);
-  const criticalCount = suppliers.filter(s => s.riskLevel === 'critical' || s.riskLevel === 'high').length;
+  const avgRisk     = Math.round(suppliers.reduce((sum, s) => sum + s.riskScore, 0) / suppliers.length);
+  const criticalCount = suppliers.filter(s => s.riskLevel === 'critical').length;
+  const highCount     = suppliers.filter(s => s.riskLevel === 'high').length;
+  const lowCount      = suppliers.filter(s => s.riskLevel === 'low').length;
 
   return (
-    <div className="h-full flex flex-col bg-slate-50">
-      {/* Top bar */}
-      <header className="h-12 bg-emerald-700 flex items-center justify-between px-4 shrink-0">
+    <>
+      {/* ── Page header — matches MapPage.tsx pattern exactly ── */}
+      <div className="flex items-start justify-between flex-shrink-0">
+        <div>
+          <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Biodiversity GIS</h1>
+          <p className="text-sm text-slate-500 mt-0.5">
+            Geospatial biodiversity risk overlay — visualise supplier exposure to protected areas and threatened species.
+          </p>
+        </div>
+
+        {/* Stats + export */}
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-emerald-500/30 flex items-center justify-center">
-              <Leaf size={15} className="text-emerald-100" />
-            </div>
-            <div>
-              <h1 className="text-[14px] text-white tracking-tight leading-none font-semibold">
-                BioRisk Monitor
-              </h1>
-              <p className="text-[9px] text-emerald-300 tracking-wider uppercase">
-                Biodiversity Risk Assessment Platform
-              </p>
-            </div>
+          <div className="hidden md:flex items-center gap-2">
+            {[
+              { label: 'Suppliers',  value: suppliers.length, cls: 'bg-slate-100 text-slate-600'    },
+              { label: 'Avg Risk',   value: avgRisk,          cls: 'bg-amber-50 text-amber-700'     },
+              { label: 'Critical',   value: criticalCount,    cls: 'bg-red-50 text-red-600'         },
+              { label: 'Low Risk',   value: lowCount,         cls: 'bg-emerald-50 text-emerald-700' },
+            ].map(({ label, value, cls }) => (
+              <span key={label} className={clsx('text-xs px-2.5 py-1 rounded-full', cls)} style={{ fontWeight: 600 }}>
+                {value} {label}
+              </span>
+            ))}
           </div>
-
-          <div className="h-5 w-px bg-emerald-500/30 mx-2" />
-
-          <div className="flex items-center gap-4 text-[11px]">
-            <div className="text-emerald-200">
-              <span className="text-white font-semibold text-[14px]">{suppliers.length}</span>{' '}
-              <span className="text-emerald-300">Suppliers</span>
-            </div>
-            <div className="text-emerald-200">
-              <span className="text-white font-semibold text-[14px]">{avgRisk}</span>{' '}
-              <span className="text-emerald-300">Avg Risk</span>
-            </div>
-            <div className="text-emerald-200">
-              <span className="text-amber-200 font-semibold text-[14px]">{criticalCount}</span>{' '}
-              <span className="text-emerald-300">High/Critical</span>
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-1">
-          <button className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-emerald-200 hover:bg-emerald-500/20 transition-colors">
-            <Layers size={13} />
-            Layers
-          </button>
-          <button className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-emerald-200 hover:bg-emerald-500/20 transition-colors">
-            <BarChart3 size={13} />
-            Reports
-          </button>
-          <button className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] text-emerald-200 hover:bg-emerald-500/20 transition-colors">
-            <Download size={13} />
-            Export
+          <button
+            className="flex items-center gap-1.5 px-3 py-2 text-xs border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg transition-colors"
+            style={{ fontWeight: 500 }}
+          >
+            <Download className="w-3.5 h-3.5" /> Export
           </button>
         </div>
-      </header>
+      </div>
 
-      {/* Main content */}
-      <div className="flex-1 flex min-h-0">
-        {/* Left panel - Supplier list */}
-        <div className="w-[300px] shrink-0 border-r border-slate-200 overflow-hidden">
+      {/* ── Mobile tab toggle — matches MapPage.tsx pattern ── */}
+      <div className="flex md:hidden items-center gap-1 bg-slate-100 rounded-lg p-1 self-start flex-shrink-0">
+        {([
+          { key: 'list', icon: List,    label: 'Suppliers' },
+          { key: 'map',  icon: MapIcon, label: 'Map'       },
+        ] as const).map(t => (
+          <button
+            key={t.key}
+            onClick={() => setMobileTab(t.key)}
+            className={clsx(
+              'flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs transition-all',
+              mobileTab === t.key ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500'
+            )}
+            style={{ fontWeight: mobileTab === t.key ? 600 : 500 }}
+          >
+            <t.icon className="w-3.5 h-3.5" /> {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Three-panel split: list | map | risk profile ── */}
+      <div className="flex-1 flex gap-4 min-h-0">
+
+        {/* LEFT — Supplier list */}
+        <div className={clsx(
+          'md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm w-[280px] shrink-0 min-h-0',
+          mobileTab === 'list' ? 'flex' : 'hidden md:flex'
+        )}>
           <SupplierList
             suppliers={suppliers}
             selectedId={selectedId}
@@ -80,8 +90,11 @@ export default function BiodiversityDashboard() {
           />
         </div>
 
-        {/* Center - Map */}
-        <div className="flex-1 min-w-0 relative">
+        {/* CENTER — Map */}
+        <div className={clsx(
+          'md:flex flex-col rounded-2xl overflow-hidden border border-slate-200 shadow-sm flex-1 min-h-0',
+          mobileTab === 'map' ? 'flex' : 'hidden md:flex'
+        )}>
           <MapView
             suppliers={suppliers}
             selectedId={selectedId}
@@ -91,14 +104,14 @@ export default function BiodiversityDashboard() {
           />
         </div>
 
-        {/* Right panel - Risk profile */}
-        <div className="w-[340px] shrink-0 border-l border-slate-200 overflow-hidden">
+        {/* RIGHT — Risk profile (always visible on desktop, slides in) */}
+        <div className="hidden md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm w-[320px] shrink-0 min-h-0 overflow-hidden">
           <RiskProfile
             supplier={selectedSupplier}
             onClose={() => setSelectedId(null)}
           />
         </div>
       </div>
-    </div>
+    </>
   );
 }
