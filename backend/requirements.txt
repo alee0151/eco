@@ -8,6 +8,10 @@ sqlalchemy>=2.0.0
 asyncpg>=0.29.0        # async PostgreSQL driver (used by SQLAlchemy async engine)
 psycopg2-binary>=2.9.9 # sync driver (used by Alembic migrations if needed)
 
+# Geospatial — PostGIS geometry type + Python-side WKB/WKT parsing
+geoalchemy2>=0.14.0    # maps PostGIS geometry columns in SQLAlchemy ORM
+shapely>=2.0.0         # WKB/WKT parsing and geometry ops in Python
+
 # Environment variables
 python-dotenv>=1.0.0
 
