@@ -1,5 +1,5 @@
 """
-eco – Supply Chain Risk Assessment
+eco - Supply Chain Risk Assessment
 Backend API  (FastAPI)
 
 Start with:
