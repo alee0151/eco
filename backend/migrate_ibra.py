@@ -19,14 +19,22 @@ What this script does
   2. Inspect - Print a cleaning report (CRS, row count, null geometry,
                invalid geometry, duplicate IBRA codes, column names).
   3. Clean   - Reproject to EPSG:4326 (WGS 84) if needed.
-               Fix invalid geometries via buffer(0).
+               Fix invalid geometries via make_valid().
                Cast Polygon → MultiPolygon for schema consistency.
                Normalise column names to match the `ibra` table schema.
                Drop rows where ibra_reg_code is null after normalisation.
                Derive `state` from the shapefile's state field if present.
   4. Migrate - Truncate the `ibra` table and bulk-insert all cleaned rows.
                Populates both `geometry` (WKT string for the API) and
-               `geom` (PostGIS WKB via ST_GeomFromText for spatial queries).
+               `geom` (PostGIS geometry) without using CASE expressions or
+               referencing the same bind parameter twice (avoids
+               SQLAlchemy CompileError 9h9h).
+
+               The PostGIS `geom` column is populated by pre-computing an
+               EWKB hex string in Python (via shapely.wkb.dumps with
+               include_srid=True) and inserting it with
+               ST_GeomFromEWKB(decode(:geom_ewkb, 'hex')).
+               This uses exactly ONE bind parameter per row — no CASE needed.
 
 Column mapping (shapefile → DB)
 -------------------------------
@@ -49,8 +57,9 @@ except ImportError:
     sys.exit("ERROR: geopandas is not installed. Run: pip install geopandas")
 
 try:
-    from shapely.geometry import MultiPolygon, Polygon
+    from shapely.geometry import MultiPolygon
     from shapely.validation import make_valid
+    from shapely import wkb as shapely_wkb
 except ImportError:
     sys.exit("ERROR: shapely is not installed. Run: pip install shapely")
 
@@ -63,7 +72,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # optional — DATABASE_URL can be set directly in the environment
+    pass  # optional — DATABASE_URL can be set via environment
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -87,40 +96,33 @@ def normalise_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     canonical names used by the `ibra` table schema.
     """
     cols = {c.upper(): c for c in gdf.columns}
-
     rename = {}
 
-    # ibra_reg_name
     for candidate in ["REG_NAME", "IBRA_REG_N", "RGN_NAME", "REGIONNAME", "NAME"]:
         if candidate in cols:
             rename[cols[candidate]] = "ibra_reg_name"
             break
 
-    # ibra_reg_code
     for candidate in ["REG_CODE", "IBRA_REG_C", "RGN_CODE", "REGIONCODE", "CODE"]:
         if candidate in cols:
             rename[cols[candidate]] = "ibra_reg_code"
             break
 
-    # ibra_reg_num
     for candidate in ["REG_NUM", "IBRA_CODE", "REGIONNUM", "REGNUM"]:
         if candidate in cols:
             rename[cols[candidate]] = "ibra_reg_num"
             break
 
-    # state
     for candidate in ["STA_CODE", "STATE", "STATE_CODE", "STATEABBR", "ST"]:
         if candidate in cols:
             rename[cols[candidate]] = "state_raw"
             break
 
-    # shape_area
     for candidate in ["SHAPE_AREA", "AREA", "SHAPE_A"]:
         if candidate in cols:
             rename[cols[candidate]] = "shape_area"
             break
 
-    # shape_len
     for candidate in ["SHAPE_LENG", "SHAPE_LENGTH", "PERIMETER", "SHAPE_L"]:
         if candidate in cols:
             rename[cols[candidate]] = "shape_len"
@@ -128,7 +130,6 @@ def normalise_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
     gdf = gdf.rename(columns=rename)
 
-    # Expand state abbreviation to full name where possible
     if "state_raw" in gdf.columns:
         gdf["state"] = gdf["state_raw"].apply(
             lambda v: STATE_ABBREV_MAP.get(str(v).upper().strip(), str(v).strip())
@@ -149,7 +150,6 @@ def ensure_multipolygon(geom):
         return MultiPolygon([geom])
     if geom.geom_type == "MultiPolygon":
         return geom
-    # GeometryCollection etc. — try to extract polygon parts
     polys = [
         p for p in (geom.geoms if hasattr(geom, "geoms") else [])
         if p.geom_type in ("Polygon", "MultiPolygon")
@@ -165,13 +165,29 @@ def ensure_multipolygon(geom):
     return None
 
 
+def geom_to_ewkb_hex(geom, srid: int = 4326) -> str | None:
+    """
+    Convert a Shapely geometry to an EWKB hex string with the given SRID
+    embedded.  This is inserted via ST_GeomFromEWKB(decode(:geom_ewkb,'hex'))
+    which requires exactly ONE bind parameter — avoiding the SQLAlchemy
+    CompileError (9h9h) caused by referencing :geom_wkt twice inside a
+    CASE expression.
+    """
+    if geom is None or geom.is_empty:
+        return None
+    # shapely_wkb.dumps(include_srid=True) writes the SRID into the WKB header
+    return shapely_wkb.dumps(geom, hex=True, include_srid=True, srid=srid)
+
+
 # ── Report ────────────────────────────────────────────────────────────────────
 
 def print_report(gdf: gpd.GeoDataFrame, label: str) -> None:
     n_total        = len(gdf)
     n_null_geom    = gdf.geometry.isna().sum()
     n_empty_geom   = gdf.geometry.apply(lambda g: g is not None and g.is_empty).sum()
-    n_invalid_geom = gdf.geometry.apply(lambda g: g is not None and not g.is_empty and not g.is_valid).sum()
+    n_invalid_geom = gdf.geometry.apply(
+        lambda g: g is not None and not g.is_empty and not g.is_valid
+    ).sum()
 
     print(f"\n{'='*60}")
     print(f"  {label}")
@@ -205,25 +221,30 @@ def clean_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
     print("[2/4] Reprojecting to EPSG:4326 (WGS 84)...")
     if gdf.crs is None:
-        print("      WARNING: No CRS detected — assuming GDA94 (EPSG:4283) and reprojecting.")
+        print("      WARNING: No CRS detected — assuming GDA94 (EPSG:4283).")
         gdf = gdf.set_crs("EPSG:4283", allow_override=True)
     if gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs("EPSG:4326")
-        print(f"      Reprojected from {gdf.crs} → EPSG:4326")
+        print(f"      Reprojected → EPSG:4326")
     else:
-        print("      Already in EPSG:4326, no reprojection needed.")
+        print("      Already EPSG:4326, no reprojection needed.")
 
     print("[3/4] Fixing invalid / null geometries...")
-    before_invalid = gdf.geometry.apply(lambda g: g is not None and not g.is_empty and not g.is_valid).sum()
+    before_invalid = gdf.geometry.apply(
+        lambda g: g is not None and not g.is_empty and not g.is_valid
+    ).sum()
     gdf["geometry_col"] = gdf.geometry.apply(
-        lambda g: make_valid(g) if g is not None and not g.is_empty and not g.is_valid else g
+        lambda g: make_valid(g)
+        if g is not None and not g.is_empty and not g.is_valid else g
     )
     gdf = gdf.set_geometry("geometry_col").drop(columns=[gdf.geometry.name])
     gdf = gdf.rename_geometry("geometry")
-    after_invalid = gdf.geometry.apply(lambda g: g is not None and not g.is_empty and not g.is_valid).sum()
-    print(f"      Fixed {before_invalid - after_invalid} invalid geometries (remaining: {after_invalid})")
+    after_invalid = gdf.geometry.apply(
+        lambda g: g is not None and not g.is_empty and not g.is_valid
+    ).sum()
+    print(f"      Fixed {before_invalid - after_invalid} invalid geometries "
+          f"(remaining: {after_invalid})")
 
-    # Drop null / empty geometry rows
     n_before = len(gdf)
     gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
     print(f"      Dropped {n_before - len(gdf)} null/empty geometry rows.")
@@ -234,10 +255,12 @@ def clean_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs="EPSG:4326")
     print(f"      All geometries are now MultiPolygon. Rows: {len(gdf)}")
 
-    # Drop rows with null ibra_reg_code (cannot be used for spatial lookups)
     if "ibra_reg_code" in gdf.columns:
         n_before = len(gdf)
-        gdf = gdf[gdf["ibra_reg_code"].notna() & (gdf["ibra_reg_code"].str.strip() != "")].copy()
+        gdf = gdf[
+            gdf["ibra_reg_code"].notna() &
+            (gdf["ibra_reg_code"].str.strip() != "")
+        ].copy()
         print(f"      Dropped {n_before - len(gdf)} rows with null/empty ibra_reg_code.")
 
     return gdf
@@ -248,63 +271,96 @@ def clean_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def migrate(gdf: gpd.GeoDataFrame, engine) -> None:
     now = datetime.now(timezone.utc).isoformat()
 
+    def _safe_str(row, key):
+        v = row.get(key, "") if hasattr(row, "get") else row[key] if key in row.index else ""
+        return str(v).strip() or None
+
+    def _safe_float(row, key):
+        if key not in row.index:
+            return None
+        v = row[key]
+        return float(v) if v is not None and str(v) not in ("", "nan", "None") else None
+
+    def _safe_int(row, key):
+        if key not in row.index:
+            return None
+        v = row[key]
+        return int(v) if v is not None and str(v) not in ("", "nan", "None") else None
+
     rows = []
     for _, row in gdf.iterrows():
-        wkt = row.geometry.wkt if row.geometry else None
+        wkt      = row.geometry.wkt if row.geometry else None
+        ewkb_hex = geom_to_ewkb_hex(row.geometry)   # SRID=4326 baked in
         rows.append({
-            "ibra_reg_name" : str(row.get("ibra_reg_name", "") or "").strip() or None,
-            "ibra_reg_code" : str(row.get("ibra_reg_code", "") or "").strip() or None,
-            "ibra_reg_num"  : int(row["ibra_reg_num"])  if "ibra_reg_num"  in row.index and row["ibra_reg_num"]  is not None and str(row["ibra_reg_num"]) not in ("", "nan", "None") else None,
-            "state"         : str(row["state"]).strip() if "state" in row.index and row["state"] and str(row["state"]) not in ("", "nan", "None") else None,
-            "shape_area"    : float(row["shape_area"])  if "shape_area"    in row.index and row["shape_area"]  is not None and str(row["shape_area"]) not in ("", "nan", "None") else None,
-            "shape_len"     : float(row["shape_len"])   if "shape_len"     in row.index and row["shape_len"]   is not None and str(row["shape_len"])  not in ("", "nan", "None") else None,
+            "ibra_reg_name" : _safe_str(row, "ibra_reg_name"),
+            "ibra_reg_code" : _safe_str(row, "ibra_reg_code"),
+            "ibra_reg_num"  : _safe_int(row, "ibra_reg_num"),
+            "state"         : _safe_str(row, "state"),
+            "shape_area"    : _safe_float(row, "shape_area"),
+            "shape_len"     : _safe_float(row, "shape_len"),
             "is_active"     : True,
-            "geometry"      : wkt,   # WKT string — used by the API JSON response
-            "geom_wkt"      : wkt,   # alias for convenience
+            "geometry"      : wkt,        # WKT string — returned by the REST API
+            "geom_ewkb"     : ewkb_hex,   # EWKB hex — decoded by PostGIS directly
             "created_at"    : now,
             "updated_at"    : now,
         })
 
+    # ── INSERT statement — ONE bind parameter per column, no CASE expression ──
+    # ST_GeomFromEWKB(decode(:geom_ewkb, 'hex')) reads the SRID from the WKB
+    # header itself, so ST_SetSRID is not needed.
+    INSERT_SQL = text("""
+        INSERT INTO ibra (
+            ibra_reg_name, ibra_reg_code, ibra_reg_num,
+            state, shape_area, shape_len,
+            is_active, geometry, created_at, updated_at,
+            geom
+        ) VALUES (
+            :ibra_reg_name, :ibra_reg_code, :ibra_reg_num,
+            :state, :shape_area, :shape_len,
+            :is_active, :geometry, :created_at, :updated_at,
+            ST_GeomFromEWKB(decode(:geom_ewkb, 'hex'))
+        )
+    """)
+
+    BATCH_SIZE = 50  # keep individual transactions small for large WKT payloads
+
     with engine.begin() as conn:
-        print(f"\n[Migrate] Truncating ibra table...")
+        print("\n[Migrate] Truncating ibra table...")
         conn.execute(text("TRUNCATE TABLE ibra RESTART IDENTITY CASCADE"))
 
-        print(f"[Migrate] Inserting {len(rows)} rows...")
-        conn.execute(
-            text("""
-                INSERT INTO ibra (
-                    ibra_reg_name, ibra_reg_code, ibra_reg_num,
-                    state, shape_area, shape_len,
-                    is_active, geometry, created_at, updated_at,
-                    geom
-                ) VALUES (
-                    :ibra_reg_name, :ibra_reg_code, :ibra_reg_num,
-                    :state, :shape_area, :shape_len,
-                    :is_active, :geometry, :created_at, :updated_at,
-                    CASE
-                        WHEN :geom_wkt IS NOT NULL
-                        THEN ST_Multi(ST_SetSRID(ST_GeomFromText(:geom_wkt), 4326))
-                        ELSE NULL
-                    END
-                )
-            """),
-            rows,
-        )
+    total = len(rows)
+    inserted = 0
+    for i in range(0, total, BATCH_SIZE):
+        batch = rows[i : i + BATCH_SIZE]
+        with engine.begin() as conn:
+            conn.execute(INSERT_SQL, batch)
+        inserted += len(batch)
+        print(f"[Migrate] Inserted {inserted}/{total} rows...", end="\r")
 
+    print(f"\n[Migrate] ✅ All {inserted} rows inserted.")
+
+    with engine.connect() as conn:
         result = conn.execute(text("SELECT COUNT(*) FROM ibra")).scalar()
         print(f"[Migrate] ✅ ibra table now contains {result} rows.")
 
-        # Verify PostGIS geom column populated correctly
         valid_geom = conn.execute(
             text("SELECT COUNT(*) FROM ibra WHERE geom IS NOT NULL AND ST_IsValid(geom)")
         ).scalar()
-        print(f"[Migrate] ✅ {valid_geom} rows have valid PostGIS geom.")
+        print(f"[Migrate] ✅ {valid_geom} rows have a valid PostGIS geom.")
+
+        null_geom = conn.execute(
+            text("SELECT COUNT(*) FROM ibra WHERE geom IS NULL")
+        ).scalar()
+        if null_geom:
+            print(f"[Migrate] ⚠️  {null_geom} rows have NULL geom "
+                  f"(geometry was null or empty in the shapefile).")
 
         invalid_geom = conn.execute(
             text("SELECT COUNT(*) FROM ibra WHERE geom IS NOT NULL AND NOT ST_IsValid(geom)")
         ).scalar()
-        if invalid_geom > 0:
-            print(f"[Migrate] ⚠️  {invalid_geom} rows have invalid PostGIS geom — consider re-running with --fix-postgis.")
+        if invalid_geom:
+            print(f"[Migrate] ⚠️  {invalid_geom} rows have invalid PostGIS geom — "
+                  f"run UPDATE ibra SET geom = ST_MakeValid(geom) WHERE NOT ST_IsValid(geom);")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -353,19 +409,17 @@ def main():
         args.db_url
         or os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/eco_db")
     )
-    # Strip asyncpg driver prefix if present (script uses sync psycopg2)
     sync_url = raw_url.replace("postgresql+asyncpg", "postgresql")
     print(f"\nConnecting to: {sync_url.split('@')[-1]}")
     engine = create_engine(sync_url, echo=False)
 
-    # Quick PostGIS check
     with engine.connect() as conn:
         try:
             conn.execute(text("SELECT PostGIS_version()"))
             print("PostGIS extension detected. ✅")
         except Exception:
             sys.exit(
-                "ERROR: PostGIS extension not found in the target database.\n"
+                "ERROR: PostGIS extension not found.\n"
                 "Enable it with: CREATE EXTENSION IF NOT EXISTS postgis;"
             )
 
