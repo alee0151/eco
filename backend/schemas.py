@@ -105,16 +105,22 @@ class IbraOut(BaseModel):
 # Used by Epic 2 risk profile panel (replaces mock epic2-data.ts)
 
 class SupplierRiskSummary(BaseModel):
-    """Computed risk profile for a supplier lat/lng against real DB data."""
+    """
+    Computed risk profile for a supplier lat/lng against real DB data.
+
+    species_nearby counts only distinct threatened species (Fix 2+3).
+    threatened_species_names is sourced from the same query as species_nearby
+    so the count and list are always consistent (Fix 3).
+    """
     supplier_id:              str
     supplier_name:            str
     lat:                      float
     lng:                      float
     ibra_region:              Optional[str]  = None
     ibra_code:                Optional[str]  = None
-    protected_areas_nearby:   int            = 0   # count of CAPAD records within buffer
-    kba_nearby:               int            = 0   # count of KBA records within buffer
-    species_nearby:           int            = 0   # count of species occurrences within buffer
+    protected_areas_nearby:   int            = 0
+    kba_nearby:               int            = 0
+    species_nearby:           int            = 0   # distinct threatened species, not raw occurrence count
     threatened_species_names: List[str]      = []
 
 
