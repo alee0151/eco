@@ -5,13 +5,42 @@
  * Base URL is read from VITE_API_URL env var (falls back to localhost:8000).
  */
 
-const BASE = (import.meta as any).env?.VITE_API_URL ?? 'http://localhost:8000';
+// Fix: use import.meta.env directly — the (as any) cast was suppressing
+// TypeScript's help and caused VITE_API_URL to be missed in production builds.
+const BASE: string = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
+/** Standard JSON request — parses response body as JSON. */
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...options?.headers },
     ...options,
   });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`API ${res.status}: ${detail}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+/**
+ * Void request — checks res.ok but does NOT call res.json().
+ * Use for DELETE / any endpoint that returns 204 No Content.
+ * Calling res.json() on a 204 throws SyntaxError: Unexpected end of JSON input.
+ */
+async function requestVoid(path: string, options?: RequestInit): Promise<void> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    ...options,
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`API ${res.status}: ${detail}`);
+  }
+}
+
+/** Multipart FormData request — returns JSON. Used for /api/extract. */
+async function requestFormData<T>(path: string, form: FormData): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { method: 'POST', body: form });
   if (!res.ok) {
     const detail = await res.text();
     throw new Error(`API ${res.status}: ${detail}`);
@@ -141,6 +170,38 @@ export interface SupplierRecord {
   warnings:             string | null;  // pipe-separated in DB
 }
 
+/** Mirrors backend ExtractResult / FieldConfidence schemas */
+export interface ExtractFieldConfidence {
+  name:      number;  // 0.0 – 1.0
+  abn:       number;
+  address:   number;
+  commodity: number;
+}
+
+export interface ExtractResult {
+  name:       string;
+  abn:        string;
+  address:    string;
+  commodity:  string;
+  confidence: ExtractFieldConfidence;
+  warnings:   string[];
+}
+
+// ── Extract API (Epic 1 — OCR + LLM via Ollama) ───────────────────────────────
+
+export const extractApi = {
+  /**
+   * Upload a PDF or image file to POST /api/extract.
+   * The backend runs Tesseract OCR then Ollama LLM to return structured fields.
+   * Note: CSV files are parsed client-side — do not send them here.
+   */
+  fromFile: (file: File): Promise<ExtractResult> => {
+    const form = new FormData();
+    form.append('file', file);
+    return requestFormData<ExtractResult>('/api/extract', form);
+  },
+};
+
 // ── Species API ───────────────────────────────────────────────────────────────
 
 export const speciesApi = {
@@ -199,14 +260,17 @@ export const riskApi = {
 // ── Suppliers API (Epic 1) ────────────────────────────────────────────────────
 
 export const suppliersApi = {
-  list:   ()                                       => request<SupplierRecord[]>('/api/suppliers'),
-  get:    (id: string)                             => request<SupplierRecord>(`/api/suppliers/${id}`),
-  create: (body: Partial<SupplierRecord>)          =>
+  list:   ()                                           => request<SupplierRecord[]>('/api/suppliers'),
+  get:    (id: string)                                 => request<SupplierRecord>(`/api/suppliers/${id}`),
+  create: (body: Partial<SupplierRecord>)              =>
     request<SupplierRecord>('/api/suppliers', { method: 'POST', body: JSON.stringify(body) }),
   update: (id: string, body: Partial<SupplierRecord>) =>
     request<SupplierRecord>(`/api/suppliers/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  delete: (id: string)                             =>
-    request<void>(`/api/suppliers/${id}`, { method: 'DELETE' }),
+  // Fix: use requestVoid — DELETE returns 204 No Content.
+  // The old request<void> called res.json() on an empty body and threw
+  // SyntaxError: Unexpected end of JSON input on every delete.
+  delete: (id: string) =>
+    requestVoid(`/api/suppliers/${id}`, { method: 'DELETE' }),
 };
 
 // ── Health ────────────────────────────────────────────────────────────────────

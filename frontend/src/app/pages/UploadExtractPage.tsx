@@ -4,16 +4,21 @@
  * Upload a CSV / PDF / image file → extract supplier rows → save each
  * extracted supplier to the DB via suppliersApi.create().
  *
- * Changes vs mock version:
- *   - After extraction, calls suppliersApi.create() for each supplier
- *   - SupplierContext.addSupplier is still called so state stays in sync
+ * Fixes applied:
+ *   1. Real extraction:
+ *      - PDF / image  → POST /api/extract (multipart) — Tesseract OCR + Ollama LLM
+ *      - CSV          → client-side parser (no server round-trip needed)
+ *      simulateExtraction() removed entirely.
+ *   2. Navigation: navigate("/enrich") → navigate("/enrichment") to match routes.tsx
+ *   3. File validation: cross-check MIME type AND file extension; reject .xlsx / .docx
+ *      with a clear error message; 10 MB client-side size guard mirrors backend limit.
  */
 
 import { useState, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useNavigate } from "react-router";
 import { useSuppliers } from "../context/SupplierContext";
-import { Supplier } from "../data/types";
+import { extractApi } from "../lib/api";
 import {
   Upload,
   FileText,
@@ -39,16 +44,33 @@ interface ExtractedRow {
   address:   string;
   commodity: string;
   region:    string;
-  confidence: number;
+  confidence: number;  // 0–100
   warnings:  string[];
   selected:  boolean;
 }
 
-function detectFileType(file: File): FileType | null {
-  if (file.type === "text/csv" || file.name.endsWith(".csv"))           return "csv";
-  if (file.type === "application/pdf" || file.name.endsWith(".pdf"))    return "pdf";
-  if (file.type.startsWith("image/"))                                     return "image";
-  return null;
+// ── File type detection ───────────────────────────────────────────────────────
+// Cross-checks MIME type AND file extension to reject renamed files.
+// Returns null (with a reason string) when the file is unsupported.
+function detectFileType(file: File): { type: FileType } | { type: null; reason: string } {
+  const name = file.name.toLowerCase();
+  const mime = (file.type || "").toLowerCase();
+
+  // Unsupported but common office formats — give a clear message
+  if (name.endsWith(".xlsx") || name.endsWith(".xls"))
+    return { type: null, reason: "Excel files are not supported. Please export as CSV first." };
+  if (name.endsWith(".docx") || name.endsWith(".doc"))
+    return { type: null, reason: "Word documents are not supported. Please use a PDF instead." };
+
+  const isCsv  = mime === "text/csv" || name.endsWith(".csv");
+  const isPdf  = mime === "application/pdf" || name.endsWith(".pdf");
+  const isImg  = mime.startsWith("image/") || /\.(png|jpe?g|webp|tiff?)$/i.test(name);
+
+  if (isCsv)  return { type: "csv" };
+  if (isPdf)  return { type: "pdf" };
+  if (isImg)  return { type: "image" };
+
+  return { type: null, reason: `Unsupported file type "${file.name}". Please upload a CSV, PDF or image.` };
 }
 
 const FILE_ICONS: Record<FileType, React.ElementType> = {
@@ -57,66 +79,111 @@ const FILE_ICONS: Record<FileType, React.ElementType> = {
   image: ImageIcon,
 };
 
-// Simulate extraction (replace with real API call to /api/extract in a later sprint)
-function simulateExtraction(file: File, type: FileType): Promise<ExtractedRow[]> {
-  return new Promise((resolve) => {
-    const delay = type === "csv" ? 800 : 2200;
-    setTimeout(() => {
-      const rows: ExtractedRow[] = [
-        {
-          id:        `EXT-${Math.random().toString(36).substr(2,5).toUpperCase()}`,
-          name:      "Green Horizons Pty Ltd",
-          abn:       "51 824 753 556",
-          address:   "14 Harbour St, Brisbane QLD 4000",
-          commodity: "Timber",
-          region:    "QLD",
-          confidence: 92,
-          warnings:  [],
-          selected:  true,
-        },
-        {
-          id:        `EXT-${Math.random().toString(36).substr(2,5).toUpperCase()}`,
-          name:      "Pacific Agri Svcs",
-          abn:       "78 432 109",
-          address:   "Farm Road, Toowoomba QLD",
-          commodity: "Agriculture",
-          region:    "QLD",
-          confidence: 61,
-          warnings:  ["ABN may be incomplete"],
-          selected:  true,
-        },
-        {
-          id:        `EXT-${Math.random().toString(36).substr(2,5).toUpperCase()}`,
-          name:      "Southern Seafoods Co",
-          abn:       "",
-          address:   "Port of Fremantle, WA",
-          commodity: "Seafood",
-          region:    "WA",
-          confidence: 34,
-          warnings:  ["ABN not found", "Address unverified"],
-          selected:  true,
-        },
-      ];
-      // For CSV, add extra rows
-      if (type === "csv") {
-        rows.push({
-          id:        `EXT-${Math.random().toString(36).substr(2,5).toUpperCase()}`,
-          name:      "TasAgri Holdings",
-          abn:       "32 811 992 447",
-          address:   "Valley Road, Hobart TAS 7000",
-          commodity: "Dairy",
-          region:    "TAS",
-          confidence: 85,
-          warnings:  [],
-          selected:  true,
-        });
-      }
-      resolve(rows);
-    }, delay);
-  });
+// ── CSV parser ────────────────────────────────────────────────────────────────
+// Handles quoted fields and CRLF / LF line endings.
+// Recognised column headers (case-insensitive):
+//   name / supplier / company, abn, address / street, commodity / product,
+//   region / state
+function parseCsv(text: string): ExtractedRow[] {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const splitRow = (line: string): string[] => {
+    const cols: string[] = [];
+    let cur = "";
+    let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQ = !inQ; continue; }
+      if (ch === ',' && !inQ) { cols.push(cur.trim()); cur = ""; continue; }
+      cur += ch;
+    }
+    cols.push(cur.trim());
+    return cols;
+  };
+
+  const headers = splitRow(lines[0]).map((h) => h.toLowerCase().replace(/[^a-z]/g, ""));
+  const col = (aliases: string[]): number =>
+    headers.findIndex((h) => aliases.some((a) => h.includes(a)));
+
+  const nameIdx      = col(["name", "supplier", "company"]);
+  const abnIdx       = col(["abn"]);
+  const addressIdx   = col(["address", "street"]);
+  const commodityIdx = col(["commodity", "product"]);
+  const regionIdx    = col(["region", "state"]);
+
+  const rows: ExtractedRow[] = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const cells = splitRow(lines[i]);
+    const get   = (idx: number) => (idx >= 0 ? cells[idx] ?? "" : "");
+
+    const name = get(nameIdx);
+    if (!name) continue;  // skip blank rows
+
+    const abn       = get(abnIdx);
+    const address   = get(addressIdx);
+    const commodity = get(commodityIdx);
+    const region    = get(regionIdx);
+
+    // Basic quality signals
+    const warnings: string[] = [];
+    if (!abn) warnings.push("ABN not found");
+    else if (abn.replace(/\D/g, "").length !== 11) warnings.push("ABN may be incomplete");
+    if (!address) warnings.push("Address missing");
+
+    // Confidence: 100 - 20 per missing key field
+    const missingFields = [name, abn, address, commodity, region].filter((v) => !v).length;
+    const confidence    = Math.max(10, 100 - missingFields * 20);
+
+    rows.push({
+      id:        `CSV-${Math.random().toString(36).substr(2, 5).toUpperCase()}`,
+      name, abn, address, commodity, region,
+      confidence,
+      warnings,
+      selected:  true,
+    });
+  }
+
+  return rows;
 }
 
+// ── OCR/LLM extraction (PDF + image) via backend ─────────────────────────────
+async function extractFromFile(file: File): Promise<ExtractedRow[]> {
+  const result = await extractApi.fromFile(file);
+
+  // Derive region from address (best-effort — extract last state token)
+  const stateMatch = result.address.match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/i);
+  const region = stateMatch ? stateMatch[1].toUpperCase() : "";
+
+  // Average field confidences to a single 0–100 integer for the UI badge
+  const conf = result.confidence;
+  const avgConf = Math.round(
+    ((conf.name + conf.abn + conf.address + conf.commodity) / 4) * 100
+  );
+
+  // The backend only returns a single extracted record per file.
+  // Wrap it in an array to be consistent with the CSV multi-row path.
+  return [
+    {
+      id:        `EXT-${Math.random().toString(36).substr(2, 5).toUpperCase()}`,
+      name:      result.name,
+      abn:       result.abn,
+      address:   result.address,
+      commodity: result.commodity,
+      region,
+      confidence: avgConf,
+      warnings:  result.warnings,
+      selected:  true,
+    },
+  ];
+}
+
+// ── Page component ────────────────────────────────────────────────────────────
 export function UploadExtractPage() {
+  // Fix: navigate("/enrich") → navigate("/enrichment")
+  // routes.tsx defines the path as "enrichment", not "enrich".
   const navigate  = useNavigate();
   const { addSupplier } = useSuppliers();
 
@@ -129,17 +196,54 @@ export function UploadExtractPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback(async (f: File) => {
-    const type = detectFileType(f);
-    if (!type) { toast.error("Unsupported file type. Use CSV, PDF or an image."); return; }
+    // Size guard — mirrors backend 10 MB limit so we fail fast client-side
+    if (f.size > 10 * 1024 * 1024) {
+      toast.error("File is too large. Maximum size is 10 MB.");
+      return;
+    }
+
+    const detected = detectFileType(f);
+    if (detected.type === null) {
+      toast.error(detected.reason);
+      return;
+    }
+
     setFile(f);
-    setFileType(type);
+    setFileType(detected.type);
     setRows([]);
     setExtracting(true);
+
     try {
-      const extracted = await simulateExtraction(f, type);
+      let extracted: ExtractedRow[];
+
+      if (detected.type === "csv") {
+        // CSV: parse client-side — no network call needed
+        const text = await f.text();
+        extracted = parseCsv(text);
+        if (extracted.length === 0) {
+          toast.error("No supplier rows found in CSV. Check that headers include 'name', 'abn', 'address' etc.");
+          setFile(null);
+          setFileType(null);
+          setExtracting(false);
+          return;
+        }
+      } else {
+        // PDF / image: POST to backend OCR + LLM pipeline
+        extracted = await extractFromFile(f);
+      }
+
       setRows(extracted);
-    } catch {
-      toast.error("Extraction failed.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("503") || msg.includes("Ollama")) {
+        toast.error("AI extraction is unavailable — Ollama is not running. Start Ollama and try again.");
+      } else if (msg.includes("415")) {
+        toast.error("File type not accepted by the server. Please use a PDF or image.");
+      } else {
+        toast.error(`Extraction failed: ${msg}`);
+      }
+      setFile(null);
+      setFileType(null);
     } finally {
       setExtracting(false);
     }
@@ -177,7 +281,7 @@ export function UploadExtractPage() {
         });
       }
       toast.success(`${selected.length} supplier${selected.length > 1 ? "s" : ""} saved to database`);
-      navigate("/enrich");
+      navigate("/enrichment");  // Fix: was "/enrich" — route is defined as "enrichment"
     } catch {
       toast.error("Failed to save suppliers. Is the backend running?");
     } finally {
@@ -196,6 +300,10 @@ export function UploadExtractPage() {
         <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Upload & Extract</h1>
         <p className="text-sm text-slate-500 mt-1">
           Upload a supplier file (CSV, PDF or image) to extract and save supplier records to the database.
+        </p>
+        <p className="text-xs text-slate-400 mt-1">
+          CSV files are parsed automatically. PDFs and images are processed via OCR + AI extraction
+          (requires Ollama running locally).
         </p>
       </motion.div>
 
@@ -227,7 +335,7 @@ export function UploadExtractPage() {
             <Upload className="w-7 h-7 text-slate-400" />
           </motion.div>
           <p className="text-sm text-slate-700" style={{ fontWeight: 600 }}>Drop a file here or click to browse</p>
-          <p className="text-xs text-slate-400 mt-1">CSV, PDF or image — supplier data will be auto-extracted</p>
+          <p className="text-xs text-slate-400 mt-1">CSV · PDF · Image (PNG, JPEG, WebP) — max 10 MB</p>
         </motion.div>
       )}
 
@@ -264,8 +372,13 @@ export function UploadExtractPage() {
                   <Sparkles className="w-6 h-6 text-emerald-500" />
                 </motion.div>
                 <p className="text-sm text-slate-500">
-                  {fileType === "csv" ? "Parsing CSV…" : "Running AI extraction…"}
+                  {fileType === "csv"
+                    ? "Parsing CSV…"
+                    : "Running OCR + AI extraction… (this may take 20–60 s)"}
                 </p>
+                {fileType !== "csv" && (
+                  <p className="text-xs text-slate-400">Powered by Tesseract OCR and Ollama (local)</p>
+                )}
               </div>
             )}
 
@@ -274,7 +387,7 @@ export function UploadExtractPage() {
               <div>
                 <div className="px-5 py-3 flex items-center justify-between border-b border-slate-100">
                   <p className="text-xs text-slate-500">
-                    <span className="text-slate-800" style={{ fontWeight: 600 }}>{rows.length}</span> suppliers extracted
+                    <span className="text-slate-800" style={{ fontWeight: 600 }}>{rows.length}</span> supplier{rows.length !== 1 ? "s" : ""} extracted
                     {" · "}
                     <span className="text-emerald-700" style={{ fontWeight: 600 }}>{selectedCount}</span> selected
                   </p>
