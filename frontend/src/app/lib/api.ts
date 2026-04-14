@@ -2,12 +2,18 @@
  * api.ts  —  Centralised typed API client
  *
  * All components import from here — never fetch() directly.
- * Base URL is read from VITE_API_URL env var (falls back to localhost:8000).
+ * Base URL is read from VITE_API_URL env var (falls back to '' so the
+ * Vite dev proxy handles /api/* requests in development).
+ *
+ * Note: suppliersApi has been removed. Supplier data is stored in
+ * session-only React state (SupplierContext) and never written to the
+ * backend database.
  */
 
-// Fix: use import.meta.env directly — the (as any) cast was suppressing
-// TypeScript's help and caused VITE_API_URL to be missed in production builds.
-const BASE: string = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+// Use empty string as fallback so /api/* paths are relative to the current
+// origin in development (handled by the Vite proxy) and in production
+// (handled by the reverse proxy / same-origin deployment).
+const BASE: string = import.meta.env.VITE_API_URL ?? '';
 
 /** Standard JSON request — parses response body as JSON. */
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -20,22 +26,6 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     throw new Error(`API ${res.status}: ${detail}`);
   }
   return res.json() as Promise<T>;
-}
-
-/**
- * Void request — checks res.ok but does NOT call res.json().
- * Use for DELETE / any endpoint that returns 204 No Content.
- * Calling res.json() on a 204 throws SyntaxError: Unexpected end of JSON input.
- */
-async function requestVoid(path: string, options?: RequestInit): Promise<void> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    ...options,
-  });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`API ${res.status}: ${detail}`);
-  }
 }
 
 /** Multipart FormData request — returns JSON. Used for /api/extract. */
@@ -145,31 +135,6 @@ export interface SupplierRiskSummary {
   threatened_species_names: string[];
 }
 
-export interface SupplierRecord {
-  id:                   string;
-  name:                 string;
-  abn:                  string | null;
-  address:              string | null;
-  commodity:            string | null;
-  region:               string | null;
-  confidence_score:     number | null;
-  status:               'pending' | 'validated' | 'approved' | 'rejected';
-  is_validated:         boolean;
-  enriched_name:        string | null;
-  enriched_address:     string | null;
-  abr_status:           string | null;
-  abn_found:            boolean | null;
-  name_discrepancy:     boolean | null;
-  address_discrepancy:  boolean | null;
-  lat:                  number | null;
-  lng:                  number | null;
-  resolution_level:     string | null;
-  inference_method:     string | null;
-  file_name:            string | null;
-  file_type:            string | null;
-  warnings:             string | null;  // pipe-separated in DB
-}
-
 /** Mirrors backend ExtractResult / FieldConfidence schemas */
 export interface ExtractFieldConfidence {
   name:      number;  // 0.0 – 1.0
@@ -255,31 +220,6 @@ export const riskApi = {
     lng:           number;
     buffer_deg?:   number;
   }) => request<SupplierRiskSummary>(`/api/biodiversity/risk-summary${buildQuery(params)}`),
-};
-
-// ── Suppliers API (Epic 1) ────────────────────────────────────────────────────
-
-export const suppliersApi = {
-  list:   ()                                           => request<SupplierRecord[]>('/api/suppliers'),
-  get:    (id: string)                                 => request<SupplierRecord>(`/api/suppliers/${id}`),
-  create: (body: Partial<SupplierRecord>)              =>
-    request<SupplierRecord>('/api/suppliers', { method: 'POST', body: JSON.stringify(body) }),
-  update: (id: string, body: Partial<SupplierRecord>) =>
-    request<SupplierRecord>(`/api/suppliers/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  // Fix: use requestVoid — DELETE returns 204 No Content.
-  // The old request<void> called res.json() on an empty body and threw
-  // SyntaxError: Unexpected end of JSON input on every delete.
-  delete: (id: string) =>
-    requestVoid(`/api/suppliers/${id}`, { method: 'DELETE' }),
-  /**
-   * Trigger ABR enrichment for a single supplier.
-   * POST /api/suppliers/:id/enrich
-   * Returns the updated SupplierRecord with abn_found, enriched_name,
-   * enriched_address, abr_status, name_discrepancy, address_discrepancy,
-   * and confidence_score populated from the real ABR lookup.
-   */
-  enrich: (id: string) =>
-    request<SupplierRecord>(`/api/suppliers/${id}/enrich`, { method: 'POST' }),
 };
 
 // ── Health ────────────────────────────────────────────────────────────────────
