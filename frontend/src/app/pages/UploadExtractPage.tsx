@@ -10,11 +10,13 @@
  *   5. "Finalise & Continue" saves all completed cards into the session
  *      cache (SupplierContext) and navigates to /enrichment
  *
- * No database writes. All supplier data lives in React state for the
- * duration of the browser session only.
+ * State persistence:
+ *   When the user navigates back from a later page, existing suppliers from
+ *   SupplierContext are restored into local card state so their data is
+ *   still visible. They can add more files, remove cards, or clear all.
  */
 
-import { useState, useRef, useCallback, useId } from "react";
+import { useState, useRef, useCallback, useId, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useNavigate } from "react-router";
 import { useSuppliers } from "../context/SupplierContext";
@@ -35,9 +37,11 @@ import {
   ChevronDown,
   ChevronUp,
   Plus,
+  Trash2,
 } from "lucide-react";
 import clsx from "clsx";
 import { toast } from "sonner";
+import { Supplier } from "../context/SupplierContext";
 
 type FileType = "csv" | "pdf" | "image";
 type CardStatus = "queued" | "extracting" | "done" | "error";
@@ -58,8 +62,10 @@ interface SupplierCard {
   confidence: number;   // 0–100
   warnings:   string[];
   // UI state
-  expanded:   boolean;  // inline editor open
-  selected:   boolean;  // included in final export
+  expanded:   boolean;
+  selected:   boolean;
+  // Track whether this card was restored from context (not a new upload)
+  fromContext?: boolean;
 }
 
 // ── File type detection ───────────────────────────────────────────────────────
@@ -79,6 +85,26 @@ function detectFileType(file: File): { type: FileType } | { type: null; reason: 
 const FILE_ICONS: Record<FileType, React.ElementType> = {
   csv: Table, pdf: FileText, image: ImageIcon,
 };
+
+// ── Restore a Supplier from context into a SupplierCard ──────────────────────
+function supplierToCard(s: Supplier): SupplierCard {
+  return {
+    cardId:      s.id,
+    fileName:    s.fileName ?? "(uploaded)",
+    fileType:    (s.fileType as FileType) ?? "csv",
+    status:      "done",
+    expanded:    false,
+    selected:    true,
+    fromContext: true,
+    name:        s.enrichedName ?? s.name,
+    abn:         s.abn ?? "",
+    address:     s.address ?? "",
+    commodity:   s.commodity ?? "",
+    region:      s.region ?? "",
+    confidence:  s.confidenceScore ?? 80,
+    warnings:    s.warnings ?? [],
+  };
+}
 
 // ── CSV parser ────────────────────────────────────────────────────────────────
 function parseCsv(text: string): Omit<SupplierCard, "cardId" | "fileName" | "fileType" | "status" | "expanded">[] {
@@ -119,20 +145,40 @@ function parseCsv(text: string): Omit<SupplierCard, "cardId" | "fileName" | "fil
 // ── Component ─────────────────────────────────────────────────────────────────
 export function UploadExtractPage() {
   const navigate = useNavigate();
-  const { addSupplier, clearAll } = useSuppliers();
+  const { suppliers, addSupplier, updateSupplier, removeSupplier, clearAll } = useSuppliers();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uid = useId();
 
-  const [dragOver, setDragOver] = useState(false);
-  const [cards, setCards]       = useState<SupplierCard[]>([]);
-  const [finalising, setFinalising] = useState(false);
+  const [dragOver,    setDragOver]    = useState(false);
+  const [cards,       setCards]       = useState<SupplierCard[]>([]);
+  const [finalising,  setFinalising]  = useState(false);
+  const [restored,    setRestored]    = useState(false);
+
+  // ── On mount: restore cards from SupplierContext if suppliers already exist
+  useEffect(() => {
+    if (suppliers.length > 0 && cards.length === 0) {
+      setCards(suppliers.map(supplierToCard));
+      setRestored(true);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // run once on mount only
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   const updateCard = (cardId: string, patch: Partial<SupplierCard>) =>
     setCards(prev => prev.map(c => c.cardId === cardId ? { ...c, ...patch } : c));
 
-  const removeCard = (cardId: string) =>
+  const removeCard = (cardId: string) => {
     setCards(prev => prev.filter(c => c.cardId !== cardId));
+    // Also remove from context if it was a previously saved supplier
+    removeSupplier(cardId);
+  };
+
+  const handleClearAll = () => {
+    clearAll();
+    setCards([]);
+    setRestored(false);
+    toast.success("All suppliers cleared.");
+  };
 
   // ── Per-file extraction ────────────────────────────────────────────────────
   const extractFile = useCallback(async (file: File, cardId: string, fileType: FileType) => {
@@ -142,7 +188,6 @@ export function UploadExtractPage() {
         const text = await file.text();
         const parsed = parseCsv(text);
         if (!parsed.length) throw new Error("No supplier rows found. Check CSV headers.");
-        // For CSV: first row goes into this card; extra rows get new cards
         const [first, ...rest] = parsed;
         updateCard(cardId, { ...first, status: "done", expanded: false });
         if (rest.length) {
@@ -204,7 +249,6 @@ export function UploadExtractPage() {
         name: "", abn: "", address: "", commodity: "", region: "",
         confidence: 0, warnings: [],
       });
-      // Start extraction asynchronously — don't await (parallel)
       setTimeout(() => extractFile(file, cardId, detected.type as FileType), 0);
     }
 
@@ -217,21 +261,49 @@ export function UploadExtractPage() {
   };
 
   // ── Finalise ───────────────────────────────────────────────────────────────
+  // Instead of clearAll + re-add everything, we surgically sync:
+  //   - Cards marked fromContext that were edited → updateSupplier
+  //   - New cards (not fromContext) → addSupplier
+  //   - Cards that were removed are already handled by removeCard above
   const handleFinalise = () => {
     const ready = cards.filter(c => c.selected && c.status === "done");
     if (!ready.length) { toast.error("No completed suppliers selected."); return; }
     setFinalising(true);
-    clearAll();
+
+    const existingIds = new Set(suppliers.map(s => s.id));
+
     for (const c of ready) {
-      addSupplier({
-        name: c.name, abn: c.abn, address: c.address,
-        commodity: c.commodity, region: c.region,
-        confidenceScore: c.confidence, status: "pending",
-        isValidated: false, fileName: c.fileName,
-        fileType: c.fileType, warnings: c.warnings,
-      });
+      const payload = {
+        name:            c.name,
+        abn:             c.abn,
+        address:         c.address,
+        commodity:       c.commodity,
+        region:          c.region,
+        confidenceScore: c.confidence,
+        status:          "pending" as const,
+        isValidated:     false,
+        fileName:        c.fileName,
+        fileType:        c.fileType,
+        warnings:        c.warnings,
+      };
+
+      if (c.fromContext && existingIds.has(c.cardId)) {
+        // Already in context — update in place (preserves coordinates,
+        // enrichedName, and any other fields set by later pipeline steps)
+        updateSupplier(c.cardId, payload);
+      } else {
+        // New upload — add fresh
+        addSupplier(payload);
+      }
     }
-    toast.success(`${ready.length} supplier${ready.length > 1 ? "s" : ""} saved to session.`);
+
+    const newCount = ready.filter(c => !c.fromContext || !existingIds.has(c.cardId)).length;
+    const updCount = ready.filter(c =>  c.fromContext &&  existingIds.has(c.cardId)).length;
+    const msg = [
+      newCount > 0 && `${newCount} new supplier${newCount > 1 ? "s" : ""} added`,
+      updCount > 0 && `${updCount} updated`,
+    ].filter(Boolean).join(", ");
+    toast.success(msg || "Suppliers saved to session.");
     navigate("/enrichment");
   };
 
@@ -239,21 +311,55 @@ export function UploadExtractPage() {
   const doneCount  = cards.filter(c => c.status === "done").length;
   const readyCount = cards.filter(c => c.selected && c.status === "done").length;
   const busyCount  = cards.filter(c => c.status === "extracting" || c.status === "queued").length;
+  const newCount   = cards.filter(c => !c.fromContext).length;
 
   return (
     <div className="max-w-3xl mx-auto space-y-6 pb-12">
       {/* Header */}
-      <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}>
-        <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Upload & Extract</h1>
-        <p className="text-sm text-slate-500 mt-1">
-          Upload one or more files. Each file maps to one supplier. Review and edit the extracted
-          data, then finalise to continue to ABN enrichment.
-        </p>
-        <p className="text-xs text-slate-400 mt-1">
-          Data is kept in memory for this session only — no database writes.
-          CSV · PDF · Image (PNG, JPEG, WebP) — max 10 MB each.
-        </p>
+      <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
+        className="flex items-start justify-between gap-4"
+      >
+        <div>
+          <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Upload &amp; Extract</h1>
+          <p className="text-sm text-slate-500 mt-1">
+            Upload one or more files. Each file maps to one supplier. Review and edit the extracted
+            data, then finalise to continue to ABN enrichment.
+          </p>
+          <p className="text-xs text-slate-400 mt-1">
+            Data is kept in memory for this session only — no database writes.
+            CSV · PDF · Image (PNG, JPEG, WebP) — max 10 MB each.
+          </p>
+        </div>
+
+        {/* Clear all button — only shown when there are saved suppliers */}
+        {cards.length > 0 && (
+          <button
+            onClick={handleClearAll}
+            className="flex items-center gap-1.5 px-3 py-2 text-xs border border-slate-200 text-slate-500 hover:bg-red-50 hover:border-red-200 hover:text-red-600 rounded-lg transition-colors flex-shrink-0 mt-1"
+            style={{ fontWeight: 500 }}
+          >
+            <Trash2 className="w-3.5 h-3.5" /> Clear all
+          </button>
+        )}
       </motion.div>
+
+      {/* Restored-from-session banner */}
+      <AnimatePresence>
+        {restored && newCount === 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            className="flex items-center gap-3 px-4 py-3 bg-emerald-50 border border-emerald-100 rounded-xl text-sm text-emerald-700"
+          >
+            <CheckCircle2 className="w-4 h-4 text-emerald-500 flex-shrink-0" />
+            <span>
+              <span style={{ fontWeight: 600 }}>{cards.length} supplier{cards.length > 1 ? "s" : ""} restored from session.</span>
+              {" "}You can add more files, edit details, or continue to enrichment.
+            </span>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Drop zone */}
       <motion.div
@@ -295,8 +401,6 @@ export function UploadExtractPage() {
             onUpdate={patch => updateCard(card.cardId, patch)}
             onRemove={() => removeCard(card.cardId)}
             onRetry={() => {
-              // Re-run extraction — we don't have the File object anymore,
-              // so show a message directing the user to remove and re-add
               toast.info("Remove this card and re-upload the file to retry extraction.");
             }}
           />
@@ -373,6 +477,14 @@ function SupplierCardRow({ card, onUpdate, onRemove, onRetry }: SupplierCardRowP
         card.selected ? "border-slate-200" : "border-slate-100 opacity-60"
       )}
     >
+      {/* Restored-from-session indicator strip */}
+      {card.fromContext && (
+        <div className="px-4 py-1 bg-slate-50 border-b border-slate-100 flex items-center gap-1.5">
+          <CheckCircle2 className="w-2.5 h-2.5 text-emerald-500" />
+          <span className="text-[10px] text-slate-400" style={{ fontWeight: 500 }}>Saved to session</span>
+        </div>
+      )}
+
       {/* Card header */}
       <div className="flex items-center gap-3 px-4 py-3">
         {/* Select checkbox */}
@@ -418,10 +530,9 @@ function SupplierCardRow({ card, onUpdate, onRemove, onRetry }: SupplierCardRowP
           </span>
         )}
 
-        {/* Status badge */}
         {statusBadge}
 
-        {/* Edit toggle (done only) */}
+        {/* Edit toggle */}
         {card.status === "done" && (
           <button
             onClick={() => onUpdate({ expanded: !card.expanded })}
@@ -475,7 +586,7 @@ function SupplierCardRow({ card, onUpdate, onRemove, onRetry }: SupplierCardRowP
         </div>
       )}
 
-      {/* Warnings strip (done, not expanded) */}
+      {/* Warnings strip */}
       {card.status === "done" && !card.expanded && card.warnings.length > 0 && (
         <div className="px-4 pb-3 flex flex-wrap gap-1 border-t border-slate-50 pt-2">
           {card.warnings.map(w => (
@@ -486,7 +597,7 @@ function SupplierCardRow({ card, onUpdate, onRemove, onRetry }: SupplierCardRowP
         </div>
       )}
 
-      {/* Quick summary (done, not expanded) */}
+      {/* Quick summary */}
       {card.status === "done" && !card.expanded && (
         <div className="px-4 pb-3 text-xs text-slate-400">
           {card.abn ? `ABN ${card.abn}` : "No ABN"}
@@ -495,7 +606,7 @@ function SupplierCardRow({ card, onUpdate, onRemove, onRetry }: SupplierCardRowP
         </div>
       )}
 
-      {/* Inline editor (expanded) */}
+      {/* Inline editor */}
       <AnimatePresence>
         {card.expanded && (
           <motion.div
@@ -526,7 +637,6 @@ function SupplierCardRow({ card, onUpdate, onRemove, onRetry }: SupplierCardRowP
                   />
                 </div>
               ))}
-              {/* Warnings inside editor */}
               {card.warnings.length > 0 && (
                 <div className="sm:col-span-2 flex flex-wrap gap-1">
                   {card.warnings.map(w => (
