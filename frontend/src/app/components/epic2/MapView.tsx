@@ -7,14 +7,17 @@
  *  - Marker colour driven by SupplierRiskSummary risk level
  *  - Fly-to on supplier select, pulse animation on hover/select
  *  - Risk legend bottom-left
+ *  - IBRA layer: fetches WKT MultiPolygon geometry from backend and renders
+ *    real bioregion polygons via Leaflet GeoJSON (using `wellknown` to parse WKT)
  */
 
 import { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import { Layers, X } from 'lucide-react';
 import clsx from 'clsx';
+import wellknown from 'wellknown';
 import { Supplier } from '../../context/SupplierContext';
-import { SupplierRiskSummary, speciesApi } from '../../lib/api';
+import { SupplierRiskSummary, speciesApi, ibraApi } from '../../lib/api';
 import 'leaflet/dist/leaflet.css';
 
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png';
@@ -62,10 +65,10 @@ interface LayerDef {
 }
 
 const LAYER_DEFS: LayerDef[] = [
-  { id: 'species',  label: 'Species Occurrences', color: '#8b5cf6', group: 'Biodiversity', desc: 'ALA threatened species records near suppliers' },
+  { id: 'species',  label: 'Species Occurrences',   color: '#8b5cf6', group: 'Biodiversity',     desc: 'ALA threatened species records near suppliers' },
   { id: 'capad',    label: 'CAPAD Protected Areas', color: '#0d9488', group: 'Protected Regions', desc: 'Commonwealth protected areas (CAPAD 2022)' },
   { id: 'kba',      label: 'Key Biodiversity Areas', color: '#16a34a', group: 'Protected Regions', desc: 'BirdLife KBA boundaries' },
-  { id: 'ibra',     label: 'IBRA Bioregions', color: '#2563eb', group: 'Bioregions', desc: 'IBRA 7 bioregion outlines' },
+  { id: 'ibra',     label: 'IBRA Bioregions',       color: '#2563eb', group: 'Bioregions',        desc: 'IBRA 7 bioregion outlines' },
 ];
 
 interface MapViewProps {
@@ -243,18 +246,62 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
       }
 
       if (layerId === 'ibra') {
-        // Show IBRA region label markers at each supplier point
-        suppliers.filter(s => s.coordinates).forEach(s => {
-          const sm = summaries.find(r => r.supplier_id === s.id);
-          if (!sm?.ibra_region) return;
-          L.marker([s.coordinates!.lat, s.coordinates!.lng], {
-            icon: L.divIcon({
-              className: '',
-              html: `<div style="background:#2563eb;color:white;font-size:9px;font-weight:600;padding:2px 6px;border-radius:4px;white-space:nowrap;opacity:0.85">${sm.ibra_region}</div>`,
-              iconAnchor: [0, 0],
-            }),
-            interactive: false,
-          }).addTo(group);
+        // Determine which states are represented by geocoded suppliers
+        const states = [...new Set(
+          suppliers.filter(s => s.coordinates && s.region).map(s => s.region!)
+        )];
+
+        // Fetch IBRA records for each relevant state (fall back to unfiltered if no states known)
+        const fetchStates: (string | undefined)[] = states.length > 0 ? states : [undefined];
+        const allRecords = (
+          await Promise.all(
+            fetchStates.map(st => ibraApi.list({ state: st, limit: 100 }).catch(() => []))
+          )
+        ).flat();
+
+        // Deduplicate by IBRA region code
+        const seen = new Set<string>();
+        const uniqueRecords = allRecords.filter(r => {
+          const key = r.ibra_reg_code ?? r.ibra_reg_name ?? String(r.id);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+
+        uniqueRecords.forEach(record => {
+          if (!record.geometry) return;
+          try {
+            // Parse WKT MultiPolygon string → GeoJSON using `wellknown`
+            const geojson = wellknown.parse(record.geometry);
+            if (!geojson) return;
+
+            // Highlight regions where a supplier's ibra_code matches
+            const isHighlighted = summaries.some(
+              sm => sm.ibra_code === record.ibra_reg_code
+            );
+
+            const areakm2 = record.shape_area
+              ? (record.shape_area / 1_000_000).toFixed(0)
+              : null;
+
+            L.geoJSON(geojson as any, {
+              style: {
+                color:       '#2563eb',
+                weight:      isHighlighted ? 2 : 1,
+                fillColor:   '#2563eb',
+                fillOpacity: isHighlighted ? 0.12 : 0.04,
+                dashArray:   isHighlighted ? undefined : '4 4',
+              },
+            })
+              .bindTooltip(
+                `<b>${record.ibra_reg_name ?? record.ibra_reg_code}</b><br/>`
+                + `${record.state ?? ''}${ areakm2 ? ` · ${areakm2} km²` : ''}`,
+                { sticky: true }
+              )
+              .addTo(group);
+          } catch (err) {
+            console.warn('[MapView] Failed to parse IBRA geometry for', record.ibra_reg_code, err);
+          }
         });
       }
     } catch (e) {
