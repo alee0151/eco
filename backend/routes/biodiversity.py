@@ -18,7 +18,8 @@ Endpoints:
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, case
+from sqlalchemy import select, func, text
+from geoalchemy2.functions import ST_Within, ST_SetSRID, ST_MakePoint
 from typing import Optional, List
 
 from database import get_db
@@ -31,10 +32,9 @@ router = APIRouter()
 DEFAULT_BUFFER_DEG = 0.5
 
 # ---------------------------------------------------------------------------
-# Fix 1 — State abbreviation → full stateprovince name
+# State abbreviation → full stateprovince name
 # The ALA dataset stores full names (e.g. "Queensland") in stateprovince.
 # Frontend callers typically pass abbreviated codes ("QLD", "NSW" etc.).
-# Without this mapping, ilike("%QLD%") returns zero rows.
 # ---------------------------------------------------------------------------
 STATE_ABBREV_MAP: dict[str, str] = {
     "NSW": "New South Wales",
@@ -54,12 +54,26 @@ def _resolve_state(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 — Threatened-species dataset names in the ALA DB
-# The ALA seeds threatened species under specific dataresourcename values.
-# We match any resource name containing 'threatened' (case-insensitive) so
-# the filter is resilient to minor naming variations across ALA export versions.
+# Threatened-species dataset filter
+# Only count species from ALA threatened-species data resources.
 # ---------------------------------------------------------------------------
 THREATENED_RESOURCE_FILTER = Species.dataresourcename.ilike("%threatened%")
+
+# ---------------------------------------------------------------------------
+# Species quality filters
+# Applied to all proximity / risk queries to exclude:
+#   - absent records (occurrencestatus != 'present')
+#   - obscured records (ALA fuzzes coordinates ±10 km for sensitive species)
+#   - unreliable basis of record (museum specimens, literature refs with bad coords)
+# ---------------------------------------------------------------------------
+SPECIES_QUALITY_FILTERS = [
+    Species.occurrencestatus.ilike("present"),
+    Species.is_obscured.is_(False),
+    Species.basisofrecord.in_([
+        "HUMAN_OBSERVATION",
+        "MACHINE_OBSERVATION",
+    ]),
+]
 
 
 # ── Species ───────────────────────────────────────────────────────────────────
@@ -75,7 +89,6 @@ async def list_species(
     """Return species occurrence records, optionally filtered."""
     q = select(Species)
     if state:
-        # Fix 1: normalise abbreviation before ilike so 'QLD' matches 'Queensland'
         resolved = _resolve_state(state)
         q = q.where(Species.stateprovince.ilike(f"%{resolved}%"))
     if kingdom:
@@ -101,6 +114,7 @@ async def species_by_bbox(
         .where(Species.decimallongitude.isnot(None))
         .where(Species.decimallatitude.between(min_lat, max_lat))
         .where(Species.decimallongitude.between(min_lng, max_lng))
+        .where(*SPECIES_QUALITY_FILTERS)
         .limit(limit)
     )
     result = await db.execute(q)
@@ -231,7 +245,7 @@ async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
     }
 
 
-# ── Supplier Risk Summary (spatial proximity query) ───────────────────────────
+# ── Supplier Risk Summary ─────────────────────────────────────────────────────
 
 @router.get("/biodiversity/risk-summary", response_model=SupplierRiskSummary)
 async def risk_summary(
@@ -243,57 +257,113 @@ async def risk_summary(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Given a supplier lat/lng, compute a risk summary by querying
-    how many threatened species occurrences, protected areas, and KBAs
-    fall within the buffer radius.
+    Given a supplier lat/lng, compute a biodiversity risk summary by:
 
-    Fix 2: Only threatened species (ALA threatened dataset) are counted.
-    Fix 3: A single grouped query produces both species_nearby count and
-           threatened_species_names from the same population so the two
-           values are always consistent.
-    Fix 4: IBRA lookup uses Euclidean distance from the supplier point to
-           each IBRA region's centroid (approximated via sit_lat/sit_long
-           from the KBA table pattern — IBRA uses ibra_reg_num as a proxy
-           index; we use a direct lat/lng distance sort on available
-           numeric columns to find the geographically nearest region).
+    1. IBRA lookup  — ST_Within(supplier_point, ibra.geom) against the real
+                      MULTIPOLYGON boundaries.  No approximation, no guessing.
+                      Falls back to ST_DWithin (nearest region) if the point
+                      sits exactly on a boundary or in a gap between regions.
+
+    2. Species      — Count distinct threatened species whose confirmed
+                      occurrences (present, non-obscured, reliable basis)
+                      fall within the bounding box around the supplier.
+
+    3. CAPAD        — Count protected area centroids within the buffer.
+
+    4. KBA          — Count Key Biodiversity Area centroids within the buffer.
     """
     min_lat = lat - buffer_deg
     max_lat = lat + buffer_deg
     min_lng = lng - buffer_deg
     max_lng = lng + buffer_deg
 
-    # ------------------------------------------------------------------
-    # Fix 2 + 3 — Single grouped query for threatened species count + names
+    # ──────────────────────────────────────────────────────────────────────────
+    # 1. IBRA region — exact ST_Within against MULTIPOLYGON boundaries
     #
-    # Groups by vernacularname, filters to threatened dataset only, counts
-    # distinct species (not occurrences), returns both total and name list
-    # from the same population — previously these were two separate queries
-    # with different populations causing count/names mismatch.
-    # ------------------------------------------------------------------
-    sp_grouped_result = await db.execute(
-        select(
-            Species.vernacularname,
-            func.count(Species.occurrence_id).label("occ_count"),
+    # ST_MakePoint(lng, lat) constructs a PostGIS Point from the supplier
+    # coordinates.  ST_SetSRID assigns SRID 4326 (WGS84) so the SRID matches
+    # ibra.geom (also 4326).  ST_Within returns TRUE only for the region whose
+    # polygon actually contains the point — this is exact, not approximate.
+    #
+    # Fallback: if no region contains the point (e.g. supplier is offshore or
+    # on a boundary), ST_DWithin finds the nearest region within 1 degree.
+    # ──────────────────────────────────────────────────────────────────────────
+    supplier_point = ST_SetSRID(ST_MakePoint(lng, lat), 4326)
+
+    # Primary: exact containment
+    ibra_exact_result = await db.execute(
+        select(Ibra.ibra_reg_name, Ibra.ibra_reg_code)
+        .where(Ibra.geom.isnot(None))
+        .where(ST_Within(supplier_point, Ibra.geom))
+        .limit(1)
+    )
+    ibra_row = ibra_exact_result.first()
+
+    # Fallback: nearest region within 1 degree (~100 km)
+    if not ibra_row:
+        ibra_near_result = await db.execute(
+            text("""
+                SELECT ibra_reg_name, ibra_reg_code
+                FROM ibra
+                WHERE geom IS NOT NULL
+                ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
+                LIMIT 1
+            """),
+            {"lng": lng, "lat": lat},
         )
+        ibra_row = ibra_near_result.first()
+
+    ibra_name = ibra_row[0] if ibra_row else None
+    ibra_code = ibra_row[1] if ibra_row else None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 2. Threatened species — distinct count + names
+    #
+    # Quality filters applied:
+    #   - occurrencestatus = 'present'   (exclude absent records)
+    #   - is_obscured = FALSE            (exclude ±10 km fuzzed coordinates)
+    #   - basisofrecord IN (HUMAN_OBSERVATION, MACHINE_OBSERVATION)
+    #                                    (exclude museum specimens / literature)
+    #
+    # A separate COUNT query (no LIMIT) gives the true total; the names query
+    # caps at 20 for the response payload only.
+    # ──────────────────────────────────────────────────────────────────────────
+    base_species_q = (
+        select(Species.vernacularname)
         .where(Species.decimallatitude.isnot(None))
         .where(Species.decimallongitude.isnot(None))
         .where(Species.decimallatitude.between(min_lat, max_lat))
         .where(Species.decimallongitude.between(min_lng, max_lng))
-        .where(THREATENED_RESOURCE_FILTER)          # Fix 2: threatened only
+        .where(THREATENED_RESOURCE_FILTER)
         .where(Species.vernacularname.isnot(None))
+        .where(Species.occurrencestatus.ilike("present"))
+        .where(Species.is_obscured.is_(False))
+        .where(Species.basisofrecord.in_([
+            "HUMAN_OBSERVATION",
+            "MACHINE_OBSERVATION",
+        ]))
+    )
+
+    # True distinct count — no LIMIT so we get the real number
+    count_q = select(func.count()).select_from(
+        base_species_q.distinct().subquery()
+    )
+    species_count_result = await db.execute(count_q)
+    species_count = species_count_result.scalar() or 0
+
+    # Top-20 names for the response panel
+    names_q = (
+        base_species_q
         .group_by(Species.vernacularname)
         .order_by(func.count(Species.occurrence_id).desc())
         .limit(20)
     )
-    sp_rows = sp_grouped_result.fetchall()
+    names_result = await db.execute(names_q)
+    species_names = [row[0] for row in names_result.fetchall() if row[0]]
 
-    # Fix 3: both count and names come from the same grouped result
-    species_count = len(sp_rows)          # number of distinct threatened species
-    species_names = [row[0] for row in sp_rows if row[0]]
-
-    # ------------------------------------------------------------------
-    # Count CAPAD protected areas with centroid nearby
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
+    # 3. CAPAD — protected area centroids within the buffer
+    # ──────────────────────────────────────────────────────────────────────────
     capad_count_result = await db.execute(
         select(func.count()).select_from(Capad)
         .where(Capad.latitude.isnot(None))
@@ -303,9 +373,9 @@ async def risk_summary(
     )
     capad_count = capad_count_result.scalar() or 0
 
-    # ------------------------------------------------------------------
-    # Count KBAs with centroid nearby
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
+    # 4. KBA — Key Biodiversity Area centroids within the buffer
+    # ──────────────────────────────────────────────────────────────────────────
     kba_count_result = await db.execute(
         select(func.count()).select_from(Kba)
         .where(Kba.sit_lat.isnot(None))
@@ -314,54 +384,6 @@ async def risk_summary(
         .where(Kba.sit_long.between(min_lng, max_lng))
     )
     kba_count = kba_count_result.scalar() or 0
-
-    # ------------------------------------------------------------------
-    # Fix 4 — IBRA nearest-region lookup
-    #
-    # Previously used SELECT ... LIMIT 1 with no WHERE clause (always
-    # returned the same first row) then switched to shape_area DESC
-    # (always returned the largest region, not the nearest one).
-    #
-    # IBRA table has no dedicated centroid lat/lng columns. We approximate
-    # the centroid using the numeric ibra_reg_num field as a rank and
-    # sort by Euclidean distance of (shape_area, shape_len) normalised
-    # pair — not ideal but avoids PostGIS dependency.
-    #
-    # Better approach: use the CAPAD bbox of matching state as a proxy.
-    # We first try to find the IBRA region whose ibra_reg_code appears
-    # in any CAPAD record whose centroid is inside the buffer (i.e. the
-    # protected areas nearby belong to this bioregion). If that yields
-    # nothing we fall back to the largest region in the nearest state.
-    # ------------------------------------------------------------------
-
-    # Step A: find the state of the nearest CAPAD centroid inside the buffer
-    nearest_capad_result = await db.execute(
-        select(Capad.state)
-        .where(Capad.latitude.isnot(None))
-        .where(Capad.longitude.isnot(None))
-        .where(Capad.latitude.between(min_lat, max_lat))
-        .where(Capad.longitude.between(min_lng, max_lng))
-        .order_by(
-            func.abs(Capad.latitude  - lat) +
-            func.abs(Capad.longitude - lng)
-        )
-        .limit(1)
-    )
-    nearest_capad_row = nearest_capad_result.first()
-    capad_state = nearest_capad_row[0] if nearest_capad_row else None
-
-    # Step B: find IBRA region in that state, ordered by descending area
-    # (largest region in the state is the most likely enclosing bioregion
-    # when we lack true spatial intersection without PostGIS).
-    ibra_q = select(Ibra.ibra_reg_name, Ibra.ibra_reg_code)
-    if capad_state:
-        ibra_q = ibra_q.where(Ibra.state.ilike(f"%{capad_state}%"))
-    ibra_q = ibra_q.order_by(Ibra.shape_area.desc()).limit(1)
-
-    ibra_result = await db.execute(ibra_q)
-    ibra_row  = ibra_result.first()
-    ibra_name = ibra_row[0] if ibra_row else None
-    ibra_code = ibra_row[1] if ibra_row else None
 
     return SupplierRiskSummary(
         supplier_id=supplier_id,

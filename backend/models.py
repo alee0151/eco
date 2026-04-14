@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text, DateTime,
 )
 from sqlalchemy.orm import DeclarativeBase
+from geoalchemy2 import Geometry
 
 
 class Base(DeclarativeBase):
@@ -76,7 +77,7 @@ class Species(Base):
     ala_licence        = Column(String,  nullable=True)
     cleaned_at         = Column(DateTime(timezone=True), nullable=True)
     geom_wkt           = Column(Text,    nullable=True)
-    geom               = Column(Text,    nullable=True)
+    geom               = Column(Text,    nullable=True)  # raw WKB — use geom_wkt for display
 
 
 # ── Kba (pre-existing, read-only) ─────────────────────────────────────────────
@@ -144,6 +145,17 @@ class Capad(Base):
 # ── Ibra (pre-existing, read-only) ────────────────────────────────────────────
 
 class Ibra(Base):
+    """
+    IBRA 7 bioregions.
+
+    The geom column stores a PostGIS MULTIPOLYGON (SRID 4326) representing
+    the exact boundary of each bioregion. Mapped as GeoAlchemy2 Geometry so
+    SQLAlchemy can pass it directly to PostGIS functions (ST_Within,
+    ST_Intersects) without raw SQL string construction.
+
+    Previously mapped as Text, which returned a raw WKB hex string and made
+    spatial queries impossible through the ORM.
+    """
     __tablename__ = "ibra"
 
     id             = Column(Integer, primary_key=True)
@@ -157,5 +169,5 @@ class Ibra(Base):
     is_active      = Column(Boolean, nullable=True)
     created_at     = Column(DateTime(timezone=True), nullable=True)
     updated_at     = Column(DateTime(timezone=True), nullable=True)
-    geometry       = Column(Text,    nullable=True)
-    geom           = Column(Text,    nullable=True)
+    geometry       = Column(Text,    nullable=True)   # WKT string — for display only
+    geom           = Column(Geometry("MULTIPOLYGON", srid=4326), nullable=True)  # PostGIS — used for ST_Within
