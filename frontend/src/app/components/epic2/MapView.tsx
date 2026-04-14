@@ -7,8 +7,12 @@
  *  - Marker colour driven by SupplierRiskSummary risk level
  *  - Fly-to on supplier select, pulse animation on hover/select
  *  - Risk legend bottom-left
- *  - IBRA layer: fetches WKT MultiPolygon geometry from backend and renders
- *    real bioregion polygons via Leaflet GeoJSON (using `wellknown` to parse WKT)
+ *  - IBRA layer: fetches ALL IBRA 7 bioregion polygons from backend (up to 200 records
+ *    across two paginated fetches) and renders real WKT MultiPolygon geometry via
+ *    Leaflet GeoJSON (using `wellknown` to parse WKT).
+ *    Regions whose ibra_reg_code matches a supplier's ibra_code are highlighted with
+ *    a stronger fill and a solid border; all others are shown as a faint dashed
+ *    reference outline.
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -33,6 +37,9 @@ const RISK_COLORS: Record<string, string> = {
   low:      '#10b981',
   none:     '#94a3b8',
 };
+
+/** IBRA overlay colour — blue teal to distinguish from other layers */
+const IBRA_COLOR = '#2563eb';
 
 function getRiskLevel(summary?: SupplierRiskSummary): string {
   if (!summary) return 'none';
@@ -68,7 +75,7 @@ const LAYER_DEFS: LayerDef[] = [
   { id: 'species',  label: 'Species Occurrences',   color: '#8b5cf6', group: 'Biodiversity',     desc: 'ALA threatened species records near suppliers' },
   { id: 'capad',    label: 'CAPAD Protected Areas', color: '#0d9488', group: 'Protected Regions', desc: 'Commonwealth protected areas (CAPAD 2022)' },
   { id: 'kba',      label: 'Key Biodiversity Areas', color: '#16a34a', group: 'Protected Regions', desc: 'BirdLife KBA boundaries' },
-  { id: 'ibra',     label: 'IBRA Bioregions',       color: '#2563eb', group: 'Bioregions',        desc: 'IBRA 7 bioregion outlines' },
+  { id: 'ibra',     label: 'IBRA Bioregions',       color: IBRA_COLOR, group: 'Bioregions',        desc: 'IBRA 7 bioregion outlines (all 89 regions)' },
 ];
 
 interface MapViewProps {
@@ -133,10 +140,14 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
       }).addTo(map);
 
       const speciesNames = summary?.threatened_species_names.slice(0, 3).join(', ') || 'None recorded';
+      const ibraLabel = summary?.ibra_region
+        ? `${summary.ibra_region}${summary.ibra_code ? ` (${summary.ibra_code})` : ''}`
+        : s.region ?? '';
+
       marker.bindPopup(`
         <div style="min-width:200px;font-family:sans-serif">
           <p style="font-weight:700;font-size:13px;color:#0f172a">${s.enrichedName ?? s.name}</p>
-          <p style="font-size:11px;color:#64748b;margin-top:2px">${summary?.ibra_region ?? s.region ?? ''}</p>
+          <p style="font-size:11px;color:#64748b;margin-top:2px">${ibraLabel}</p>
           <div style="margin-top:8px;padding:6px 8px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0">
             <p style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">Risk Indicators</p>
             <p style="font-size:11px;color:#334155">🦎 <b>${summary?.species_nearby ?? 0}</b> species nearby</p>
@@ -246,20 +257,19 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
       }
 
       if (layerId === 'ibra') {
-        // Determine which states are represented by geocoded suppliers
-        const states = [...new Set(
-          suppliers.filter(s => s.coordinates && s.region).map(s => s.region!)
-        )];
+        // ── IBRA Overlay ────────────────────────────────────────────────────
+        // Fetch all IBRA 7 bioregion polygons from the backend.
+        // There are 89 IBRA regions in Australia; we issue two paginated
+        // requests (limit 100 each at offset 0 and 100) to guarantee full
+        // coverage regardless of the backend's default page size.
+        const [page1, page2] = await Promise.all([
+          ibraApi.list({ limit: 100, offset: 0  }).catch(() => []),
+          ibraApi.list({ limit: 100, offset: 100 }).catch(() => []),
+        ]);
+        const allRecords = [...page1, ...page2];
 
-        // Fetch IBRA records for each relevant state (fall back to unfiltered if no states known)
-        const fetchStates: (string | undefined)[] = states.length > 0 ? states : [undefined];
-        const allRecords = (
-          await Promise.all(
-            fetchStates.map(st => ibraApi.list({ state: st, limit: 100 }).catch(() => []))
-          )
-        ).flat();
-
-        // Deduplicate by IBRA region code
+        // Deduplicate by IBRA region code so we never render a polygon twice
+        // (can happen if the same region spans multiple DB rows)
         const seen = new Set<string>();
         const uniqueRecords = allRecords.filter(r => {
           const key = r.ibra_reg_code ?? r.ibra_reg_name ?? String(r.id);
@@ -268,34 +278,66 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           return true;
         });
 
+        // Build a set of IBRA codes that are linked to at least one supplier
+        // via their risk summary, so we can render highlighted vs reference styles
+        const highlightedCodes = new Set(
+          summaries
+            .filter(sm => sm.ibra_code)
+            .map(sm => sm.ibra_code as string)
+        );
+
         uniqueRecords.forEach(record => {
           if (!record.geometry) return;
           try {
-            // Parse WKT MultiPolygon string → GeoJSON using `wellknown`
+            // Parse WKT MultiPolygon / Polygon string → GeoJSON
             const geojson = wellknown.parse(record.geometry);
             if (!geojson) return;
 
-            // Highlight regions where a supplier's ibra_code matches
-            const isHighlighted = summaries.some(
-              sm => sm.ibra_code === record.ibra_reg_code
-            );
+            const isHighlighted = highlightedCodes.has(record.ibra_reg_code ?? '');
+
+            // Collect supplier names that fall in this bioregion for the tooltip
+            const matchedSuppliers = summaries
+              .filter(sm => sm.ibra_code === record.ibra_reg_code)
+              .map(sm => sm.supplier_name)
+              .filter(Boolean);
 
             const areakm2 = record.shape_area
               ? (record.shape_area / 1_000_000).toFixed(0)
               : null;
 
+            const supplierBadge = matchedSuppliers.length > 0
+              ? `<br/><span style="display:inline-block;margin-top:4px;padding:2px 6px;background:#dbeafe;color:#1d4ed8;border-radius:4px;font-size:10px;font-weight:600">`
+                + `${matchedSuppliers.slice(0, 3).join(', ')}${matchedSuppliers.length > 3 ? ` +${matchedSuppliers.length - 3} more` : ''}`
+                + `</span>`
+              : '';
+
             L.geoJSON(geojson as any, {
-              style: {
-                color:       '#2563eb',
-                weight:      isHighlighted ? 2 : 1,
-                fillColor:   '#2563eb',
-                fillOpacity: isHighlighted ? 0.12 : 0.04,
-                dashArray:   isHighlighted ? undefined : '4 4',
-              },
+              style: isHighlighted
+                ? {
+                    // Highlighted: supplier's bioregion — strong fill, solid border
+                    color:       IBRA_COLOR,
+                    weight:      2.5,
+                    opacity:     0.9,
+                    fillColor:   IBRA_COLOR,
+                    fillOpacity: 0.18,
+                    dashArray:   undefined,
+                  }
+                : {
+                    // Reference: faint dashed outline for geographic context
+                    color:       IBRA_COLOR,
+                    weight:      0.8,
+                    opacity:     0.5,
+                    fillColor:   IBRA_COLOR,
+                    fillOpacity: 0.03,
+                    dashArray:   '4 5',
+                  },
             })
               .bindTooltip(
-                `<b>${record.ibra_reg_name ?? record.ibra_reg_code}</b><br/>`
-                + `${record.state ?? ''}${ areakm2 ? ` · ${areakm2} km²` : ''}`,
+                `<b style="font-size:12px">${record.ibra_reg_name ?? record.ibra_reg_code ?? 'Unknown'}</b>`
+                + `<br/><span style="font-size:10px;color:#64748b">`
+                + `${record.state ?? 'Australia'}${ areakm2 ? ` · ${areakm2} km²` : ''}`
+                + `</span>`
+                + supplierBadge,
                 { sticky: true }
               )
               .addTo(group);
@@ -394,6 +436,34 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           ))}
 
           <p className="px-4 py-2 text-[10px] text-slate-400 border-t border-slate-100">More datasets coming soon: water stress, minerals</p>
+        </div>
+      )}
+
+      {/* ── IBRA legend (shown when IBRA layer is active) ── */}
+      {activeLayers.has('ibra') && (
+        <div className="absolute bottom-20 left-4 bg-white/95 backdrop-blur-sm rounded-xl p-3 shadow-md border border-slate-200/80 z-[1000] min-w-[160px]">
+          <p className="text-[10px] text-slate-500 mb-2 uppercase tracking-wider" style={{ fontWeight: 600 }}>IBRA Bioregions</p>
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span
+                className="w-6 h-3 rounded-sm shrink-0 border-2"
+                style={{ backgroundColor: IBRA_COLOR + '2e', borderColor: IBRA_COLOR }}
+              />
+              <span className="text-[11px] text-slate-600">Supplier region</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span
+                className="w-6 h-3 rounded-sm shrink-0 border"
+                style={{
+                  backgroundColor: IBRA_COLOR + '08',
+                  borderColor: IBRA_COLOR + '80',
+                  borderStyle: 'dashed',
+                }}
+              />
+              <span className="text-[11px] text-slate-600">Reference region</span>
+            </div>
+          </div>
+          <p className="text-[9px] text-slate-400 mt-2 leading-tight">Hover a polygon to see<br/>region name &amp; area</p>
         </div>
       )}
 
