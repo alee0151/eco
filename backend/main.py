@@ -22,11 +22,30 @@ app = FastAPI(
     description="Supply Chain Biodiversity Risk Assessment API",
 )
 
+# Vite's dev server starts at 5173 and auto-increments (5174, 5175 ...)
+# when the preferred port is already in use.  List all common Vite ports so
+# CORS is never blocked just because another process held 5173.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:4173", "http://localhost:3000"],
+    allow_origins=[
+        # Vite dev server (auto-increments when port is busy)
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:5175",
+        "http://localhost:5176",
+        # Vite preview mode
+        "http://localhost:4173",
+        "http://localhost:4174",
+        # Common alternatives
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://127.0.0.1:8000",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
 app.include_router(extract_router,      prefix="/api")
