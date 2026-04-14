@@ -36,6 +36,59 @@ import markerShadow from "leaflet/dist/images/marker-shadow.png";
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({ iconUrl: markerIcon, iconRetinaUrl: markerIcon2x, shadowUrl: markerShadow });
 
+/* ─── State centroids (fallback when Nominatim finds nothing) ─ */
+const STATE_CENTROIDS: Record<string, { lat: number; lng: number }> = {
+  NSW: { lat: -32.1656, lng: 147.0000 },
+  VIC: { lat: -37.0201, lng: 144.9646 },
+  QLD: { lat: -22.5750, lng: 144.0850 },
+  WA:  { lat: -25.0419, lng: 121.8989 },
+  SA:  { lat: -30.0002, lng: 136.2092 },
+  TAS: { lat: -42.0409, lng: 146.5978 },
+  ACT: { lat: -35.4735, lng: 149.0124 },
+  NT:  { lat: -19.4914, lng: 132.5510 },
+};
+// Default centre-of-Australia fallback
+const AUS_CENTRE = { lat: -25.2744, lng: 133.7751 };
+
+/**
+ * Geocode a free-text address using the Nominatim OSM public API.
+ * Returns { lat, lng, level } where level is 'address' | 'state' | 'country'.
+ *
+ * Rate limit: Nominatim allows 1 request/second.
+ * The caller is responsible for staggering calls (see geocodeAll).
+ */
+async function geocodeAddress(
+  address: string
+): Promise<{ lat: number; lng: number; level: string }> {
+  const query = encodeURIComponent(address + ", Australia");
+  const url = `https://nominatim.openstreetmap.org/search?q=${query}&format=json&limit=1&countrycodes=au`;
+  try {
+    const res = await fetch(url, {
+      headers: { "Accept-Language": "en", "User-Agent": "eco-supply-chain-app" },
+    });
+    if (!res.ok) throw new Error(`Nominatim ${res.status}`);
+    const data = await res.json();
+    if (Array.isArray(data) && data.length > 0) {
+      return {
+        lat:   parseFloat(data[0].lat),
+        lng:   parseFloat(data[0].lon),
+        level: data[0].type === "administrative" ? "state" : "address",
+      };
+    }
+  } catch {
+    // Network error or Nominatim down — fall through to state centroid
+  }
+
+  // Fallback: detect state token in address string → use centroid
+  const stateMatch = address.toUpperCase().match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/);
+  if (stateMatch) {
+    const c = STATE_CENTROIDS[stateMatch[1]];
+    return { ...c, level: "state" };
+  }
+
+  return { ...AUS_CENTRE, level: "country" };
+}
+
 /* ─── Helpers ─────────────────────────────────────────────── */
 type ConfidenceTier = "all" | "high" | "medium" | "low";
 
@@ -204,9 +257,15 @@ function SupplierCard({
                   <div className="grid grid-cols-2 gap-x-4 gap-y-2.5">
                     <DataRow icon={Tag}     label="Commodity" value={supplier.commodity || "—"} />
                     <DataRow icon={Hash}    label="ABN"       value={supplier.abn || "—"} />
-                    <DataRow icon={MapPin}  label="Coords"    value={supplier.coordinates
-                      ? `${supplier.coordinates.lat.toFixed(3)}, ${supplier.coordinates.lng.toFixed(3)}`
-                      : "Unmapped"} />
+                    <DataRow icon={MapPin}  label="Coords"
+                      value={
+                        supplier.coordinates
+                          ? `${supplier.coordinates.lat.toFixed(4)}, ${supplier.coordinates.lng.toFixed(4)}${
+                              supplier.resolutionLevel ? ` (${supplier.resolutionLevel})` : ""
+                            }`
+                          : "Unmapped"
+                      }
+                    />
                     <DataRow icon={FileText} label="Source"   value={supplier.fileName || "Upload"} />
                   </div>
 
@@ -309,10 +368,15 @@ export function MapPage() {
 
   // Map state
   const [geocoding, setGeocoding] = useState(true);
+  const [geocodeProgress, setGeocodeProgress] = useState({ done: 0, total: 0 });
   const mapRef = useRef<L.Map | null>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, L.Marker>>(new Map());
   const onMarkerClickRef = useRef<(id: string) => void>(() => {});
+
+  // Track which supplier IDs have already been geocoded this session
+  // so we never call Nominatim twice for the same supplier.
+  const geocodedIds = useRef<Set<string>>(new Set());
 
   // Review state
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -345,31 +409,67 @@ export function MapPage() {
     return () => { map.remove(); mapRef.current = null; };
   }, []);
 
-  /* ── Geocode ── */
+  /* ── Geocode ─────────────────────────────────────────────────────────────
+   *
+   * Replaces the old Math.random() approach.
+   *
+   * For each supplier that doesn't yet have coordinates, call the Nominatim
+   * OSM API with their full address string.  Requests are staggered 1 second
+   * apart to stay within Nominatim's 1 req/s rate limit.
+   *
+   * If Nominatim returns no result the function falls back to the state
+   * centroid (detected from the address string) or the centre of Australia.
+   * resolutionLevel is set accordingly so the UI can show the precision.
+   *
+   * Fix: geocodedIds ref prevents re-geocoding suppliers on every render.
+   * The effect dependency array only includes suppliers.length so it runs
+   * again when new suppliers are added, not on every updateSupplier call.
+   */
   useEffect(() => {
-    const timer = setTimeout(() => {
-      suppliers.forEach((s) => {
-        if (!s.coordinates) {
-          let lat = -25 + Math.random() * 10;
-          let lng = 120 + Math.random() * 25;
-          const a = s.address || "";
-          if (a.includes("QLD")) { lat = -18 + Math.random() * 6; lng = 143 + Math.random() * 5; }
-          else if (a.includes("WA"))  { lat = -25 + Math.random() * 8; lng = 115 + Math.random() * 5; }
-          else if (a.includes("TAS")) { lat = -42 + Math.random() * 2; lng = 145 + Math.random() * 3; }
-          else if (a.includes("SA"))  { lat = -34 + Math.random() * 3; lng = 137 + Math.random() * 3; }
-          else if (a.includes("NSW")) { lat = -33 + Math.random() * 5; lng = 144 + Math.random() * 5; }
-          else if (a.includes("NT"))  { lat = -14 + Math.random() * 5; lng = 131 + Math.random() * 3; }
-          updateSupplier(s.id, {
-            coordinates: { lat, lng },
-            resolutionLevel: a.length > 15 ? "facility" : "regional",
-            inferenceMethod: a.length > 15 ? "Address geocoding" : "Region centroid",
-          });
-        }
-      });
+    // Suppliers that still need geocoding
+    const needsGeocode = suppliers.filter(
+      (s) => !s.coordinates && !geocodedIds.current.has(s.id)
+    );
+
+    if (needsGeocode.length === 0) {
       setGeocoding(false);
-    }, 1000);
-    return () => clearTimeout(timer);
-  }, [suppliers, updateSupplier]);
+      return;
+    }
+
+    setGeocoding(true);
+    setGeocodeProgress({ done: 0, total: needsGeocode.length });
+
+    let cancelled = false;
+
+    const geocodeAll = async () => {
+      for (let i = 0; i < needsGeocode.length; i++) {
+        if (cancelled) break;
+        const s = needsGeocode[i];
+        geocodedIds.current.add(s.id);  // mark before await to prevent double-calls
+
+        const address = s.enrichedAddress || s.address || s.region || "";
+        const { lat, lng, level } = await geocodeAddress(address);
+
+        updateSupplier(s.id, {
+          coordinates:     { lat, lng },
+          resolutionLevel: level === "address" ? "facility" : level === "state" ? "state" : "country",
+          inferenceMethod: level === "address" ? "Nominatim OSM geocoding" : level === "state" ? "State centroid fallback" : "Country centroid fallback",
+        });
+
+        setGeocodeProgress({ done: i + 1, total: needsGeocode.length });
+
+        // Respect Nominatim's 1 req/s rate limit
+        if (i < needsGeocode.length - 1) {
+          await new Promise((r) => setTimeout(r, 1100));
+        }
+      }
+      if (!cancelled) setGeocoding(false);
+    };
+
+    geocodeAll();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [suppliers.length]);  // only re-run when the number of suppliers changes
 
   /* ── Render markers ── */
   useEffect(() => {
@@ -405,6 +505,7 @@ export function MapPage() {
             <p style="font-size:11px;margin-top:6px;font-weight:600;color:${(s.confidenceScore || 0) >= 80 ? "#059669" : (s.confidenceScore || 0) >= 50 ? "#d97706" : "#dc2626"}">
               Confidence: ${s.confidenceScore || 0}%
             </p>
+            <p style="font-size:10px;color:#94a3b8;margin-top:2px">${s.resolutionLevel ? `Location precision: ${s.resolutionLevel}` : ""}</p>
           </div>`
         );
         marker.on("click", () => onMarkerClickRef.current(s.id));
@@ -427,6 +528,39 @@ export function MapPage() {
       setTimeout(() => marker?.openPopup(), 400);
     }
   }, [selectedId, suppliers]);
+
+  /* ── Export CSV ─────────────────────────────────────────────────────────
+   * Fix: Export button previously had no onClick handler.
+   * Now exports all suppliers as a UTF-8 CSV and triggers a download.
+   */
+  const handleExport = useCallback(() => {
+    if (suppliers.length === 0) {
+      toast.error("No suppliers to export.");
+      return;
+    }
+    const headers = ["Name", "ABN", "Address", "Commodity", "Region", "Latitude", "Longitude", "Confidence", "Status", "Resolution Level"];
+    const rows = suppliers.map((s) => [
+      s.enrichedName || s.name || "",
+      s.abn || "",
+      s.enrichedAddress || s.address || "",
+      s.commodity || "",
+      s.region || "",
+      s.coordinates?.lat?.toFixed(6) ?? "",
+      s.coordinates?.lng?.toFixed(6) ?? "",
+      s.confidenceScore ?? "",
+      s.status || "",
+      s.resolutionLevel || "",
+    ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
+    const csv = [headers.join(","), ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `eco-suppliers-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success(`Exported ${suppliers.length} suppliers to CSV`);
+  }, [suppliers]);
 
   /* ── Handlers ── */
   const handleSelect = (id: string) => {
@@ -488,7 +622,7 @@ export function MapPage() {
         <div>
           <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Map & Review</h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Geographically mapped supplier locations — review, edit and approve records.
+            Supplier locations geocoded via OpenStreetMap Nominatim — review, edit and approve records.
           </p>
         </div>
 
@@ -505,11 +639,13 @@ export function MapPage() {
               </span>
             ))}
           </div>
+          {/* Fix: Export button now has an onClick handler */}
           <button
+            onClick={handleExport}
             className="flex items-center gap-1.5 px-3 py-2 text-xs border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg transition-colors"
             style={{ fontWeight: 500 }}
           >
-            <Download className="w-3.5 h-3.5" /> Export
+            <Download className="w-3.5 h-3.5" /> Export CSV
           </button>
         </div>
       </div>
@@ -538,18 +674,34 @@ export function MapPage() {
       <div className="flex-1 flex gap-4 min-h-0">
 
         {/* ── Map panel ── */}
+        {/* Fix: added position:relative so the geocoding overlay anchors correctly */}
         <div className={clsx(
-          "md:flex flex-col rounded-2xl overflow-hidden border border-slate-200 shadow-sm flex-[55] min-h-0",
+          "md:flex flex-col rounded-2xl overflow-hidden border border-slate-200 shadow-sm flex-[55] min-h-0 relative",
           mobileTab === "map" ? "flex" : "hidden md:flex"
         )}>
           {geocoding && (
-            <div className="absolute inset-0 z-[1000] bg-white/70 backdrop-blur-sm flex flex-col items-center justify-center gap-3 rounded-2xl">
+            <div className="absolute inset-0 z-[1000] bg-white/80 backdrop-blur-sm flex flex-col items-center justify-center gap-3 rounded-2xl">
               <motion.div
                 animate={{ rotate: 360 }}
                 transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
                 className="w-7 h-7 border-[3px] border-emerald-500 border-t-transparent rounded-full"
               />
-              <p className="text-sm text-slate-500">Geocoding suppliers…</p>
+              <p className="text-sm text-slate-600" style={{ fontWeight: 500 }}>
+                Geocoding suppliers via OpenStreetMap…
+              </p>
+              {geocodeProgress.total > 0 && (
+                <div className="flex flex-col items-center gap-1.5">
+                  <p className="text-xs text-slate-400">
+                    {geocodeProgress.done} / {geocodeProgress.total} addresses resolved
+                  </p>
+                  <div className="w-40 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                    <motion.div
+                      animate={{ width: `${(geocodeProgress.done / geocodeProgress.total) * 100}%` }}
+                      className="h-full bg-emerald-500 rounded-full"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           )}
           <div ref={mapContainerRef} className="w-full h-full" />
