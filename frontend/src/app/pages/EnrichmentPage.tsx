@@ -16,7 +16,7 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import clsx from "clsx";
-import { suppliersApi } from "../lib/api";
+import { enrichApi } from "../lib/api";
 
 type StepStatus =
   | "waiting"
@@ -51,7 +51,6 @@ const LABELS: Record<StepStatus, string> = {
  * Validates an ABN against the Australian Business Register format:
  * - Strip all spaces and hyphens
  * - Must be exactly 11 digits
- * (The old check was `length >= 3` which incorrectly passed 3-char strings)
  */
 function isValidAbnFormat(abn: string): boolean {
   const digits = abn.replace(/[\s\-]/g, "");
@@ -105,7 +104,8 @@ export function EnrichmentPage() {
     );
 
     /**
-     * Enrich a single supplier via the real ABR backend endpoint.
+     * Enrich a single supplier via POST /api/enrich.
+     * updateSupplier is synchronous (session state only — no DB).
      * Staggered by index so requests don't all fire at once.
      */
     const enrichOne = async (supplierId: string, staggerMs: number) => {
@@ -115,14 +115,14 @@ export function EnrichmentPage() {
       updateRow(supplierId, { status: "connecting", progress: 25 });
       await new Promise((r) => setTimeout(r, 400));
 
-      // Step 2 — validating (client-side format check before hitting network)
+      // Step 2 — client-side format check before hitting network
       updateRow(supplierId, { status: "validating", progress: 50 });
       await new Promise((r) => setTimeout(r, 300));
 
       const supplier = suppliers.find((s) => s.id === supplierId);
       if (!supplier?.abn || !isValidAbnFormat(supplier.abn)) {
         // Invalid ABN format — mark failed immediately, no network call needed
-        await updateSupplier(supplierId, {
+        updateSupplier(supplierId, {
           isValidated: true,
           abnFound: false,
           abrStatus: "",
@@ -132,14 +132,18 @@ export function EnrichmentPage() {
         return;
       }
 
-      // Step 3 — enriching via real API
+      // Step 3 — enrich via ABR backend
       updateRow(supplierId, { status: "enriching", progress: 75 });
 
       try {
-        const enriched = await suppliersApi.enrich(supplierId);
+        const enriched = await enrichApi.enrich(
+          supplier.abn,
+          supplier.name  ?? "",
+          supplier.address ?? "",
+        );
 
-        // Persist the server-returned enrichment data into context (→ DB via PATCH)
-        await updateSupplier(supplierId, {
+        // Persist enrichment data into session context (synchronous — no DB)
+        updateSupplier(supplierId, {
           isValidated:        true,
           enrichedName:       enriched.enriched_name       ?? undefined,
           enrichedAddress:    enriched.enriched_address    ?? undefined,
@@ -161,7 +165,7 @@ export function EnrichmentPage() {
           msg.includes("404") || msg.includes("500") || msg.includes("fetch");
 
         // Persist partial validation state so supplier isn't stuck unvalidated
-        await updateSupplier(supplierId, {
+        updateSupplier(supplierId, {
           isValidated: true,
           confidenceScore: 0,
         });
@@ -176,7 +180,7 @@ export function EnrichmentPage() {
       }
     };
 
-    // Fire all enrichments in parallel, staggered by 700ms each
+    // Fire all enrichments in parallel, staggered by 700 ms each
     const allPromises = pending.map((s, i) => enrichOne(s.id, i * 700));
 
     Promise.allSettled(allPromises).then(() => {
@@ -184,7 +188,7 @@ export function EnrichmentPage() {
     });
   }, [suppliers, updateSupplier, updateRow]);
 
-  // countdown + auto redirect
+  // countdown + auto-redirect
   useEffect(() => {
     if (!isComplete) return;
     const t = setInterval(() => {

@@ -7,7 +7,9 @@
  *
  * Note: suppliersApi has been removed. Supplier data is stored in
  * session-only React state (SupplierContext) and never written to the
- * backend database.
+ * backend database. enrichApi is the only supplier-related API — it
+ * calls POST /api/enrich to look up ABN data from ABR and returns
+ * enriched fields without persisting anything.
  */
 
 // Use empty string as fallback so /api/* paths are relative to the current
@@ -152,6 +154,22 @@ export interface ExtractResult {
   warnings:   string[];
 }
 
+/**
+ * Returned by POST /api/enrich.
+ * The backend looks up the ABN against the Australian Business Register
+ * and returns enriched fields. Nothing is written to any database.
+ */
+export interface EnrichResult {
+  abn:                 string;
+  abn_found:           boolean;
+  enriched_name:       string | null;
+  enriched_address:    string | null;
+  abr_status:          string | null;
+  name_discrepancy:    boolean | null;
+  address_discrepancy: boolean | null;
+  confidence_score:    number | null;
+}
+
 // ── Extract API (Epic 1 — OCR + LLM via Ollama) ───────────────────────────────
 
 export const extractApi = {
@@ -165,6 +183,23 @@ export const extractApi = {
     form.append('file', file);
     return requestFormData<ExtractResult>('/api/extract', form);
   },
+};
+
+// ── Enrich API (Epic 2 — ABN lookup via ABR) ──────────────────────────────────
+
+export const enrichApi = {
+  /**
+   * POST /api/enrich  { abn: string, name: string, address: string }
+   *
+   * Looks up the ABN against the Australian Business Register.
+   * Returns enriched fields only — does NOT write anything to a database.
+   * All persistence is handled by SupplierContext (session-only state).
+   */
+  enrich: (abn: string, name: string, address: string): Promise<EnrichResult> =>
+    request<EnrichResult>('/api/enrich', {
+      method: 'POST',
+      body: JSON.stringify({ abn, name, address }),
+    }),
 };
 
 // ── Species API ───────────────────────────────────────────────────────────────
