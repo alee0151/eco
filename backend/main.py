@@ -16,13 +16,15 @@ from routes.extract      import router as extract_router
 from routes.suppliers    import router as suppliers_router
 from routes.biodiversity import router as biodiversity_router
 
-app = FastAPI(title="eco API", version="0.2.0")
+app = FastAPI(
+    title="eco API",
+    version="0.3.0",
+    description="Supply Chain Biodiversity Risk Assessment API",
+)
 
-# Allow the Vite dev server to call the API directly (dev only).
-# In production, sit behind a reverse proxy so CORS is handled externally.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:4173"],
+    allow_origins=["http://localhost:5173", "http://localhost:4173", "http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,4 +36,4 @@ app.include_router(biodiversity_router, prefix="/api")
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "0.3.0"}

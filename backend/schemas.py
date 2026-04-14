@@ -1,16 +1,124 @@
 """
 schemas.py
 
-Pydantic response schemas — what the API returns to the frontend.
-These match the TypeScript interfaces in frontend/src/app/data/types.ts
-and frontend/src/app/data/epic2-data.ts.
+Pydantic response schemas for the real DB tables:
+  species, kba, capad, ibra
+
+Also keeps the Epic 1 Supplier schemas used by routes/suppliers.py.
 """
 
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, List
 
 
-# ── Epic 1 Schemas ────────────────────────────────────────────────────────────
+# ── species ────────────────────────────────────────────────────────────────────
+
+class SpeciesOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    occurrence_id:    str
+    decimallatitude:  Optional[float]  = None
+    decimallongitude: Optional[float]  = None
+    scientificname:   Optional[str]    = None
+    vernacularname:   Optional[str]    = None
+    taxonconceptid:   Optional[str]    = None
+    kingdom:          Optional[str]    = None
+    occurrencestatus: Optional[str]    = None
+    basisofrecord:    Optional[str]    = None
+    eventdate:        Optional[str]    = None
+    stateprovince:    Optional[str]    = None
+    dataresourcename: Optional[str]    = None
+    is_obscured:      Optional[bool]   = None
+    source_dataset:   Optional[str]    = None
+    ala_licence:      Optional[str]    = None
+    geom_wkt:         Optional[str]    = None
+
+
+# ── kba ──────────────────────────────────────────────────────────────────────
+
+class KbaOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id:           int
+    sit_rec_id:   Optional[int]   = None
+    region:       Optional[str]   = None
+    country:      Optional[str]   = None
+    iso3:         Optional[str]   = None
+    nat_name:     Optional[str]   = None
+    int_name:     Optional[str]   = None
+    sit_lat:      Optional[float] = None
+    sit_long:     Optional[float] = None
+    sit_area_km2: Optional[float] = None
+    kba_status:   Optional[str]   = None
+    kba_class:    Optional[str]   = None
+    iba_status:   Optional[str]   = None
+    source:       Optional[str]   = None
+    shape_area:   Optional[float] = None
+    geometry:     Optional[str]   = None  # WKT for frontend mapping
+
+
+# ── capad ─────────────────────────────────────────────────────────────────────
+
+class CapadOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id:               int
+    pa_id:            Optional[str]   = None
+    pa_name:          Optional[str]   = None
+    pa_type:          Optional[str]   = None
+    pa_type_abbr:     Optional[str]   = None
+    iucn_cat:         Optional[str]   = None
+    nrs_pa:           Optional[bool]  = None
+    gaz_area_ha:      Optional[float] = None
+    gis_area_ha:      Optional[float] = None
+    state:            Optional[str]   = None
+    environ:          Optional[str]   = None
+    epbc_trigger:     Optional[str]   = None
+    latitude:         Optional[float] = None
+    longitude:        Optional[float] = None
+    governance:       Optional[str]   = None
+    authority:        Optional[str]   = None
+    effective_area_ha: Optional[float] = None
+    source_dataset:   Optional[str]   = None
+    capad_version:    Optional[str]   = None
+    is_active:        Optional[bool]  = None
+    geom_wkt:         Optional[str]   = None  # WKT for frontend mapping
+
+
+# ── ibra ──────────────────────────────────────────────────────────────────────
+
+class IbraOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id:             int
+    ibra_reg_name:  Optional[str]   = None
+    ibra_reg_code:  Optional[str]   = None
+    ibra_reg_num:   Optional[int]   = None
+    state:          Optional[str]   = None
+    shape_area:     Optional[float] = None
+    shape_len:      Optional[float] = None
+    is_active:      Optional[bool]  = None
+    geometry:       Optional[str]   = None  # WKT for frontend mapping
+
+
+# ── Supplier risk summary — joins real GIS data to a supplier location ──────
+# Used by Epic 2 risk profile panel (replaces mock epic2-data.ts)
+
+class SupplierRiskSummary(BaseModel):
+    """Computed risk profile for a supplier lat/lng against real DB data."""
+    supplier_id:              str
+    supplier_name:            str
+    lat:                      float
+    lng:                      float
+    ibra_region:              Optional[str]  = None
+    ibra_code:                Optional[str]  = None
+    protected_areas_nearby:   int            = 0   # count of CAPAD records within buffer
+    kba_nearby:               int            = 0   # count of KBA records within buffer
+    species_nearby:           int            = 0   # count of species occurrences within buffer
+    threatened_species_names: List[str]      = []
+
+
+# ── Epic 1 Supplier schemas (unchanged) ───────────────────────────────────────
 
 class SupplierOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -36,11 +144,10 @@ class SupplierOut(BaseModel):
     inference_method:    Optional[str]  = None
     file_name:           Optional[str]  = None
     file_type:           Optional[str]  = None
-    warnings:            Optional[str]  = None  # JSON string
+    warnings:            Optional[str]  = None
 
 
 class SupplierCreate(BaseModel):
-    """Body accepted when saving an extracted supplier record."""
     id:               str
     name:             str
     abn:              Optional[str]  = None
@@ -52,36 +159,3 @@ class SupplierCreate(BaseModel):
     file_name:        Optional[str]  = None
     file_type:        Optional[str]  = None
     warnings:         Optional[str]  = None
-
-
-# ── Epic 2 Schemas ────────────────────────────────────────────────────────────
-
-class ThreatenedSpeciesOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id:           int
-    name:         str
-    species_type: Optional[str] = None
-    status:       Optional[str] = None
-
-
-class BiodiversitySupplierOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id:                       str
-    name:                     str
-    region:                   Optional[str]   = None
-    lat:                      Optional[float] = None
-    lng:                      Optional[float] = None
-    risk_score:               Optional[int]   = None
-    risk_level:               Optional[str]   = None
-    protected_area_overlap:   Optional[float] = None
-    threatened_species_count: Optional[int]   = None
-    vegetation_condition:     Optional[float] = None
-    deforestation_rate:       Optional[float] = None
-    water_stress_index:       Optional[float] = None
-    carbon_stock:             Optional[float] = None
-    last_assessment:          Optional[str]   = None
-    industry:                 Optional[str]   = None
-    notes:                    Optional[str]   = None
-    threatened_species:       List[ThreatenedSpeciesOut] = []

@@ -1,146 +1,148 @@
 """
 models.py
 
-SQLAlchemy ORM table definitions.
-These must match the tables you created in DBeaver / PostgreSQL.
+SQLAlchemy ORM table definitions mapped to the REAL tables
+already present in the PostgreSQL / DBeaver database:
+
+  - species   : species occurrence records (ALA / GBIF data)
+  - kba       : Key Biodiversity Areas
+  - capad     : Conservation and Protected Areas Database of Australia
+  - ibra      : Interim Biogeographic Regionalisation for Australia
+
+PostGIS system tables (spatial_ref_sys, geometry_columns, etc.)
+are read-only views managed by PostGIS — not mapped here.
 """
 
 from sqlalchemy import (
     Column, String, Integer, Float, Boolean,
-    Text, DateTime, ForeignKey, Enum as SAEnum,
+    Text, DateTime, BigInteger,
 )
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-import enum
-
-from database import Base
+from sqlalchemy.orm import DeclarativeBase
 
 
-# ── Enums ─────────────────────────────────────────────────────────────────────
-
-class SupplierStatus(str, enum.Enum):
-    pending   = "pending"
-    validated = "validated"
-    approved  = "approved"
-    rejected  = "rejected"
+class Base(DeclarativeBase):
+    pass
 
 
-class RiskLevel(str, enum.Enum):
-    low      = "low"
-    medium   = "medium"
-    high     = "high"
-    critical = "critical"
+# ── species ────────────────────────────────────────────────────────────────────
 
-
-class SpeciesType(str, enum.Enum):
-    mammal    = "mammal"
-    bird      = "bird"
-    reptile   = "reptile"
-    amphibian = "amphibian"
-    plant     = "plant"
-    insect    = "insect"
-
-
-class SpeciesStatus(str, enum.Enum):
-    critically_endangered = "critically_endangered"
-    endangered            = "endangered"
-    vulnerable            = "vulnerable"
-
-
-# ── Epic 1 — Supplier (document-extracted) ────────────────────────────────────
-
-class Supplier(Base):
+class Species(Base):
     """
-    Mirrors the `suppliers` table.
-    Populated when the /api/extract endpoint processes a document
-    and the user approves the extracted data.
+    Species occurrence records sourced from ALA / GBIF.
+    Each row is one sighting of a species at a location.
     """
-    __tablename__ = "suppliers"
+    __tablename__ = "species"
 
-    id               = Column(String(20),  primary_key=True)          # e.g. SUP-001
-    name             = Column(String(255), nullable=False)
-    abn              = Column(String(20),  nullable=True)
-    address          = Column(Text,        nullable=True)
-    commodity        = Column(String(100), nullable=True)
-    region           = Column(String(100), nullable=True)
-    confidence_score = Column(Integer,     nullable=True)              # 0-100
-    status           = Column(
-        SAEnum(SupplierStatus, name="supplier_status"),
-        nullable=False,
-        default=SupplierStatus.pending,
-    )
-    is_validated       = Column(Boolean,   default=False)
-    enriched_name      = Column(String(255), nullable=True)
-    enriched_address   = Column(Text,        nullable=True)
-    abr_status         = Column(String(50),  nullable=True)
-    abn_found          = Column(Boolean,     nullable=True)
-    name_discrepancy   = Column(Boolean,     nullable=True)
-    address_discrepancy = Column(Boolean,    nullable=True)
-    lat                = Column(Float,       nullable=True)
-    lng                = Column(Float,       nullable=True)
-    resolution_level   = Column(String(20),  nullable=True)
-    inference_method   = Column(String(50),  nullable=True)
-    file_name          = Column(String(255), nullable=True)
-    file_type          = Column(String(10),  nullable=True)
-    warnings           = Column(Text,        nullable=True)  # JSON array stored as text
-    created_at         = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at         = Column(DateTime(timezone=True), onupdate=func.now())
+    occurrence_id      = Column(String,  primary_key=True)
+    decimallatitude    = Column(Float,   nullable=True)
+    decimallongitude   = Column(Float,   nullable=True)
+    scientificname     = Column(String,  nullable=True)
+    vernacularname     = Column(String,  nullable=True)
+    taxonconceptid     = Column(String,  nullable=True)
+    kingdom            = Column(String,  nullable=True)
+    occurrencestatus   = Column(String,  nullable=True)  # e.g. PRESENT / ABSENT
+    basisofrecord      = Column(String,  nullable=True)  # e.g. HUMAN_OBSERVATION
+    eventdate          = Column(String,  nullable=True)  # stored as text in source data
+    stateprovince      = Column(String,  nullable=True)
+    dataresourcename   = Column(String,  nullable=True)
+    is_obscured        = Column(Boolean, nullable=True)
+    source_dataset     = Column(String,  nullable=True)
+    ala_licence        = Column(String,  nullable=True)
+    cleaned_at         = Column(DateTime(timezone=True), nullable=True)
+    geom_wkt           = Column(Text,    nullable=True)  # WKT geometry string
+    geom               = Column(Text,    nullable=True)  # PostGIS geometry (raw)
 
 
-# ── Epic 2 — Biodiversity / Environmental risk ────────────────────────────────
+# ── kba ──────────────────────────────────────────────────────────────────────
 
-class BiodiversitySupplier(Base):
+class Kba(Base):
     """
-    Mirrors the `biodiversity_suppliers` table.
-    Stores environmental risk metrics per supplier/site.
+    Key Biodiversity Areas — internationally recognised sites
+    critical for biodiversity conservation.
     """
-    __tablename__ = "biodiversity_suppliers"
+    __tablename__ = "kba"
 
-    id                       = Column(String(20),  primary_key=True)  # e.g. SUP-001
-    name                     = Column(String(255), nullable=False)
-    region                   = Column(String(100), nullable=True)
-    lat                      = Column(Float,       nullable=True)
-    lng                      = Column(Float,       nullable=True)
-    risk_score               = Column(Integer,     nullable=True)     # 0-100
-    risk_level               = Column(
-        SAEnum(RiskLevel, name="risk_level"),
-        nullable=True,
-    )
-    protected_area_overlap   = Column(Float,  nullable=True)          # %
-    threatened_species_count = Column(Integer, nullable=True)
-    vegetation_condition     = Column(Float,  nullable=True)          # 0-100
-    deforestation_rate       = Column(Float,  nullable=True)          # % per year
-    water_stress_index       = Column(Float,  nullable=True)          # 0-100
-    carbon_stock             = Column(Float,  nullable=True)          # tonnes/ha
-    last_assessment          = Column(String(20), nullable=True)      # ISO date
-    industry                 = Column(String(100), nullable=True)
-    notes                    = Column(Text, nullable=True)
-
-    # One-to-many: each site can have multiple threatened species records
-    threatened_species = relationship(
-        "ThreatenedSpecies",
-        back_populates="supplier",
-        cascade="all, delete-orphan",
-    )
+    id            = Column(Integer, primary_key=True)
+    sit_rec_id    = Column(Integer, nullable=True)    # site record ID
+    region        = Column(String,  nullable=True)
+    country       = Column(String,  nullable=True)
+    iso3          = Column(String,  nullable=True)    # ISO 3166-1 alpha-3
+    nat_name      = Column(String,  nullable=True)    # national name
+    int_name      = Column(String,  nullable=True)    # international name
+    sit_lat       = Column(Float,   nullable=True)
+    sit_long      = Column(Float,   nullable=True)
+    sit_area_km2  = Column(Float,   nullable=True)
+    kba_status    = Column(String,  nullable=True)    # e.g. "KBA"
+    kba_class     = Column(String,  nullable=True)
+    iba_status    = Column(String,  nullable=True)    # Important Bird Area status
+    last_update   = Column(DateTime(timezone=True), nullable=True)
+    source        = Column(String,  nullable=True)
+    shape_leng    = Column(Float,   nullable=True)
+    shape_area    = Column(Float,   nullable=True)
+    geometry      = Column(Text,    nullable=True)    # WKT / GeoJSON text
+    geom          = Column(Text,    nullable=True)    # PostGIS geometry
 
 
-class ThreatenedSpecies(Base):
+# ── capad ─────────────────────────────────────────────────────────────────────
+
+class Capad(Base):
     """
-    Mirrors the `threatened_species` table.
-    Each row is one species observed at a supplier/site.
+    Conservation and Protected Areas Database of Australia.
+    Contains every gazetted protected area in Australia.
     """
-    __tablename__ = "threatened_species"
+    __tablename__ = "capad"
 
-    id          = Column(Integer, primary_key=True, autoincrement=True)
-    supplier_id = Column(String(20), ForeignKey("biodiversity_suppliers.id"), nullable=False)
-    name        = Column(String(255), nullable=False)
-    species_type = Column(
-        SAEnum(SpeciesType, name="species_type"),
-        nullable=True,
-    )
-    status      = Column(
-        SAEnum(SpeciesStatus, name="species_status"),
-        nullable=True,
-    )
+    id                = Column(Integer, primary_key=True)
+    objectid          = Column(Integer, nullable=True)
+    pa_id             = Column(String,  nullable=True)   # protected area ID
+    pa_name           = Column(String,  nullable=True)
+    pa_type           = Column(String,  nullable=True)   # e.g. "National Park"
+    pa_type_abbr      = Column(String,  nullable=True)
+    iucn_cat          = Column(String,  nullable=True)   # IUCN category e.g. "II"
+    nrs_pa            = Column(Boolean, nullable=True)   # in National Reserve System?
+    gaz_area_ha       = Column(Float,   nullable=True)   # gazetted area (ha)
+    gis_area_ha       = Column(Float,   nullable=True)   # GIS-calculated area (ha)
+    state             = Column(String,  nullable=True)
+    environ           = Column(String,  nullable=True)   # e.g. "Terrestrial"
+    epbc_trigger      = Column(String,  nullable=True)
+    latitude          = Column(Float,   nullable=True)
+    longitude         = Column(Float,   nullable=True)
+    latest_gaz        = Column(DateTime(timezone=True), nullable=True)
+    pa_pid            = Column(String,  nullable=True)
+    governance        = Column(String,  nullable=True)
+    authority         = Column(String,  nullable=True)
+    gaz_date          = Column(DateTime(timezone=True), nullable=True)
+    effective_area_ha = Column(Float,   nullable=True)
+    source_dataset    = Column(String,  nullable=True)
+    capad_version     = Column(String,  nullable=True)
+    capad_citation    = Column(String,  nullable=True)
+    capad_licence     = Column(String,  nullable=True)
+    cleaned_at        = Column(DateTime(timezone=True), nullable=True)
+    is_active         = Column(Boolean, nullable=True)
+    geom_wkt          = Column(Text,    nullable=True)
+    geom              = Column(Text,    nullable=True)
 
-    supplier = relationship("BiodiversitySupplier", back_populates="threatened_species")
+
+# ── ibra ──────────────────────────────────────────────────────────────────────
+
+class Ibra(Base):
+    """
+    Interim Biogeographic Regionalisation for Australia.
+    Defines Australia's 89 bioregions and 419 sub-regions.
+    Used to map supplier locations to bioregional context.
+    """
+    __tablename__ = "ibra"
+
+    id           = Column(Integer, primary_key=True)
+    objectid     = Column(Integer, nullable=True)
+    ibra_reg_name = Column(String, nullable=True)   # e.g. "Brigalow Belt South"
+    ibra_reg_code = Column(String, nullable=True)   # e.g. "BBS"
+    ibra_reg_num  = Column(Integer, nullable=True)
+    state         = Column(String, nullable=True)
+    shape_area    = Column(Float,  nullable=True)
+    shape_len     = Column(Float,  nullable=True)
+    is_active     = Column(Boolean, nullable=True)
+    created_at    = Column(DateTime(timezone=True), nullable=True)
+    updated_at    = Column(DateTime(timezone=True), nullable=True)
+    geometry      = Column(Text,   nullable=True)   # WKT / GeoJSON text
+    geom          = Column(Text,   nullable=True)   # PostGIS geometry
