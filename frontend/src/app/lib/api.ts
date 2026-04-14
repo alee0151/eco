@@ -271,6 +271,15 @@ export const suppliersApi = {
   // SyntaxError: Unexpected end of JSON input on every delete.
   delete: (id: string) =>
     requestVoid(`/api/suppliers/${id}`, { method: 'DELETE' }),
+  /**
+   * Trigger ABR enrichment for a single supplier.
+   * POST /api/suppliers/:id/enrich
+   * Returns the updated SupplierRecord with abn_found, enriched_name,
+   * enriched_address, abr_status, name_discrepancy, address_discrepancy,
+   * and confidence_score populated from the real ABR lookup.
+   */
+  enrich: (id: string) =>
+    request<SupplierRecord>(`/api/suppliers/${id}/enrich`, { method: 'POST' }),
 };
 
 // ── Health ────────────────────────────────────────────────────────────────────
