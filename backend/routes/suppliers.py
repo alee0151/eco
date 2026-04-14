@@ -1,59 +1,47 @@
 """
-routes/suppliers.py
-
-Epic 1 — Supplier CRUD endpoints.
-All data is read from / written to PostgreSQL via SQLAlchemy async.
+routes/suppliers.py  —  Epic 1 supplier CRUD
 
 Endpoints:
-  GET  /api/suppliers          — list all suppliers
-  GET  /api/suppliers/{id}     — get one supplier
-  POST /api/suppliers          — create / upsert a supplier
-  PATCH /api/suppliers/{id}    — update status or fields
-  DELETE /api/suppliers/{id}   — delete a supplier
+  GET    /api/suppliers          list all
+  GET    /api/suppliers/{id}     get one
+  POST   /api/suppliers          create
+  PATCH  /api/suppliers/{id}     update (status, enrichment, coords, etc.)
+  DELETE /api/suppliers/{id}     delete
 """
 
-import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from typing import List
 
 from database import get_db
-from models import Supplier
+from models import Supplier as SupplierModel
 from schemas import SupplierOut, SupplierCreate
 
 router = APIRouter()
 
 
-@router.get("/suppliers", response_model=list[SupplierOut])
+@router.get("/suppliers", response_model=List[SupplierOut])
 async def list_suppliers(db: AsyncSession = Depends(get_db)):
-    """Return all suppliers ordered by creation date desc."""
-    result = await db.execute(
-        select(Supplier).order_by(Supplier.created_at.desc())
-    )
+    result = await db.execute(select(SupplierModel).order_by(SupplierModel.name))
     return result.scalars().all()
 
 
 @router.get("/suppliers/{supplier_id}", response_model=SupplierOut)
 async def get_supplier(supplier_id: str, db: AsyncSession = Depends(get_db)):
-    supplier = await db.get(Supplier, supplier_id)
-    if not supplier:
-        raise HTTPException(status_code=404, detail=f"Supplier '{supplier_id}' not found")
-    return supplier
+    s = await db.get(SupplierModel, supplier_id)
+    if not s:
+        raise HTTPException(status_code=404, detail=f"Supplier {supplier_id} not found")
+    return s
 
 
 @router.post("/suppliers", response_model=SupplierOut, status_code=201)
 async def create_supplier(body: SupplierCreate, db: AsyncSession = Depends(get_db)):
-    """Insert a new supplier, or update if the ID already exists (upsert)."""
-    existing = await db.get(Supplier, body.id)
+    # Prevent duplicate IDs
+    existing = await db.get(SupplierModel, body.id)
     if existing:
-        # Update editable fields
-        for field, value in body.model_dump(exclude_unset=True).items():
-            setattr(existing, field, value)
-        await db.commit()
-        await db.refresh(existing)
-        return existing
-
-    supplier = Supplier(**body.model_dump())
+        raise HTTPException(status_code=409, detail=f"Supplier {body.id} already exists")
+    supplier = SupplierModel(**body.model_dump())
     db.add(supplier)
     await db.commit()
     await db.refresh(supplier)
@@ -66,22 +54,30 @@ async def update_supplier(
     body: dict,
     db: AsyncSession = Depends(get_db),
 ):
-    """Partial update — useful for status changes and validation flags."""
-    supplier = await db.get(Supplier, supplier_id)
-    if not supplier:
-        raise HTTPException(status_code=404, detail=f"Supplier '{supplier_id}' not found")
-    for field, value in body.items():
-        if hasattr(supplier, field):
-            setattr(supplier, field, value)
+    s = await db.get(SupplierModel, supplier_id)
+    if not s:
+        raise HTTPException(status_code=404, detail=f"Supplier {supplier_id} not found")
+    # Allow partial update of any column
+    allowed = {
+        "name", "abn", "address", "commodity", "region",
+        "confidence_score", "status", "is_validated",
+        "enriched_name", "enriched_address", "abr_status",
+        "abn_found", "name_discrepancy", "address_discrepancy",
+        "lat", "lng", "resolution_level", "inference_method",
+        "file_name", "file_type", "warnings",
+    }
+    for key, value in body.items():
+        if key in allowed:
+            setattr(s, key, value)
     await db.commit()
-    await db.refresh(supplier)
-    return supplier
+    await db.refresh(s)
+    return s
 
 
 @router.delete("/suppliers/{supplier_id}", status_code=204)
 async def delete_supplier(supplier_id: str, db: AsyncSession = Depends(get_db)):
-    supplier = await db.get(Supplier, supplier_id)
-    if not supplier:
-        raise HTTPException(status_code=404, detail=f"Supplier '{supplier_id}' not found")
-    await db.delete(supplier)
+    s = await db.get(SupplierModel, supplier_id)
+    if not s:
+        raise HTTPException(status_code=404, detail=f"Supplier {supplier_id} not found")
+    await db.delete(s)
     await db.commit()

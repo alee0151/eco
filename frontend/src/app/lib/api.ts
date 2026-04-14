@@ -1,16 +1,11 @@
 /**
- * api.ts
+ * api.ts  —  Centralised typed API client
  *
- * Centralised typed API client for the eco backend.
- * Covers all real DB tables: species, kba, capad, ibra
- * plus Epic 1 supplier management.
- *
- * Usage:
- *   import { speciesApi, capadApi, kbaApi, ibraApi, suppliersApi } from '@/app/lib/api';
- *   const species = await speciesApi.list({ state: 'QLD', limit: 200 });
+ * All components import from here — never fetch() directly.
+ * Base URL is read from VITE_API_URL env var (falls back to localhost:8000).
  */
 
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
+const BASE = (import.meta as any).env?.VITE_API_URL ?? 'http://localhost:8000';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -32,7 +27,7 @@ function buildQuery(params: Record<string, string | number | boolean | undefined
   return q ? `?${q}` : '';
 }
 
-// ── Types ──────────────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface SpeciesRecord {
   occurrence_id:    string;
@@ -122,23 +117,31 @@ export interface SupplierRiskSummary {
 }
 
 export interface SupplierRecord {
-  id:                  string;
-  name:                string;
-  abn:                 string | null;
-  address:             string | null;
-  commodity:           string | null;
-  region:              string | null;
-  confidence_score:    number | null;
-  status:              'pending' | 'validated' | 'approved' | 'rejected';
-  is_validated:        boolean;
-  lat:                 number | null;
-  lng:                 number | null;
-  file_name:           string | null;
-  file_type:           string | null;
-  warnings:            string | null;
+  id:                   string;
+  name:                 string;
+  abn:                  string | null;
+  address:              string | null;
+  commodity:            string | null;
+  region:               string | null;
+  confidence_score:     number | null;
+  status:               'pending' | 'validated' | 'approved' | 'rejected';
+  is_validated:         boolean;
+  enriched_name:        string | null;
+  enriched_address:     string | null;
+  abr_status:           string | null;
+  abn_found:            boolean | null;
+  name_discrepancy:     boolean | null;
+  address_discrepancy:  boolean | null;
+  lat:                  number | null;
+  lng:                  number | null;
+  resolution_level:     string | null;
+  inference_method:     string | null;
+  file_name:            string | null;
+  file_type:            string | null;
+  warnings:             string | null;  // pipe-separated in DB
 }
 
-// ── Species API ────────────────────────────────────────────────────────────────
+// ── Species API ───────────────────────────────────────────────────────────────
 
 export const speciesApi = {
   list: (params?: { state?: string; kingdom?: string; limit?: number; offset?: number }) =>
@@ -148,7 +151,7 @@ export const speciesApi = {
     request<SpeciesRecord[]>(`/api/biodiversity/species/by-bbox${buildQuery(bbox)}`),
 };
 
-// ── KBA API ──────────────────────────────────────────────────────────────────
+// ── KBA API ───────────────────────────────────────────────────────────────────
 
 export const kbaApi = {
   list: (params?: { region?: string; limit?: number; offset?: number }) =>
@@ -171,7 +174,7 @@ export const capadApi = {
     request<CapadRecord>(`/api/biodiversity/capad/${id}`),
 };
 
-// ── IBRA API ─────────────────────────────────────────────────────────────────
+// ── IBRA API ──────────────────────────────────────────────────────────────────
 
 export const ibraApi = {
   list: (params?: { state?: string; limit?: number; offset?: number }) =>
@@ -193,20 +196,21 @@ export const riskApi = {
   }) => request<SupplierRiskSummary>(`/api/biodiversity/risk-summary${buildQuery(params)}`),
 };
 
-// ── Suppliers API (Epic 1) ───────────────────────────────────────────────────────
+// ── Suppliers API (Epic 1) ────────────────────────────────────────────────────
 
 export const suppliersApi = {
-  list:   ()                                   => request<SupplierRecord[]>('/api/suppliers'),
-  get:    (id: string)                         => request<SupplierRecord>(`/api/suppliers/${id}`),
-  create: (body: Partial<SupplierRecord>)      =>
+  list:   ()                                       => request<SupplierRecord[]>('/api/suppliers'),
+  get:    (id: string)                             => request<SupplierRecord>(`/api/suppliers/${id}`),
+  create: (body: Partial<SupplierRecord>)          =>
     request<SupplierRecord>('/api/suppliers', { method: 'POST', body: JSON.stringify(body) }),
   update: (id: string, body: Partial<SupplierRecord>) =>
     request<SupplierRecord>(`/api/suppliers/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  delete: (id: string)                         =>
+  delete: (id: string)                             =>
     request<void>(`/api/suppliers/${id}`, { method: 'DELETE' }),
 };
 
-// ── Health ──────────────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────────────────
+
 export const healthApi = {
   check: () => request<{ status: string; version: string }>('/api/health'),
 };
