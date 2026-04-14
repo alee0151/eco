@@ -4,11 +4,17 @@ Backend API  (FastAPI)
 
 Start with:
   uvicorn main:app --reload --port 8000
+
+uvicorn is configured below to watch only the backend/ source directory.
+Without this, WatchFiles watches the entire working directory including
+.venv, which causes infinite reload loops every time numpy or shapely
+import their own files during startup.
 """
 
 from dotenv import load_dotenv
 load_dotenv()  # load .env before anything reads os.getenv()
 
+import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -56,3 +62,23 @@ app.include_router(biodiversity_router, prefix="/api")
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": "0.3.0"}
+
+
+if __name__ == "__main__":
+    # When run directly (`python main.py`) restrict the reload watcher to
+    # the backend source directory only.  This prevents WatchFiles from
+    # picking up changes inside .venv and triggering infinite restart loops.
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        reload_dirs=["."],           # only watch backend/ (current dir)
+        reload_excludes=[
+            ".venv/*",
+            "__pycache__/*",
+            "*.pyc",
+            "*.pyo",
+            ".git/*",
+        ],
+    )

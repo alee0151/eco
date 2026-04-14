@@ -1,0 +1,13 @@
+# .watchfilesignore
+# Tell WatchFiles (used by uvicorn --reload) which paths to ignore.
+# Without this, numpy/shapely importing their own .py files inside .venv
+# triggers an infinite reload loop on every server start.
+
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+*.egg-info/
+dist/
+build/
