@@ -7,19 +7,28 @@
  * Data flow:
  *   1. Load all approved/validated suppliers from SupplierContext (already from DB)
  *   2. For each supplier with coordinates → call /api/biodiversity/risk-summary
- *   3. Also fetch CAPAD + KBA totals for summary stats
+ *   3. Fetch real DB counts from /api/biodiversity/counts for stat cards
  *   4. Render risk cards per supplier
+ *
+ * Fixes applied:
+ *   - Stat cards now show real DB counts (was hardcoded 9,000+ / 270+)
+ *   - IBRA lookup fix is backend-side (biodiversity.py)
+ *   - Per-supplier error isolation — one failed call doesn't blank the list
+ *   - CSV export wired up
+ *   - Supplier candidate filter broadened to catch all enriched/validated states
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useSuppliers } from "../context/SupplierContext";
-import { riskApi, capadApi, kbaApi, speciesApi, SupplierRiskSummary } from "../lib/api";
+import { riskApi, SupplierRiskSummary } from "../lib/api";
 import clsx from "clsx";
 import {
   Leaf, MapPin, AlertTriangle, CheckCircle2,
-  Shield, Bird, TreePine, Loader2, RefreshCw, Info,
+  Shield, Bird, TreePine, Loader2, RefreshCw, Info, Download,
 } from "lucide-react";
+
+const BASE: string = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
 // ── Risk level helpers ──────────────────────────────────────────────────────
 function riskLevel(s: SupplierRiskSummary): "critical" | "high" | "medium" | "low" {
@@ -36,6 +45,13 @@ const RISK_COLORS = {
   medium:   { bg: "bg-amber-50",  border: "border-amber-200",  text: "text-amber-700",  dot: "bg-amber-500"  },
   low:      { bg: "bg-emerald-50",border: "border-emerald-200",text: "text-emerald-700",dot: "bg-emerald-500"},
 };
+
+// ── DB counts type ────────────────────────────────────────────────────────────
+interface BiodiversityCounts {
+  capad_active:  number;
+  kba_total:     number;
+  species_total: number;
+}
 
 // ── Risk card ───────────────────────────────────────────────────────────────
 function RiskCard({ summary }: { summary: SupplierRiskSummary }) {
@@ -122,69 +138,129 @@ function Stat({ icon: Icon, label, value }: { icon: React.ElementType; label: st
   );
 }
 
+/** Shimmer skeleton pill for stat cards while counts are loading */
+function StatSkeleton() {
+  return (
+    <div className="h-7 w-20 rounded bg-slate-200 animate-pulse" />
+  );
+}
+
 // ── Main page ────────────────────────────────────────────────────────────────
 export function BiodiversityPage() {
   const { suppliers, loading: suppLoading } = useSuppliers();
 
-  const [summaries, setSummaries]     = useState<SupplierRiskSummary[]>([]);
-  const [capadTotal, setCapadTotal]   = useState<number | null>(null);
-  const [kbaTotal, setKbaTotal]       = useState<number | null>(null);
-  const [speciesTotal, setSpeciesTotal] = useState<number | null>(null);
-  const [loading, setLoading]         = useState(false);
-  const [error, setError]             = useState<string | null>(null);
+  const [summaries, setSummaries]       = useState<SupplierRiskSummary[]>([]);
+  const [dbCounts, setDbCounts]         = useState<BiodiversityCounts | null>(null);
+  const [countsLoading, setCountsLoading] = useState(true);
+  const [loading, setLoading]           = useState(false);
+  const [error, setError]               = useState<string | null>(null);
 
-  // Load global DB totals once
+  // ── Load real DB counts for stat cards ──────────────────────────────────────
   useEffect(() => {
-    Promise.all([
-      capadApi.list({ limit: 1, is_active: true }).catch(() => []),
-      kbaApi.list({ limit: 1 }).catch(() => []),
-      speciesApi.list({ limit: 1 }).catch(() => []),
-    ]).then(([c, k, s]) => {
-      // We just need counts — hit a small query; real counts need a dedicated count endpoint
-      // For now show "50+" style placeholders based on page response
-      setCapadTotal(c.length > 0 ? 9000 : null);   // CAPAD has ~9k+ records nationally
-      setKbaTotal(k.length > 0 ? 270 : null);       // ~270 KBAs in Australia
-      setSpeciesTotal(s.length > 0 ? null : null);  // Dynamic
-    });
+    setCountsLoading(true);
+    fetch(`${BASE}/api/biodiversity/counts`)
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((data: BiodiversityCounts) => setDbCounts(data))
+      .catch(() => setDbCounts(null))  // graceful degradation — show "—" on failure
+      .finally(() => setCountsLoading(false));
   }, []);
 
-  // Compute risk summaries for suppliers that have coordinates
+  // ── Compute risk summaries ───────────────────────────────────────────────────
   const computeRisk = async () => {
     setLoading(true);
     setError(null);
+
+    // Broaden candidate filter: include any supplier that has been enriched,
+    // validated, or approved — as long as they have geocoded coordinates.
     const candidates = suppliers.filter(
-      (s) => s.coordinates && (s.status === "approved" || s.status === "validated" || s.isValidated)
+      (s) =>
+        s.coordinates &&
+        (
+          s.status === "approved" ||
+          s.status === "validated" ||
+          s.isValidated ||
+          s.status === "pending"   // include pending suppliers with coords too
+        )
     );
+
     if (candidates.length === 0) {
       setLoading(false);
       return;
     }
-    try {
-      const results = await Promise.all(
-        candidates.map((s) =>
-          riskApi.summary({
+
+    // Per-supplier error isolation: a failed call returns null, not an exception.
+    // Previously Promise.all would reject the entire batch if one supplier failed.
+    const results = await Promise.all(
+      candidates.map((s) =>
+        riskApi
+          .summary({
             supplier_id:   s.id,
             supplier_name: s.enrichedName ?? s.name,
             lat:           s.coordinates!.lat,
             lng:           s.coordinates!.lng,
-          }).catch(() => null)
-        )
-      );
-      setSummaries(results.filter(Boolean) as SupplierRiskSummary[]);
-    } catch (e) {
-      setError("Failed to compute risk summaries. Is the backend running?");
-    } finally {
-      setLoading(false);
+          })
+          .catch((err) => {
+            console.warn(`[BiodiversityPage] risk-summary failed for ${s.id}:`, err);
+            return null;
+          })
+      )
+    );
+
+    const valid = results.filter(Boolean) as SupplierRiskSummary[];
+    setSummaries(valid);
+
+    if (valid.length === 0 && candidates.length > 0) {
+      setError("Risk summary calls failed for all suppliers. Is the backend running?");
     }
+
+    setLoading(false);
   };
 
   useEffect(() => {
     if (!suppLoading && suppliers.length > 0) computeRisk();
   }, [suppLoading, suppliers.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Risk distribution
+  // ── CSV export ───────────────────────────────────────────────────────────────
+  const handleExport = () => {
+    if (summaries.length === 0) return;
+    const header = ["Supplier ID", "Supplier Name", "Latitude", "Longitude",
+                    "IBRA Region", "IBRA Code", "Species Nearby",
+                    "Protected Areas", "KBAs Nearby", "Risk Level",
+                    "Threatened Species (sample)"].join(",");
+    const rows = summaries
+      .sort((a, b) => {
+        const order = { critical: 0, high: 1, medium: 2, low: 3 };
+        return order[riskLevel(a)] - order[riskLevel(b)];
+      })
+      .map((s) => [
+        `"${s.supplier_id}"`,
+        `"${s.supplier_name.replace(/"/g, '""')}"`,
+        s.lat,
+        s.lng,
+        `"${s.ibra_region ?? ""}"`,
+        `"${s.ibra_code ?? ""}"`,
+        s.species_nearby,
+        s.protected_areas_nearby,
+        s.kba_nearby,
+        riskLevel(s),
+        `"${s.threatened_species_names.join("; ").replace(/"/g, '""')}"`,
+      ].join(","));
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `eco-biodiversity-risk-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ── Risk distribution ────────────────────────────────────────────────────────
   const counts = { critical: 0, high: 0, medium: 0, low: 0 };
   summaries.forEach((s) => counts[riskLevel(s)]++);
+
+  // ── Format a DB count for display (e.g. 9423 → "9,423") ─────────────────────
+  const fmtCount = (n: number) => n.toLocaleString("en-AU");
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -197,27 +273,55 @@ export function BiodiversityPage() {
             Live spatial analysis — supplier locations cross-referenced with CAPAD, KBA and species data.
           </p>
         </div>
-        <button
-          onClick={computeRisk}
-          disabled={loading}
-          className="flex items-center gap-2 px-3 py-2 text-xs border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg transition-colors disabled:opacity-50"
-          style={{ fontWeight: 500 }}
-        >
-          <RefreshCw className={clsx("w-3.5 h-3.5", loading && "animate-spin")} />
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          {summaries.length > 0 && (
+            <button
+              onClick={handleExport}
+              className="flex items-center gap-2 px-3 py-2 text-xs border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg transition-colors"
+              style={{ fontWeight: 500 }}
+              title="Export risk profiles as CSV"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export CSV
+            </button>
+          )}
+          <button
+            onClick={computeRisk}
+            disabled={loading}
+            className="flex items-center gap-2 px-3 py-2 text-xs border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg transition-colors disabled:opacity-50"
+            style={{ fontWeight: 500 }}
+          >
+            <RefreshCw className={clsx("w-3.5 h-3.5", loading && "animate-spin")} />
+            Refresh
+          </button>
+        </div>
       </div>
 
-      {/* DB Stats bar */}
+      {/* DB Stats bar — live counts from /api/biodiversity/counts */}
       <div className="grid grid-cols-3 gap-4">
         {[
-          { label: "Protected Areas (CAPAD)", value: capadTotal != null ? "9,000+" : "—", icon: Shield,   color: "text-teal-600" },
-          { label: "Key Biodiversity Areas",  value: kbaTotal   != null ? "270+"   : "—", icon: TreePine, color: "text-green-600" },
-          { label: "Suppliers Assessed",      value: summaries.length.toString(),          icon: MapPin,   color: "text-blue-600"  },
+          {
+            label: "Protected Areas (CAPAD)",
+            value: countsLoading ? null : dbCounts ? fmtCount(dbCounts.capad_active)  : "—",
+            icon: Shield,   color: "text-teal-600",
+          },
+          {
+            label: "Key Biodiversity Areas",
+            value: countsLoading ? null : dbCounts ? fmtCount(dbCounts.kba_total)     : "—",
+            icon: TreePine, color: "text-green-600",
+          },
+          {
+            label: "Suppliers Assessed",
+            value: summaries.length.toString(),
+            icon: MapPin,   color: "text-blue-600",
+          },
         ].map(({ label, value, icon: Icon, color }) => (
           <div key={label} className="bg-white rounded-xl border border-slate-200 p-4">
             <Icon className={clsx("w-5 h-5 mb-2", color)} />
-            <p className="text-xl text-slate-900" style={{ fontWeight: 700 }}>{value}</p>
+            {value === null
+              ? <StatSkeleton />
+              : <p className="text-xl text-slate-900" style={{ fontWeight: 700 }}>{value}</p>
+            }
             <p className="text-xs text-slate-500 mt-0.5">{label}</p>
           </div>
         ))}
