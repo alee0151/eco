@@ -1,7 +1,11 @@
 /**
  * SupplierList.tsx — left panel of the Biodiversity split layout.
- * Driven by live SupplierContext suppliers + SupplierRiskSummary[].
- * Risk level and score are derived from the summary (no mock epic2-data).
+ *
+ * Design: supplier data is ALWAYS visible.
+ * - Suppliers with a computed risk summary render as full cards.
+ * - Suppliers with coordinates but no summary yet render as skeleton cards
+ *   (shimmer animation) so the user sees their data loading in-place.
+ * - Skeleton cards animate out and real cards animate in as summaries arrive.
  */
 
 import { useState } from 'react';
@@ -12,12 +16,13 @@ import { Supplier } from '../../context/SupplierContext';
 import { SupplierRiskSummary } from '../../lib/api';
 
 interface SupplierListProps {
-  suppliers:  Supplier[];
-  summaries:  SupplierRiskSummary[];
-  selectedId: string | null;
-  onSelect:   (id: string) => void;
-  hoveredId:  string | null;
-  onHover:    (id: string | null) => void;
+  suppliers:   Supplier[];
+  summaries:   SupplierRiskSummary[];
+  riskLoading: boolean;
+  selectedId:  string | null;
+  onSelect:    (id: string) => void;
+  hoveredId:   string | null;
+  onHover:     (id: string | null) => void;
 }
 
 type RiskFilter = 'all' | 'critical' | 'high' | 'medium' | 'low';
@@ -41,19 +46,67 @@ const RISK_COLORS: Record<string, { light: string; border: string; text: string;
   low:      { light: 'bg-emerald-50', border: 'border-emerald-200',text: 'text-emerald-700',dot: '#10b981' },
 };
 
-export default function SupplierList({ suppliers, summaries, selectedId, onSelect, hoveredId, onHover }: SupplierListProps) {
+/* ── Skeleton card ─────────────────────────────────────────────────────── */
+function SkeletonCard({ name }: { name: string }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, scale: 0.97 }}
+      className="rounded-xl border border-slate-200 bg-white overflow-hidden"
+    >
+      <div className="px-3 py-2.5 flex items-start gap-2.5">
+        {/* Score badge skeleton */}
+        <div className="w-10 h-10 rounded-xl bg-slate-100 animate-pulse flex-shrink-0" />
+
+        <div className="flex-1 min-w-0 space-y-2">
+          {/* Name — show real name so user recognises it */}
+          <p className="text-[13px] text-slate-700 truncate" style={{ fontWeight: 600 }}>{name}</p>
+
+          {/* Location row skeleton */}
+          <div className="flex items-center gap-1.5">
+            <MapPin className="w-2.5 h-2.5 text-slate-300 flex-shrink-0" />
+            <div className="h-2.5 w-24 rounded-full bg-slate-100 animate-pulse" />
+          </div>
+
+          {/* Metrics row skeleton */}
+          <div className="flex items-center gap-3">
+            <div className="h-2 w-10 rounded-full bg-slate-100 animate-pulse" />
+            <div className="h-2 w-10 rounded-full bg-slate-100 animate-pulse" />
+            <div className="h-2 w-10 rounded-full bg-slate-100 animate-pulse" />
+          </div>
+
+          {/* Risk bar skeleton */}
+          <div className="h-1 w-full rounded-full bg-slate-100 animate-pulse" />
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+/* ── Main component ────────────────────────────────────────────────────── */
+export default function SupplierList({
+  suppliers, summaries, riskLoading,
+  selectedId, onSelect, hoveredId, onHover,
+}: SupplierListProps) {
   const [search,     setSearch]     = useState('');
   const [filterRisk, setFilterRisk] = useState<RiskFilter>('all');
 
-  // Only show suppliers that have a risk summary (i.e., have been geocoded)
+  // Suppliers with a completed risk summary
   const withSummary = suppliers
     .map(s => ({ supplier: s, summary: summaries.find(r => r.supplier_id === s.id) }))
     .filter(({ summary }) => summary != null) as { supplier: Supplier; summary: SupplierRiskSummary }[];
 
-  // Also show suppliers that have coordinates but no summary yet
-  const withCoords = suppliers.filter(
+  // Suppliers with coordinates but summary not yet computed
+  const pending = suppliers.filter(
     s => s.coordinates && !summaries.find(r => r.supplier_id === s.id)
   );
+
+  // Suppliers with no coordinates at all (can't be assessed)
+  const noCoords = suppliers.filter(s => !s.coordinates);
+
+  const totalVisible = suppliers.length;
+  const assessedCount = withSummary.length;
 
   const counts: Record<RiskFilter, number> = {
     all:      withSummary.length,
@@ -66,27 +119,39 @@ export default function SupplierList({ suppliers, summaries, selectedId, onSelec
   const filtered = withSummary
     .filter(({ supplier, summary }) => {
       const q = search.toLowerCase();
-      const matchSearch = supplier.name.toLowerCase().includes(q)
-        || (supplier.region ?? '').toLowerCase().includes(q)
-        || (summary.ibra_region ?? '').toLowerCase().includes(q);
+      const matchSearch =
+        supplier.name.toLowerCase().includes(q) ||
+        (supplier.region ?? '').toLowerCase().includes(q) ||
+        (summary.ibra_region ?? '').toLowerCase().includes(q);
       const matchRisk = filterRisk === 'all' || riskLevel(summary) === filterRisk;
       return matchSearch && matchRisk;
     })
     .sort((a, b) => riskScore(b.summary) - riskScore(a.summary));
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full min-h-0">
       {/* Panel header */}
       <div className="px-4 pt-4 pb-3 border-b border-slate-100 flex-shrink-0 space-y-3">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <Layers className="w-4 h-4 text-emerald-600" />
           <span className="text-sm text-slate-800" style={{ fontWeight: 600 }}>Suppliers</span>
+
+          {/* Total count badge */}
           <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>
-            {withSummary.length}
+            {totalVisible}
           </span>
-          {withCoords.length > 0 && (
+
+          {/* Assessed progress — only while loading or partially done */}
+          {riskLoading && (
+            <span className="text-xs text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>
+              {assessedCount}/{totalVisible} assessed
+            </span>
+          )}
+
+          {/* Pending badge when some still need geocoding */}
+          {!riskLoading && noCoords.length > 0 && (
             <span className="text-xs text-amber-500 bg-amber-50 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>
-              +{withCoords.length} pending
+              {noCoords.length} need geocoding
             </span>
           )}
         </div>
@@ -116,7 +181,10 @@ export default function SupplierList({ suppliers, summaries, selectedId, onSelec
               style={{ fontWeight: filterRisk === level ? 600 : 500 }}
             >
               {level === 'all' ? 'All' : level.slice(0, 3)}
-              <span className={clsx('text-[9px] px-1 rounded', filterRisk === level ? 'bg-slate-100 text-slate-600' : 'bg-transparent')} style={{ fontWeight: 700 }}>
+              <span
+                className={clsx('text-[9px] px-1 rounded', filterRisk === level ? 'bg-slate-100 text-slate-600' : 'bg-transparent')}
+                style={{ fontWeight: 700 }}
+              >
                 {counts[level]}
               </span>
             </button>
@@ -126,7 +194,9 @@ export default function SupplierList({ suppliers, summaries, selectedId, onSelec
 
       {/* Card list */}
       <div className="flex-1 overflow-y-auto p-3 space-y-2">
-        <AnimatePresence>
+        <AnimatePresence mode="popLayout">
+
+          {/* ── Real cards (summaries computed) ── */}
           {filtered.map(({ supplier, summary }, i) => {
             const level  = riskLevel(summary);
             const score  = riskScore(summary);
@@ -139,6 +209,7 @@ export default function SupplierList({ suppliers, summaries, selectedId, onSelec
                 key={supplier.id}
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.97 }}
                 transition={{ delay: i * 0.04 }}
               >
                 <div
@@ -147,9 +218,11 @@ export default function SupplierList({ suppliers, summaries, selectedId, onSelec
                   onMouseLeave={() => onHover(null)}
                   className={clsx(
                     'rounded-xl border overflow-hidden transition-all duration-200 cursor-pointer bg-white',
-                    isSelected ? 'border-emerald-300 shadow-md shadow-emerald-100/60'
-                    : isHovered ? 'border-slate-300 shadow-sm'
-                    : 'border-slate-200 hover:border-slate-300'
+                    isSelected
+                      ? 'border-emerald-300 shadow-md shadow-emerald-100/60'
+                      : isHovered
+                      ? 'border-slate-300 shadow-sm'
+                      : 'border-slate-200 hover:border-slate-300'
                   )}
                 >
                   <div className="px-3 py-2.5 flex items-start gap-2.5">
@@ -162,7 +235,9 @@ export default function SupplierList({ suppliers, summaries, selectedId, onSelec
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1.5">
                         <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: colors.dot }} />
-                        <p className="text-[13px] text-slate-900 truncate" style={{ fontWeight: 600 }}>{supplier.enrichedName ?? supplier.name}</p>
+                        <p className="text-[13px] text-slate-900 truncate" style={{ fontWeight: 600 }}>
+                          {supplier.enrichedName ?? supplier.name}
+                        </p>
                       </div>
                       <div className="flex items-center gap-1 mt-0.5 text-[11px] text-slate-400">
                         <MapPin className="w-2.5 h-2.5" />
@@ -198,20 +273,40 @@ export default function SupplierList({ suppliers, summaries, selectedId, onSelec
               </motion.div>
             );
           })}
+
+          {/* ── Skeleton cards (pending risk computation) ── */}
+          {riskLoading && pending.map(s => (
+            <SkeletonCard
+              key={`skel-${s.id}`}
+              name={s.enrichedName ?? s.name}
+            />
+          ))}
+
         </AnimatePresence>
 
-        {filtered.length === 0 && withSummary.length > 0 && (
+        {/* Empty state: search returned nothing */}
+        {filtered.length === 0 && withSummary.length > 0 && !riskLoading && (
           <div className="text-center py-16">
             <Search className="w-8 h-8 text-slate-200 mx-auto mb-3" />
             <p className="text-sm text-slate-400">No suppliers match this filter.</p>
           </div>
         )}
 
-        {withSummary.length === 0 && (
+        {/* Empty state: no suppliers at all */}
+        {suppliers.length === 0 && (
           <div className="text-center py-12 px-4">
             <AlertTriangle className="w-8 h-8 text-slate-200 mx-auto mb-3" />
-            <p className="text-sm text-slate-500" style={{ fontWeight: 600 }}>No risk data yet</p>
-            <p className="text-xs text-slate-400 mt-1">Suppliers need geocoded coordinates to compute biodiversity risk.</p>
+            <p className="text-sm text-slate-500" style={{ fontWeight: 600 }}>No suppliers loaded</p>
+            <p className="text-xs text-slate-400 mt-1">Upload supplier files to begin biodiversity risk assessment.</p>
+          </div>
+        )}
+
+        {/* Empty state: suppliers exist but none have coordinates */}
+        {suppliers.length > 0 && withSummary.length === 0 && pending.length === 0 && !riskLoading && (
+          <div className="text-center py-12 px-4">
+            <MapPin className="w-8 h-8 text-slate-200 mx-auto mb-3" />
+            <p className="text-sm text-slate-500" style={{ fontWeight: 600 }}>Awaiting geocoding</p>
+            <p className="text-xs text-slate-400 mt-1">Visit Map &amp; Review to resolve supplier locations first.</p>
           </div>
         )}
       </div>

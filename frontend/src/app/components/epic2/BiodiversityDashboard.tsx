@@ -1,20 +1,19 @@
 /**
  * BiodiversityDashboard.tsx
  *
- * Three-panel layout (restored from b48048b) wired to live data:
- *   LEFT   — SupplierList  (driven by SupplierContext + SupplierRiskSummary[])
- *   CENTRE — MapView       (real geocoded coords, CAPAD/KBA/IBRA/Species layer toggles)
+ * Three-panel layout wired to live data:
+ *   LEFT   — SupplierList  (visible immediately from session context)
+ *   CENTRE — MapView       (real geocoded coords, layer toggles)
  *   RIGHT  — RiskProfile   (live risk summary for selected supplier)
  *
- * Data flow:
- *   1. Load suppliers from SupplierContext
- *   2. For each supplier with coordinates call /api/biodiversity/risk-summary
- *   3. Load real DB counts from /api/biodiversity/counts for header stat pills
- *   4. Pass summaries + suppliers into child panels
+ * Design principle: supplier cards are ALWAYS visible.
+ * DB fetches (risk summaries, counts) happen in the background.
+ * A slim banner on the left panel indicates loading without blocking the UI.
  */
 
 import { useState, useEffect } from 'react';
-import { Download, List, Map as MapIcon, Loader2, RefreshCw } from 'lucide-react';
+import { Download, List, Map as MapIcon, RefreshCw, Loader2 } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
 import clsx from 'clsx';
 import { useSuppliers } from '../../context/SupplierContext';
 import { riskApi, SupplierRiskSummary } from '../../lib/api';
@@ -22,7 +21,7 @@ import SupplierList from './SupplierList';
 import MapView from './MapView';
 import RiskProfile from './RiskProfile';
 
-const BASE: string = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+const BASE: string = import.meta.env.VITE_API_URL ?? '';
 
 interface DbCounts { capad_active: number; kba_total: number; species_total: number; }
 
@@ -35,7 +34,7 @@ function riskLevel(s: SupplierRiskSummary): 'critical' | 'high' | 'medium' | 'lo
 }
 
 export default function BiodiversityDashboard() {
-  const { suppliers, loading: suppLoading } = useSuppliers();
+  const { suppliers } = useSuppliers();
 
   const [summaries, setSummaries]         = useState<SupplierRiskSummary[]>([]);
   const [dbCounts, setDbCounts]           = useState<DbCounts | null>(null);
@@ -46,7 +45,7 @@ export default function BiodiversityDashboard() {
   const [hoveredId,  setHoveredId]  = useState<string | null>(null);
   const [mobileTab,  setMobileTab]  = useState<'map' | 'list'>('list');
 
-  // ── Load real DB counts ──────────────────────────────────────────────────
+  // ── Load real DB counts (background) ──────────────────────────────────
   useEffect(() => {
     setCountsLoading(true);
     fetch(`${BASE}/api/biodiversity/counts`)
@@ -56,7 +55,7 @@ export default function BiodiversityDashboard() {
       .finally(() => setCountsLoading(false));
   }, []);
 
-  // ── Compute risk summaries ───────────────────────────────────────────────
+  // ── Compute risk summaries (background) ───────────────────────────────
   const computeRisk = async () => {
     setRiskLoading(true);
     const candidates = suppliers.filter(
@@ -81,11 +80,12 @@ export default function BiodiversityDashboard() {
     setRiskLoading(false);
   };
 
+  // Trigger risk computation when suppliers change — never blocks rendering
   useEffect(() => {
-    if (!suppLoading && suppliers.length > 0) computeRisk();
-  }, [suppLoading, suppliers.length]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (suppliers.length > 0) computeRisk();
+  }, [suppliers.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── CSV export ───────────────────────────────────────────────────────────
+  // ── CSV export ────────────────────────────────────────────────────────
   const handleExport = () => {
     if (!summaries.length) return;
     const header = ['Supplier ID','Name','Lat','Lng','IBRA Region','Risk Level',
@@ -108,10 +108,9 @@ export default function BiodiversityDashboard() {
     URL.revokeObjectURL(url);
   };
 
-  // ── Derived stats ────────────────────────────────────────────────────────
+  // ── Derived stats ──────────────────────────────────────────────────────
   const criticalCount = summaries.filter(s => riskLevel(s) === 'critical').length;
-  const highCount     = summaries.filter(s => riskLevel(s) === 'high').length;
-  const lowCount      = summaries.filter(s => riskLevel(s) === 'low').length;
+  const assessedCount = summaries.length;
 
   const selectedSupplier = suppliers.find(s => s.id === selectedId) ?? null;
   const selectedSummary  = summaries.find(s => s.supplier_id === selectedId) ?? null;
@@ -123,7 +122,7 @@ export default function BiodiversityDashboard() {
         <div>
           <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Biodiversity GIS</h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Geospatial biodiversity risk — supplier exposure to protected areas, KBAs & threatened species.
+            Geospatial biodiversity risk — supplier exposure to protected areas, KBAs &amp; threatened species.
           </p>
         </div>
 
@@ -131,12 +130,12 @@ export default function BiodiversityDashboard() {
           {/* Stat pills */}
           <div className="hidden md:flex items-center gap-2">
             {countsLoading
-              ? <span className="h-6 w-32 rounded-full bg-slate-100 animate-pulse block" />
+              ? <span className="h-6 w-36 rounded-full bg-slate-100 animate-pulse block" />
               : [
-                  { label: 'CAPAD',    value: dbCounts ? dbCounts.capad_active.toLocaleString('en-AU')  : '—', cls: 'bg-teal-50 text-teal-700'      },
-                  { label: 'KBAs',     value: dbCounts ? dbCounts.kba_total.toLocaleString('en-AU')     : '—', cls: 'bg-green-50 text-green-700'    },
-                  { label: 'Critical', value: criticalCount,                                                   cls: 'bg-red-50 text-red-600'         },
-                  { label: 'Assessed', value: summaries.length,                                                cls: 'bg-slate-100 text-slate-600'    },
+                  { label: 'CAPAD',    value: dbCounts ? dbCounts.capad_active.toLocaleString('en-AU') : '—', cls: 'bg-teal-50 text-teal-700'   },
+                  { label: 'KBAs',     value: dbCounts ? dbCounts.kba_total.toLocaleString('en-AU')    : '—', cls: 'bg-green-50 text-green-700' },
+                  { label: 'Critical', value: criticalCount,                                                   cls: 'bg-red-50 text-red-600'     },
+                  { label: 'Assessed', value: assessedCount,                                                   cls: 'bg-slate-100 text-slate-600' },
                 ].map(({ label, value, cls }) => (
                   <span key={label} className={clsx('text-xs px-2.5 py-1 rounded-full', cls)} style={{ fontWeight: 600 }}>
                     {value} {label}
@@ -147,7 +146,7 @@ export default function BiodiversityDashboard() {
 
           <button
             onClick={computeRisk}
-            disabled={riskLoading || suppLoading}
+            disabled={riskLoading}
             className="flex items-center gap-1.5 px-3 py-2 text-xs border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg transition-colors disabled:opacity-50"
             style={{ fontWeight: 500 }}
           >
@@ -186,25 +185,39 @@ export default function BiodiversityDashboard() {
       {/* ── Three-panel split ── */}
       <div className="flex-1 flex gap-4 min-h-0">
 
-        {/* LEFT — Supplier list */}
+        {/* LEFT — Supplier list (always visible) */}
         <div className={clsx(
-          'md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm w-[280px] shrink-0 min-h-0',
+          'md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm w-[280px] shrink-0 min-h-0 overflow-hidden',
           mobileTab === 'list' ? 'flex' : 'hidden md:flex'
         )}>
-          {suppLoading || riskLoading
-            ? <div className="flex-1 flex items-center justify-center gap-2">
-                <Loader2 className="w-4 h-4 text-emerald-600 animate-spin" />
-                <span className="text-xs text-slate-500">{suppLoading ? 'Loading suppliers…' : 'Computing risk…'}</span>
-              </div>
-            : <SupplierList
-                suppliers={suppliers}
-                summaries={summaries}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
-                hoveredId={hoveredId}
-                onHover={setHoveredId}
-              />
-          }
+          {/* Slim loading banner — sits above cards, doesn't replace them */}
+          <AnimatePresence>
+            {riskLoading && (
+              <motion.div
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.2 }}
+                className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border-b border-emerald-100 flex-shrink-0 overflow-hidden"
+              >
+                <Loader2 className="w-3 h-3 text-emerald-500 animate-spin flex-shrink-0" />
+                <span className="text-[11px] text-emerald-700" style={{ fontWeight: 500 }}>
+                  Computing biodiversity risk from database…
+                </span>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Supplier list — always rendered */}
+          <SupplierList
+            suppliers={suppliers}
+            summaries={summaries}
+            riskLoading={riskLoading}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            hoveredId={hoveredId}
+            onHover={setHoveredId}
+          />
         </div>
 
         {/* CENTRE — Map */}
