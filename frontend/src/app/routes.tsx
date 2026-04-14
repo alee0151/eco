@@ -3,6 +3,7 @@ import { Layout } from "./components/Layout";
 import { UploadExtractPage } from "./pages/UploadExtractPage";
 import { EnrichmentPage } from "./pages/EnrichmentPage";
 import { MapPage } from "./pages/MapPage";
+import { BiodiversityPage } from "./pages/BiodiversityPage";
 
 export const router = createBrowserRouter([
   {
@@ -12,6 +13,7 @@ export const router = createBrowserRouter([
       { index: true, Component: UploadExtractPage },
       { path: "enrichment", Component: EnrichmentPage },
       { path: "review", Component: MapPage },
+      { path: "biodiversity", Component: BiodiversityPage },
     ],
   },
 ]);
