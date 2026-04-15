@@ -106,40 +106,52 @@ class Kba(Base):
     geom          = Column(Text,    nullable=True)
 
 
-# ── Capad (pre-existing, read-only) ───────────────────────────────────────────
+# ── Capad (pre-existing — recreated by migrate_capad_shp.py) ─────────────────
+#
+#  All 29 shapefile columns are mapped here.
+#  geom is a PostGIS MultiPolygon (SRID 4326), matching the ibra pattern.
+#  geom_wkt holds the WKT string for frontend display.
 
 class Capad(Base):
     __tablename__ = "capad"
 
-    id                = Column(Integer, primary_key=True)
-    objectid          = Column(Integer, nullable=True)
-    pa_id             = Column(String,  nullable=True)
-    pa_name           = Column(String,  nullable=True)
-    pa_type           = Column(String,  nullable=True)
-    pa_type_abbr      = Column(String,  nullable=True)
-    iucn_cat          = Column(String,  nullable=True)
-    nrs_pa            = Column(Boolean, nullable=True)
-    gaz_area_ha       = Column(Float,   nullable=True)
-    gis_area_ha       = Column(Float,   nullable=True)
-    state             = Column(String,  nullable=True)
-    environ           = Column(String,  nullable=True)
-    epbc_trigger      = Column(String,  nullable=True)
-    latitude          = Column(Float,   nullable=True)
-    longitude         = Column(Float,   nullable=True)
-    latest_gaz        = Column(DateTime(timezone=True), nullable=True)
-    pa_pid            = Column(String,  nullable=True)
-    governance        = Column(String,  nullable=True)
-    authority         = Column(String,  nullable=True)
-    gaz_date          = Column(DateTime(timezone=True), nullable=True)
-    effective_area_ha = Column(Float,   nullable=True)
-    source_dataset    = Column(String,  nullable=True)
-    capad_version     = Column(String,  nullable=True)
-    capad_citation    = Column(String,  nullable=True)
-    capad_licence     = Column(String,  nullable=True)
-    cleaned_at        = Column(DateTime(timezone=True), nullable=True)
-    is_active         = Column(Boolean, nullable=True)
-    geom_wkt          = Column(Text,    nullable=True)
-    geom              = Column(Text,    nullable=True)
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    objectid        = Column(Integer, nullable=True, unique=True)
+    pa_id           = Column(Text,    nullable=True)
+    pa_pid          = Column(Text,    nullable=True)
+    pa_name         = Column(Text,    nullable=True)
+    pa_type         = Column(Text,    nullable=True)
+    pa_type_abbr    = Column(Text,    nullable=True)
+    iucn_cat        = Column(Text,    nullable=True)
+    nrs_pa          = Column(Boolean, nullable=True)   # NRS_PA  Y/N -> bool
+    nrs_mpa         = Column(Boolean, nullable=True)   # NRS_MPA Y/N -> bool
+    gaz_area_ha     = Column(Float,   nullable=True)
+    gis_area_ha     = Column(Float,   nullable=True)
+    gaz_date        = Column(DateTime(timezone=True), nullable=True)
+    latest_gaz      = Column(DateTime(timezone=True), nullable=True)
+    state           = Column(Text,    nullable=True)
+    authority       = Column(Text,    nullable=True)
+    source_dataset  = Column(Text,    nullable=True)   # DATASOURCE
+    governance      = Column(Text,    nullable=True)
+    comments        = Column(Text,    nullable=True)
+    environ         = Column(Text,    nullable=True)
+    overlap         = Column(Text,    nullable=True)
+    mgt_plan        = Column(Text,    nullable=True)
+    res_number      = Column(Text,    nullable=True)
+    zone_type       = Column(Text,    nullable=True)
+    epbc_trigger    = Column(Text,    nullable=True)   # EPBC
+    longitude       = Column(Float,   nullable=True)
+    latitude        = Column(Float,   nullable=True)
+    pa_system       = Column(Text,    nullable=True)
+    shape_area      = Column(Float,   nullable=True)   # Shape__Are
+    shape_len       = Column(Float,   nullable=True)   # Shape__Len
+    capad_version   = Column(Text,    nullable=True)
+    capad_citation  = Column(Text,    nullable=True)
+    capad_licence   = Column(Text,    nullable=True)
+    is_active       = Column(Boolean, nullable=True,   default=True)
+    cleaned_at      = Column(DateTime(timezone=True),  nullable=True)
+    geom_wkt        = Column(Text,    nullable=True)   # WKT string — frontend display
+    geom            = Column(Geometry("MULTIPOLYGON", srid=4326), nullable=True)  # PostGIS — spatial queries
 
 
 # ── Ibra (pre-existing, read-only) ────────────────────────────────────────────
