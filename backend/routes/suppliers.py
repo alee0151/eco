@@ -18,7 +18,7 @@ import logging
 
 from database import get_db
 from models import Supplier as SupplierModel
-from schemas import SupplierOut, SupplierCreate
+from schemas import SupplierOut, SupplierCreate, SupplierPatch
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -79,9 +79,19 @@ async def create_supplier(body: SupplierCreate, db: AsyncSession = Depends(get_d
 @router.patch("/suppliers/{supplier_id}", response_model=SupplierOut)
 async def update_supplier(
     supplier_id: str,
-    body: dict,
+    body: SupplierPatch,
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Partial update for a supplier row.
+
+    body is a SupplierPatch (Pydantic model) — FastAPI validates all field
+    types before this handler runs. Only fields explicitly sent by the caller
+    (non-None) are applied to the DB row; omitted fields are left unchanged.
+
+    An allowlist is kept as secondary defence-in-depth to prevent accidental
+    writes to internal/read-only columns even if SupplierPatch is widened.
+    """
     try:
         s = await db.get(SupplierModel, supplier_id)
         if not s:
@@ -94,7 +104,10 @@ async def update_supplier(
             "lat", "lng", "resolution_level", "inference_method",
             "file_name", "file_type", "warnings",
         }
-        for key, value in body.items():
+        # exclude_none=True — only iterate fields the caller actually sent;
+        # this ensures a partial PATCH never overwrites existing DB values
+        # with null when the caller omits a field.
+        for key, value in body.model_dump(exclude_none=True).items():
             if key in allowed:
                 setattr(s, key, value)
         await db.commit()
