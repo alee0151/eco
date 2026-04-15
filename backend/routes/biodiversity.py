@@ -264,9 +264,11 @@ async def risk_summary(
                       Falls back to ST_DWithin (nearest region) if the point
                       sits exactly on a boundary or in a gap between regions.
 
-    2. Species      — Count distinct threatened species whose confirmed
-                      occurrences (present, non-obscured, reliable basis)
+    2. Species      — Count distinct threatened species (by taxonconceptid) whose
+                      confirmed occurrences (present, non-obscured, reliable basis)
                       fall within the bounding box around the supplier.
+                      The names list is derived from the SAME CTE so count and
+                      list are always consistent.
 
     3. CAPAD        — Count protected area centroids within the buffer.
 
@@ -279,18 +281,9 @@ async def risk_summary(
 
     # ──────────────────────────────────────────────────────────────────────────
     # 1. IBRA region — exact ST_Within against MULTIPOLYGON boundaries
-    #
-    # ST_MakePoint(lng, lat) constructs a PostGIS Point from the supplier
-    # coordinates.  ST_SetSRID assigns SRID 4326 (WGS84) so the SRID matches
-    # ibra.geom (also 4326).  ST_Within returns TRUE only for the region whose
-    # polygon actually contains the point — this is exact, not approximate.
-    #
-    # Fallback: if no region contains the point (e.g. supplier is offshore or
-    # on a boundary), ST_DWithin finds the nearest region within 1 degree.
     # ──────────────────────────────────────────────────────────────────────────
     supplier_point = ST_SetSRID(ST_MakePoint(lng, lat), 4326)
 
-    # Primary: exact containment
     ibra_exact_result = await db.execute(
         select(Ibra.ibra_reg_name, Ibra.ibra_reg_code)
         .where(Ibra.geom.isnot(None))
@@ -299,7 +292,6 @@ async def risk_summary(
     )
     ibra_row = ibra_exact_result.first()
 
-    # Fallback: nearest region within 1 degree (~100 km)
     if not ibra_row:
         ibra_near_result = await db.execute(
             text("""
@@ -317,49 +309,62 @@ async def risk_summary(
     ibra_code = ibra_row[1] if ibra_row else None
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 2. Threatened species — distinct count + names
+    # 2. Threatened species — distinct count + names, both from the same CTE
     #
-    # Quality filters applied:
-    #   - occurrencestatus = 'present'   (exclude absent records)
-    #   - is_obscured = FALSE            (exclude ±10 km fuzzed coordinates)
-    #   - basisofrecord IN (HUMAN_OBSERVATION, MACHINE_OBSERVATION)
-    #                                    (exclude museum specimens / literature)
+    # FIX: previously the count deduped on vernacularname (a display string),
+    # which:
+    #   (a) excluded species where vernacularname IS NULL
+    #   (b) double-counted species that appear with >1 name spelling in ALA
+    #   (c) used a separate GROUP BY query for the names list, so count and
+    #       list could diverge.
     #
-    # A separate COUNT query (no LIMIT) gives the true total; the names query
-    # caps at 20 for the response payload only.
+    # Now we:
+    #   1. Build a CTE that selects DISTINCT taxonconceptid (stable ALA species
+    #      identifier) + one representative vernacularname per concept via
+    #      MIN(vernacularname) FILTER (WHERE vernacularname IS NOT NULL).
+    #   2. Derive species_count = COUNT(*) on the CTE  → distinct species only.
+    #   3. Derive species_names from the same CTE, alphabetical, limit 20.
+    #
+    # taxonconceptid NULLs are excluded — they cannot be reliably identified
+    # as threatened species (no stable identifier → could be anything).
     # ──────────────────────────────────────────────────────────────────────────
-    base_species_q = (
-        select(Species.vernacularname)
+    threatened_cte = (
+        select(
+            Species.taxonconceptid,
+            func.min(Species.vernacularname).filter(
+                Species.vernacularname.isnot(None)
+            ).label("representative_name"),
+        )
+        .where(Species.taxonconceptid.isnot(None))
         .where(Species.decimallatitude.isnot(None))
         .where(Species.decimallongitude.isnot(None))
         .where(Species.decimallatitude.between(min_lat, max_lat))
         .where(Species.decimallongitude.between(min_lng, max_lng))
         .where(THREATENED_RESOURCE_FILTER)
-        .where(Species.vernacularname.isnot(None))
         .where(Species.occurrencestatus.ilike("present"))
         .where(Species.is_obscured.is_(False))
         .where(Species.basisofrecord.in_([
             "HUMAN_OBSERVATION",
             "MACHINE_OBSERVATION",
         ]))
+        .group_by(Species.taxonconceptid)
+        .cte("threatened_species")
     )
 
-    # True distinct count — no LIMIT so we get the real number
-    count_q = select(func.count()).select_from(
-        base_species_q.distinct().subquery()
+    # Distinct species count — one row per taxonconceptid
+    count_result = await db.execute(
+        select(func.count()).select_from(threatened_cte)
     )
-    species_count_result = await db.execute(count_q)
-    species_count = species_count_result.scalar() or 0
+    species_count = count_result.scalar() or 0
 
-    # Top-20 names for the response panel
-    names_q = (
-        base_species_q
-        .group_by(Species.vernacularname)
-        .order_by(func.count(Species.occurrence_id).desc())
+    # Representative names — same CTE, alphabetical, top 20
+    names_result = await db.execute(
+        select(threatened_cte.c.representative_name)
+        .where(threatened_cte.c.representative_name.isnot(None))
+        .order_by(threatened_cte.c.representative_name)
         .limit(20)
     )
-    names_result = await db.execute(names_q)
-    species_names = [row[0] for row in names_result.fetchall() if row[0]]
+    species_names = [row[0] for row in names_result.fetchall()]
 
     # ──────────────────────────────────────────────────────────────────────────
     # 3. CAPAD — protected area centroids within the buffer
