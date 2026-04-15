@@ -162,7 +162,7 @@ export function Layout() {
       </AnimatePresence>
 
       {/* Main content area */}
-      <div className="flex-1 flex flex-col lg:pl-[260px] h-screen">
+      <div className="flex-1 flex flex-col lg:pl-[260px] min-h-screen">
         {/* Top header */}
         <header className="h-16 bg-white border-b border-slate-200 flex items-center px-4 lg:px-6 gap-4 sticky top-0 z-30 shrink-0">
           <button
@@ -216,10 +216,11 @@ export function Layout() {
           </div>
         </header>
 
-        {/* Page content — flex-1 flex-col overflow-hidden so children with
-            flex-1/min-h-0 (BiodiversityPage, MapPage) receive a resolved height.
-            Pages that need internal scroll must manage it themselves. */}
-        <main className="flex-1 flex flex-col overflow-hidden p-4 lg:p-6 min-h-0">
+        {/* Page content — overflow-y-auto allows natural page scroll.
+            Pages that need a fixed-height internal scroll region
+            (BiodiversityPage, MapPage) apply overflow-hidden on their
+            own root element and are unaffected by this change. */}
+        <main className="flex-1 flex flex-col overflow-y-auto p-4 lg:p-6">
           <Outlet />
         </main>
       </div>
