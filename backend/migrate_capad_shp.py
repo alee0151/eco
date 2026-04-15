@@ -236,6 +236,8 @@ def _bool_yn(v) -> bool | None:
 
 
 def _date(v) -> str | None:
+    """Return ISO-8601 string or None. psycopg2 will bind this as TEXT;
+    the INSERT SQL casts it to TIMESTAMPTZ via CAST(... AS TIMESTAMPTZ)."""
     if v is None:
         return None
     s = str(v).strip()
@@ -274,7 +276,7 @@ def _iucn(v) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers  (same pattern as migrate_ibra.py)
+# Geometry helpers
 # ---------------------------------------------------------------------------
 
 def _to_multipolygon(geom):
@@ -300,7 +302,7 @@ def _to_multipolygon(geom):
 
 
 def _ewkb(geom, srid: int = 4326) -> str | None:
-    """EWKB hex — inserted via ST_GeomFromEWKB(decode(:hex,'hex'))."""
+    """EWKB hex string — passed as :geom_ewkb and decoded in SQL."""
     if geom is None or geom.is_empty:
         return None
     return shapely_wkb.dumps(geom, hex=True, include_srid=True, srid=srid)
@@ -514,6 +516,9 @@ def drop_and_create(engine) -> None:
 # ---------------------------------------------------------------------------
 # Migrate (bulk INSERT)
 # ---------------------------------------------------------------------------
+# NOTE: psycopg2 chokes on `:param::TYPE` because `::` immediately after a
+# bind-param marker confuses its parser.  Use CAST(:param AS TYPE) instead.
+# ---------------------------------------------------------------------------
 
 INSERT_SQL = text("""
     INSERT INTO capad (
@@ -529,12 +534,15 @@ INSERT_SQL = text("""
         :objectid, :pa_id, :pa_pid, :pa_name, :pa_type, :pa_type_abbr,
         :iucn_cat, :nrs_pa, :nrs_mpa,
         :gaz_area_ha, :gis_area_ha,
-        :gaz_date::TIMESTAMPTZ, :latest_gaz::TIMESTAMPTZ,
+        CAST(:gaz_date AS TIMESTAMPTZ),
+        CAST(:latest_gaz AS TIMESTAMPTZ),
         :state, :authority, :source_dataset, :governance, :comments,
         :environ, :overlap, :mgt_plan, :res_number, :zone_type, :epbc_trigger,
         :longitude, :latitude, :pa_system, :shape_area, :shape_len,
         :capad_version, :capad_citation, :capad_licence,
-        :is_active, :cleaned_at::TIMESTAMPTZ, :geom_wkt,
+        :is_active,
+        CAST(:cleaned_at AS TIMESTAMPTZ),
+        :geom_wkt,
         ST_GeomFromEWKB(decode(:geom_ewkb, 'hex'))
     )
 """)
@@ -595,8 +603,8 @@ def migrate(rows: list[dict], engine) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    # Declare global BATCH_SIZE at the very top of main() so Python's
-    # compile-time scan sees it before any reference to BATCH_SIZE occurs.
+    # global BATCH_SIZE must be declared before any reference inside this
+    # function so Python's compile-time scan does not raise SyntaxError.
     global BATCH_SIZE
 
     parser = argparse.ArgumentParser(
@@ -612,18 +620,17 @@ def main():
                         help=f"Rows per INSERT batch (default: {BATCH_SIZE})")
     args = parser.parse_args()
 
-    # Apply --batch override now that args are parsed
     BATCH_SIZE = args.batch
 
     if not os.path.exists(args.shp):
         sys.exit(f"ERROR: Shapefile not found: {args.shp}")
 
-    # ── Load ─────────────────────────────────────────────────────────────
+    # ── Load ───────────────────────────────────────────────────────────
     print(f"\nLoading: {args.shp}")
     gdf = gpd.read_file(args.shp)
     report(gdf, "RAW shapefile")
 
-    # ── Clean ────────────────────────────────────────────────────────────
+    # ── Clean ──────────────────────────────────────────────────────────
     gdf = clean(gdf)
     report(gdf, "CLEANED shapefile")
 
@@ -634,7 +641,7 @@ def main():
         print("[Dry run] No DB changes made.")
         return
 
-    # ── Connect ───────────────────────────────────────────────────────────
+    # ── Connect ────────────────────────────────────────────────────────
     raw_url  = args.db_url or os.getenv(
         "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/eco_db"
     )
@@ -652,15 +659,15 @@ def main():
                 "Enable with: CREATE EXTENSION IF NOT EXISTS postgis;"
             )
 
-    # ── Drop + recreate table ──────────────────────────────────────────────
+    # ── Drop + recreate table ──────────────────────────────────────────
     drop_and_create(engine)
 
-    # ── Build rows ────────────────────────────────────────────────────────
+    # ── Build rows ───────────────────────────────────────────────────
     print("\nBuilding row dicts...")
     rows = build_rows(gdf, version=args.version)
     print(f"Built {len(rows)} rows.")
 
-    # ── Insert ────────────────────────────────────────────────────────────
+    # ── Insert ─────────────────────────────────────────────────────────
     migrate(rows, engine)
     print("\nDone. Press F5 in DBeaver to refresh the capad table.")
 
