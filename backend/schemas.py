@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict
 from typing import Optional, List
 
 
-# ── species ────────────────────────────────────────────────────────────────────
+# ── species ──────────────────────────────────────────────────────────────────────────────
 
 class SpeciesOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -34,7 +34,7 @@ class SpeciesOut(BaseModel):
     geom_wkt:         Optional[str]    = None
 
 
-# ── kba ──────────────────────────────────────────────────────────────────────
+# ── kba ───────────────────────────────────────────────────────────────────────────────
 
 class KbaOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -57,7 +57,7 @@ class KbaOut(BaseModel):
     geometry:     Optional[str]   = None  # WKT for frontend mapping
 
 
-# ── capad ─────────────────────────────────────────────────────────────────────
+# ── capad ──────────────────────────────────────────────────────────────────────────────
 
 class CapadOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -85,7 +85,7 @@ class CapadOut(BaseModel):
     geom_wkt:         Optional[str]   = None  # WKT for frontend mapping
 
 
-# ── ibra ──────────────────────────────────────────────────────────────────────
+# ── ibra ───────────────────────────────────────────────────────────────────────────────
 
 class IbraOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -124,7 +124,7 @@ class SupplierRiskSummary(BaseModel):
     threatened_species_names: List[str]      = []
 
 
-# ── Epic 1 Supplier schemas (unchanged) ───────────────────────────────────────
+# ── Epic 1 Supplier schemas ───────────────────────────────────────────────
 
 class SupplierOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -165,3 +165,38 @@ class SupplierCreate(BaseModel):
     file_name:        Optional[str]  = None
     file_type:        Optional[str]  = None
     warnings:         Optional[str]  = None
+
+
+class SupplierPatch(BaseModel):
+    """
+    Request body for PATCH /api/suppliers/{id}.
+
+    All fields are Optional — callers only include what they want to change
+    (JSON Merge Patch semantics, RFC 7396). FastAPI/Pydantic validates types
+    before the route handler runs, preventing type-unsafe DB writes that the
+    previous `body: dict` approach allowed.
+
+    The allowed-field allowlist in the route handler is kept as a secondary
+    defence-in-depth guard.
+    """
+    name:                Optional[str]   = None
+    abn:                 Optional[str]   = None
+    address:             Optional[str]   = None
+    commodity:           Optional[str]   = None
+    region:              Optional[str]   = None
+    confidence_score:    Optional[int]   = None
+    status:              Optional[str]   = None
+    is_validated:        Optional[bool]  = None
+    enriched_name:       Optional[str]   = None
+    enriched_address:    Optional[str]   = None
+    abr_status:          Optional[str]   = None
+    abn_found:           Optional[bool]  = None
+    name_discrepancy:    Optional[bool]  = None
+    address_discrepancy: Optional[bool]  = None
+    lat:                 Optional[float] = None
+    lng:                 Optional[float] = None
+    resolution_level:    Optional[str]   = None
+    inference_method:    Optional[str]   = None
+    file_name:           Optional[str]   = None
+    file_type:           Optional[str]   = None
+    warnings:            Optional[str]   = None
