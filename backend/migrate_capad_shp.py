@@ -348,7 +348,7 @@ def clean(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     for shp_col_upper, db_col in COL_MAP.items():
         if shp_col_upper in cols_upper:
             src = cols_upper[shp_col_upper]
-            if src != db_col:          # only rename if name actually differs
+            if src != db_col:
                 rename[src] = db_col
     gdf = gdf.rename(columns=rename)
     print(f"      Renamed: {rename}")
@@ -393,7 +393,6 @@ def clean(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     # 5. Clean attribute columns
     print("[5/6] Cleaning attribute fields...")
 
-    # objectid: cast to int, deduplicate (keep last)
     if "objectid" in gdf.columns:
         gdf["objectid"] = gdf["objectid"].apply(_i)
         n_b = len(gdf)
@@ -403,21 +402,17 @@ def clean(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         gdf["objectid"] = range(1, len(gdf) + 1)
         print("      WARNING: No OBJECTID column. Synthesised from row index.")
 
-    # Drop rows with null objectid
     n_b = len(gdf)
     gdf = gdf[gdf["objectid"].notna()].copy()
     print(f"      Dropped {n_b - len(gdf)} rows with null objectid.")
 
-    # IUCN normalise
     if "iucn_cat" in gdf.columns:
         gdf["iucn_cat"] = gdf["iucn_cat"].apply(_iucn)
 
-    # Y/N booleans
     for bool_col in ("nrs_pa", "nrs_mpa"):
         if bool_col in gdf.columns:
             gdf[bool_col] = gdf[bool_col].apply(_bool_yn)
 
-    # Validate lat / lon
     if "latitude" in gdf.columns:
         gdf["latitude"] = gdf["latitude"].apply(
             lambda v: _f(v) if v is not None and AUS_LAT[0] <= (_f(v) or 999) <= AUS_LAT[1] else None
@@ -509,7 +504,6 @@ def drop_and_create(engine) -> None:
         print("[DDL] Dropping capad table (CASCADE)...")
         conn.execute(text("DROP TABLE IF EXISTS capad CASCADE"))
         print("[DDL] Creating capad table + indexes...")
-        # Execute each statement separately (psycopg2 doesn't support multi-statement DDL)
         for stmt in CREATE_TABLE_SQL.strip().split(";"):
             stmt = stmt.strip()
             if stmt:
@@ -574,7 +568,6 @@ def migrate(rows: list[dict], engine) -> None:
 
     print(f"\n[Migrate] Inserted {inserted}/{total} rows | Skipped/errored: {errors}")
 
-    # Post-insert validation
     with engine.connect() as conn:
         total_db  = conn.execute(text("SELECT COUNT(*) FROM capad")).scalar()
         with_geom = conn.execute(text("SELECT COUNT(*) FROM capad WHERE geom IS NOT NULL")).scalar()
@@ -602,6 +595,10 @@ def migrate(rows: list[dict], engine) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    # Declare global BATCH_SIZE at the very top of main() so Python's
+    # compile-time scan sees it before any reference to BATCH_SIZE occurs.
+    global BATCH_SIZE
+
     parser = argparse.ArgumentParser(
         description="Drop capad table, recreate, clean CAPAD .shp, and bulk-insert."
     )
@@ -615,15 +612,18 @@ def main():
                         help=f"Rows per INSERT batch (default: {BATCH_SIZE})")
     args = parser.parse_args()
 
+    # Apply --batch override now that args are parsed
+    BATCH_SIZE = args.batch
+
     if not os.path.exists(args.shp):
         sys.exit(f"ERROR: Shapefile not found: {args.shp}")
 
-    # ── Load ────────────────────────────────────────────────────────────────
+    # ── Load ─────────────────────────────────────────────────────────────
     print(f"\nLoading: {args.shp}")
     gdf = gpd.read_file(args.shp)
     report(gdf, "RAW shapefile")
 
-    # ── Clean ───────────────────────────────────────────────────────────────
+    # ── Clean ────────────────────────────────────────────────────────────
     gdf = clean(gdf)
     report(gdf, "CLEANED shapefile")
 
@@ -634,7 +634,7 @@ def main():
         print("[Dry run] No DB changes made.")
         return
 
-    # ── Connect ─────────────────────────────────────────────────────────────
+    # ── Connect ───────────────────────────────────────────────────────────
     raw_url  = args.db_url or os.getenv(
         "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/eco_db"
     )
@@ -652,17 +652,15 @@ def main():
                 "Enable with: CREATE EXTENSION IF NOT EXISTS postgis;"
             )
 
-    # ── Drop + recreate table ───────────────────────────────────────────────
+    # ── Drop + recreate table ──────────────────────────────────────────────
     drop_and_create(engine)
 
-    # ── Build rows ──────────────────────────────────────────────────────────
-    global BATCH_SIZE
-    BATCH_SIZE = args.batch
+    # ── Build rows ────────────────────────────────────────────────────────
     print("\nBuilding row dicts...")
     rows = build_rows(gdf, version=args.version)
     print(f"Built {len(rows)} rows.")
 
-    # ── Insert ──────────────────────────────────────────────────────────────
+    # ── Insert ────────────────────────────────────────────────────────────
     migrate(rows, engine)
     print("\nDone. Press F5 in DBeaver to refresh the capad table.")
 
