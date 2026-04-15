@@ -1,21 +1,15 @@
 /**
  * MapView.tsx — centre panel of the Biodiversity split layout.
  *
- * Features:
- *  - Renders supplier markers using real geocoded coordinates from SupplierContext
- *  - Layer toggle panel: Species Occurrences, CAPAD Protected Areas, KBA, IBRA regions
- *  - Marker colour driven by SupplierRiskSummary risk level
- *  - Fly-to on supplier select, pulse animation on hover/select
- *  - Risk legend bottom-left
- *  - IBRA layer:
- *      • Fetches all IBRA 7 bioregion polygons once (two paginated requests, cached
- *        in ibraRecordsRef so we never re-fetch on selection changes)
- *      • drawIbraLayer() rebuilds the Leaflet GeoJSON layer from cached records
- *        + current summaries + current selectedId — called on every relevant
- *        state change so highlights are always up-to-date
- *      • Supplier-linked regions: strong fill + solid border
- *      • Selected supplier's region: extra-thick border + 'Selected' badge
- *      • Reference regions: faint dashed outline
+ * Layout of bottom-left controls (bottom → top):
+ *   [Risk Legend]  ← always visible
+ *   [Layers btn]   ← always visible, sits directly above legend
+ *   [Layer panel]  ← expands upward from the Layers btn when open
+ *
+ * IBRA highlight tiers:
+ *   Selected supplier's bioregion  → amber fill, thick border
+ *   Other supplier bioregions      → blue fill, solid border
+ *   Reference regions              → faint blue dashed outline
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -41,7 +35,8 @@ const RISK_COLORS: Record<string, string> = {
   none:     '#94a3b8',
 };
 
-const IBRA_COLOR = '#2563eb';
+const IBRA_COLOR          = '#2563eb'; // blue  — other supplier regions
+const IBRA_SELECTED_COLOR = '#f59e0b'; // amber — selected supplier's bioregion
 
 function getRiskLevel(summary?: SupplierRiskSummary): string {
   if (!summary) return 'none';
@@ -64,14 +59,7 @@ function createIcon(color: string, size: number, pulse: boolean) {
   });
 }
 
-// ── Layer definitions ─────────────────────────────────────────────────────
-interface LayerDef {
-  id:    string;
-  label: string;
-  color: string;
-  group: string;
-  desc:  string;
-}
+interface LayerDef { id: string; label: string; color: string; group: string; desc: string; }
 
 const LAYER_DEFS: LayerDef[] = [
   { id: 'species', label: 'Species Occurrences',    color: '#8b5cf6', group: 'Biodiversity',     desc: 'ALA threatened species records near suppliers' },
@@ -94,15 +82,13 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
   const mapRef        = useRef<L.Map | null>(null);
   const markersRef    = useRef<Map<string, L.Marker>>(new Map());
   const layerGroupRef = useRef<Map<string, L.LayerGroup>>(new Map());
-
-  // Cache raw IBRA records so we never re-fetch on selection changes
   const ibraRecordsRef = useRef<IbraRecord[] | null>(null);
 
   const [layerPanelOpen, setLayerPanelOpen] = useState(false);
   const [activeLayers,   setActiveLayers]   = useState<Set<string>>(new Set(['species']));
   const [layerLoading,   setLayerLoading]   = useState<Set<string>>(new Set());
 
-  // ── Init map ─────────────────────────────────────────────────────────────
+  // ── Init map ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
     const map = L.map(containerRef.current, {
@@ -124,7 +110,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Add/update supplier markers ──────────────────────────────────────────
+  // ── Supplier markers ──────────────────────────────────────────────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -175,7 +161,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     });
   }, [suppliers, summaries, selectedId, hoveredId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Fly to selected ──────────────────────────────────────────────────────
+  // ── Fly to selected ───────────────────────────────────────────────────────
   useEffect(() => {
     if (!selectedId || !mapRef.current) return;
     const s = suppliers.find(x => x.id === selectedId);
@@ -185,28 +171,27 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     }
   }, [selectedId, suppliers]);
 
-  // ── IBRA draw helper ───────────────────────────────────────────────────────
-  // Rebuilds the IBRA Leaflet layer from cached records + current
-  // summaries + current selectedId without re-fetching from the backend.
-  // Safe to call repeatedly — always clears the old layer group first.
+  // ── IBRA draw helper ──────────────────────────────────────────────────────
+  // Rebuilds the entire IBRA layer from cached records + current state.
+  // Called on every relevant state change — never re-fetches from backend.
   const drawIbraLayer = useCallback((records: IbraRecord[]) => {
     const map = mapRef.current;
     if (!map) return;
 
-    // Tear down any existing IBRA layer group
     layerGroupRef.current.get('ibra')?.remove();
     const group = L.layerGroup().addTo(map);
     layerGroupRef.current.set('ibra', group);
 
-    // Determine which IBRA codes are linked to suppliers via risk summaries
-    const highlightedCodes = new Set(
-      summaries.filter(sm => sm.ibra_code).map(sm => sm.ibra_code as string)
-    );
-
-    // Determine the IBRA code of the *currently selected* supplier
-    const selectedCode = selectedId
+    // IBRA code of the currently selected supplier (the region they are IN)
+    const selectedCode: string | null = selectedId
       ? (summaries.find(sm => sm.supplier_id === selectedId)?.ibra_code ?? null)
       : null;
+
+    // All IBRA codes that have at least one supplier located in them
+    const highlightedCodes = new Set<string>(
+      summaries.filter(sm => sm.ibra_code && sm.ibra_code !== selectedCode)
+               .map(sm => sm.ibra_code as string)
+    );
 
     records.forEach(record => {
       if (!record.geometry) return;
@@ -218,7 +203,6 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
         const isSelected    = !!selectedCode && code === selectedCode;
         const isHighlighted = highlightedCodes.has(code);
 
-        // Collect supplier names that fall in this bioregion
         const matchedSuppliers = summaries
           .filter(sm => sm.ibra_code === code)
           .map(sm => sm.supplier_name)
@@ -229,41 +213,23 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           : null;
 
         const supplierBadge = matchedSuppliers.length > 0
-          ? `<br/><span style="display:inline-block;margin-top:4px;padding:2px 6px;`
-            + (isSelected
-              ? `background:#fef9c3;color:#854d0e;border-radius:4px;font-size:10px;font-weight:700">Selected: `
-              : `background:#dbeafe;color:#1d4ed8;border-radius:4px;font-size:10px;font-weight:600">`)
+          ? `<br/><span style="display:inline-block;margin-top:4px;padding:2px 6px;"
+             + (isSelected
+               ? `background:#fef3c7;color:#92400e;border-radius:4px;font-size:10px;font-weight:700">📍 `
+               : `background:#dbeafe;color:#1d4ed8;border-radius:4px;font-size:10px;font-weight:600">`)
             + `${matchedSuppliers.slice(0, 3).join(', ')}${matchedSuppliers.length > 3 ? ` +${matchedSuppliers.length - 3} more` : ''}`
             + `</span>`
           : '';
 
-        // Three-tier style: selected > highlighted > reference
+        // Tier styles:
+        //   isSelected    → amber, thick solid border (supplier is located here)
+        //   isHighlighted → blue, solid border (other suppliers located here)
+        //   otherwise     → faint blue dashed outline (reference context)
         const style = isSelected
-          ? {
-              color:       IBRA_COLOR,
-              weight:      3,
-              opacity:     1,
-              fillColor:   IBRA_COLOR,
-              fillOpacity: 0.25,
-              dashArray:   undefined as string | undefined,
-            }
+          ? { color: IBRA_SELECTED_COLOR, weight: 3,   opacity: 1,   fillColor: IBRA_SELECTED_COLOR, fillOpacity: 0.22, dashArray: undefined as string | undefined }
           : isHighlighted
-          ? {
-              color:       IBRA_COLOR,
-              weight:      2.5,
-              opacity:     0.9,
-              fillColor:   IBRA_COLOR,
-              fillOpacity: 0.18,
-              dashArray:   undefined as string | undefined,
-            }
-          : {
-              color:       IBRA_COLOR,
-              weight:      0.8,
-              opacity:     0.5,
-              fillColor:   IBRA_COLOR,
-              fillOpacity: 0.03,
-              dashArray:   '4 5',
-            };
+          ? { color: IBRA_COLOR,          weight: 2.5, opacity: 0.9, fillColor: IBRA_COLOR,          fillOpacity: 0.15, dashArray: undefined as string | undefined }
+          : { color: IBRA_COLOR,          weight: 0.8, opacity: 0.4, fillColor: IBRA_COLOR,          fillOpacity: 0.03, dashArray: '4 5' };
 
         L.geoJSON(geojson as any, { style })
           .bindTooltip(
@@ -276,22 +242,18 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           )
           .addTo(group);
       } catch (err) {
-        console.warn('[MapView] Failed to parse IBRA geometry for', record.ibra_reg_code, err);
+        console.warn('[MapView] IBRA parse error for', record.ibra_reg_code, err);
       }
     });
   }, [summaries, selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Re-draw IBRA layer when summaries or selectedId change ────────────
-  // This ensures highlights are always in sync even if the IBRA layer was
-  // toggled on before summaries finished loading, or when user selects a
-  // different supplier.
+  // ── Re-draw IBRA when summaries or selection changes ──────────────────────
   useEffect(() => {
-    if (!activeLayers.has('ibra')) return;     // layer not active — nothing to do
-    if (!ibraRecordsRef.current) return;       // records not yet fetched — toggleLayer will draw
+    if (!activeLayers.has('ibra') || !ibraRecordsRef.current) return;
     drawIbraLayer(ibraRecordsRef.current);
   }, [summaries, selectedId, activeLayers, drawIbraLayer]);
 
-  // ── Toggle dataset layers ───────────────────────────────────────────────
+  // ── Toggle dataset layers ─────────────────────────────────────────────────
   const toggleLayer = async (layerId: string) => {
     const map = mapRef.current;
     if (!map) return;
@@ -314,17 +276,14 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
         if (suppliersWithCoords.length > 0) {
           const first = suppliersWithCoords[0];
           const records = await speciesApi.byBbox({
-            min_lat: first.coordinates!.lat - 2,
-            max_lat: first.coordinates!.lat + 2,
-            min_lng: first.coordinates!.lng - 2,
-            max_lng: first.coordinates!.lng + 2,
+            min_lat: first.coordinates!.lat - 2, max_lat: first.coordinates!.lat + 2,
+            min_lng: first.coordinates!.lng - 2, max_lng: first.coordinates!.lng + 2,
             limit: 300,
           }).catch(() => []);
           records.forEach(r => {
             if (!r.decimallatitude || !r.decimallongitude) return;
             L.circleMarker([r.decimallatitude, r.decimallongitude], {
-              radius: 4, color: '#8b5cf6', fillColor: '#8b5cf6',
-              fillOpacity: 0.5, weight: 1, opacity: 0.7,
+              radius: 4, color: '#8b5cf6', fillColor: '#8b5cf6', fillOpacity: 0.5, weight: 1, opacity: 0.7,
             }).bindTooltip(`<b>${r.vernacularname ?? r.scientificname ?? 'Unknown'}</b><br/>${r.stateprovince ?? ''}`)
               .addTo(group);
           });
@@ -334,17 +293,14 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
       if (layerId === 'capad') {
         const group = L.layerGroup().addTo(map);
         layerGroupRef.current.set(layerId, group);
-        if (summaries[0]) {
-          suppliers.filter(s => s.coordinates).forEach(s => {
-            const sm = summaries.find(r => r.supplier_id === s.id);
-            if (!sm || sm.protected_areas_nearby === 0) return;
-            L.circle([s.coordinates!.lat, s.coordinates!.lng], {
-              radius: 55000, color: '#0d9488', fillColor: '#0d9488',
-              fillOpacity: 0.05, weight: 1.5, dashArray: '6 4',
-            }).bindTooltip(`${sm.protected_areas_nearby} protected areas within ~50 km of ${s.enrichedName ?? s.name}`)
-              .addTo(group);
-          });
-        }
+        suppliers.filter(s => s.coordinates).forEach(s => {
+          const sm = summaries.find(r => r.supplier_id === s.id);
+          if (!sm || sm.protected_areas_nearby === 0) return;
+          L.circle([s.coordinates!.lat, s.coordinates!.lng], {
+            radius: 55000, color: '#0d9488', fillColor: '#0d9488', fillOpacity: 0.05, weight: 1.5, dashArray: '6 4',
+          }).bindTooltip(`${sm.protected_areas_nearby} protected areas within ~50 km of ${s.enrichedName ?? s.name}`)
+            .addTo(group);
+        });
       }
 
       if (layerId === 'kba') {
@@ -354,34 +310,26 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           const sm = summaries.find(r => r.supplier_id === s.id);
           if (!sm || sm.kba_nearby === 0) return;
           L.circle([s.coordinates!.lat, s.coordinates!.lng], {
-            radius: 45000, color: '#16a34a', fillColor: '#16a34a',
-            fillOpacity: 0.06, weight: 1.5, dashArray: '4 6',
+            radius: 45000, color: '#16a34a', fillColor: '#16a34a', fillOpacity: 0.06, weight: 1.5, dashArray: '4 6',
           }).bindTooltip(`${sm.kba_nearby} Key Biodiversity Areas near ${s.enrichedName ?? s.name}`)
             .addTo(group);
         });
       }
 
       if (layerId === 'ibra') {
-        // Fetch records only if we haven't already cached them
         if (!ibraRecordsRef.current) {
           const [page1, page2] = await Promise.all([
             ibraApi.list({ limit: 100, offset: 0   }).catch(() => []),
             ibraApi.list({ limit: 100, offset: 100 }).catch(() => []),
           ]);
-          const allRecords = [...page1, ...page2];
-
-          // Deduplicate by IBRA region code
           const seen = new Set<string>();
-          ibraRecordsRef.current = allRecords.filter(r => {
+          ibraRecordsRef.current = [...page1, ...page2].filter(r => {
             const key = r.ibra_reg_code ?? r.ibra_reg_name ?? String(r.id);
             if (seen.has(key)) return false;
             seen.add(key);
             return true;
           });
         }
-
-        // Draw using current summaries + selectedId (drawIbraLayer reads from
-        // the closure captured at render time, so it always has fresh values)
         drawIbraLayer(ibraRecordsRef.current);
       }
     } catch (e) {
@@ -405,109 +353,6 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
 
       <div ref={containerRef} className="h-full w-full" />
 
-      {/* ── Layer toggle button ── */}
-      <button
-        onClick={() => setLayerPanelOpen(v => !v)}
-        className={clsx(
-          'absolute top-3 left-3 z-[1000] flex items-center gap-1.5 px-3 py-2 text-xs rounded-xl shadow-md border transition-colors',
-          layerPanelOpen
-            ? 'bg-emerald-600 text-white border-emerald-700'
-            : 'bg-white/95 backdrop-blur-sm text-slate-700 border-slate-200/80 hover:bg-slate-50'
-        )}
-        style={{ fontWeight: 600 }}
-      >
-        <Layers className="w-3.5 h-3.5" />
-        Layers
-        {activeLayers.size > 0 && (
-          <span className={clsx('text-[10px] px-1.5 py-0.5 rounded-full', layerPanelOpen ? 'bg-white/20' : 'bg-emerald-100 text-emerald-700')}>
-            {activeLayers.size}
-          </span>
-        )}
-      </button>
-
-      {/* ── Layer panel ── */}
-      {layerPanelOpen && (
-        <div className="absolute top-12 left-3 z-[1000] w-[240px] bg-white/97 backdrop-blur-sm rounded-xl shadow-lg border border-slate-200/80 overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
-            <span className="text-xs text-slate-800" style={{ fontWeight: 600 }}>Map Layers</span>
-            <button onClick={() => setLayerPanelOpen(false)} className="p-1 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          {Array.from(new Set(LAYER_DEFS.map(l => l.group))).map(group => (
-            <div key={group}>
-              <p className="px-4 pt-3 pb-1 text-[10px] text-slate-400 uppercase tracking-widest" style={{ fontWeight: 600 }}>{group}</p>
-              {LAYER_DEFS.filter(l => l.group === group).map(layer => {
-                const isActive  = activeLayers.has(layer.id);
-                const isLoading = layerLoading.has(layer.id);
-                return (
-                  <div
-                    key={layer.id}
-                    className={clsx(
-                      'flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors select-none',
-                      isActive ? 'bg-slate-50' : 'hover:bg-slate-50/60'
-                    )}
-                    onClick={() => toggleLayer(layer.id)}
-                  >
-                    <div
-                      className={clsx('w-8 h-4 rounded-full border-2 flex items-center transition-all duration-200', isActive ? 'justify-end' : 'justify-start')}
-                      style={{ borderColor: layer.color, backgroundColor: isActive ? layer.color + '30' : 'transparent' }}
-                    >
-                      <div className="w-3 h-3 rounded-full mx-0.5" style={{ backgroundColor: isActive ? layer.color : '#cbd5e1' }} />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-[12px] text-slate-700" style={{ fontWeight: isActive ? 600 : 500 }}>{layer.label}</p>
-                      <p className="text-[10px] text-slate-400 leading-tight">{layer.desc}</p>
-                    </div>
-                    {isLoading && (
-                      <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full animate-spin" />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-
-          <p className="px-4 py-2 text-[10px] text-slate-400 border-t border-slate-100">More datasets coming soon: water stress, minerals</p>
-        </div>
-      )}
-
-      {/* ── IBRA legend ── */}
-      {activeLayers.has('ibra') && (
-        <div className="absolute bottom-20 left-4 bg-white/95 backdrop-blur-sm rounded-xl p-3 shadow-md border border-slate-200/80 z-[1000] min-w-[160px]">
-          <p className="text-[10px] text-slate-500 mb-2 uppercase tracking-wider" style={{ fontWeight: 600 }}>IBRA Bioregions</p>
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-2">
-              <span className="w-6 h-3 rounded-sm shrink-0 border-2" style={{ backgroundColor: IBRA_COLOR + '40', borderColor: IBRA_COLOR }} />
-              <span className="text-[11px] text-slate-600">Selected region</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-6 h-3 rounded-sm shrink-0 border-2" style={{ backgroundColor: IBRA_COLOR + '2e', borderColor: IBRA_COLOR }} />
-              <span className="text-[11px] text-slate-600">Supplier region</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-6 h-3 rounded-sm shrink-0 border" style={{ backgroundColor: IBRA_COLOR + '08', borderColor: IBRA_COLOR + '80', borderStyle: 'dashed' }} />
-              <span className="text-[11px] text-slate-600">Reference region</span>
-            </div>
-          </div>
-          <p className="text-[9px] text-slate-400 mt-2 leading-tight">Hover a polygon to see<br/>region name &amp; area</p>
-        </div>
-      )}
-
-      {/* ── Risk legend ── */}
-      <div className="absolute bottom-4 left-4 bg-white/95 backdrop-blur-sm rounded-xl p-3 shadow-md border border-slate-200/80 z-[1000]">
-        <p className="text-[10px] text-slate-500 mb-2 uppercase tracking-wider" style={{ fontWeight: 600 }}>Risk Level</p>
-        <div className="space-y-1.5">
-          {(['critical', 'high', 'medium', 'low'] as const).map(level => (
-            <div key={level} className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: RISK_COLORS[level] }} />
-              <span className="text-[11px] text-slate-600 capitalize">{level}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-
       {/* ── Top-right summary badges ── */}
       <div className="absolute top-3 right-3 flex gap-2 z-[1000]">
         {[
@@ -520,6 +365,101 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           </div>
         ))}
       </div>
+
+      {/*
+        ── Bottom-left control stack ──
+        Flex column (bottom-up):
+          [Risk legend]  ← always at the bottom
+          [Layers btn]   ← directly above legend
+          [Layer panel]  ← expands upward above the Layers btn
+      */}
+      <div className="absolute bottom-4 left-4 z-[1000] flex flex-col items-start gap-2">
+
+        {/* Layer panel — renders above the button when open */}
+        {layerPanelOpen && (
+          <div className="w-[240px] bg-white/97 backdrop-blur-sm rounded-xl shadow-lg border border-slate-200/80 overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
+              <span className="text-xs text-slate-800" style={{ fontWeight: 600 }}>Map Layers</span>
+              <button
+                onClick={() => setLayerPanelOpen(false)}
+                className="p-1 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {Array.from(new Set(LAYER_DEFS.map(l => l.group))).map(group => (
+              <div key={group}>
+                <p className="px-4 pt-3 pb-1 text-[10px] text-slate-400 uppercase tracking-widest" style={{ fontWeight: 600 }}>{group}</p>
+                {LAYER_DEFS.filter(l => l.group === group).map(layer => {
+                  const isActive  = activeLayers.has(layer.id);
+                  const isLoading = layerLoading.has(layer.id);
+                  return (
+                    <div
+                      key={layer.id}
+                      className={clsx(
+                        'flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors select-none',
+                        isActive ? 'bg-slate-50' : 'hover:bg-slate-50/60'
+                      )}
+                      onClick={() => toggleLayer(layer.id)}
+                    >
+                      <div
+                        className={clsx('w-8 h-4 rounded-full border-2 flex items-center transition-all duration-200', isActive ? 'justify-end' : 'justify-start')}
+                        style={{ borderColor: layer.color, backgroundColor: isActive ? layer.color + '30' : 'transparent' }}
+                      >
+                        <div className="w-3 h-3 rounded-full mx-0.5" style={{ backgroundColor: isActive ? layer.color : '#cbd5e1' }} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[12px] text-slate-700" style={{ fontWeight: isActive ? 600 : 500 }}>{layer.label}</p>
+                        <p className="text-[10px] text-slate-400 leading-tight">{layer.desc}</p>
+                      </div>
+                      {isLoading && (
+                        <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full animate-spin" />
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+
+            <p className="px-4 py-2 text-[10px] text-slate-400 border-t border-slate-100">More datasets coming soon: water stress, minerals</p>
+          </div>
+        )}
+
+        {/* Layers toggle button */}
+        <button
+          onClick={() => setLayerPanelOpen(v => !v)}
+          className={clsx(
+            'flex items-center gap-1.5 px-3 py-2 text-xs rounded-xl shadow-md border transition-colors',
+            layerPanelOpen
+              ? 'bg-emerald-600 text-white border-emerald-700'
+              : 'bg-white/95 backdrop-blur-sm text-slate-700 border-slate-200/80 hover:bg-slate-50'
+          )}
+          style={{ fontWeight: 600 }}
+        >
+          <Layers className="w-3.5 h-3.5" />
+          Layers
+          {activeLayers.size > 0 && (
+            <span className={clsx('text-[10px] px-1.5 py-0.5 rounded-full', layerPanelOpen ? 'bg-white/20' : 'bg-emerald-100 text-emerald-700')}>
+              {activeLayers.size}
+            </span>
+          )}
+        </button>
+
+        {/* Risk legend — always at the bottom of the stack */}
+        <div className="bg-white/95 backdrop-blur-sm rounded-xl p-3 shadow-md border border-slate-200/80">
+          <p className="text-[10px] text-slate-500 mb-2 uppercase tracking-wider" style={{ fontWeight: 600 }}>Risk Level</p>
+          <div className="space-y-1.5">
+            {(['critical', 'high', 'medium', 'low'] as const).map(level => (
+              <div key={level} className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: RISK_COLORS[level] }} />
+                <span className="text-[11px] text-slate-600 capitalize">{level}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+      </div>{/* end bottom-left stack */}
     </div>
   );
 }
