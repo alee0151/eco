@@ -86,7 +86,14 @@ export function EnrichmentPage() {
     if (started.current) return;
     started.current = true;
 
+    // ── Snapshot suppliers once, at effect start ──────────────────────────
+    // Reading `suppliers` here (synchronously, before any awaits) captures
+    // the stable initial value.  `enrichOne` receives the full supplier object
+    // it needs directly, so the callback never needs to close over the live
+    // context value.  This removes `suppliers` from the dependency array and
+    // prevents re-firing in React Strict Mode when context updates.
     const pending = suppliers.filter((s) => !s.isValidated);
+
     if (pending.length === 0) {
       setIsComplete(true);
       return;
@@ -105,10 +112,17 @@ export function EnrichmentPage() {
 
     /**
      * Enrich a single supplier via POST /api/enrich.
-     * updateSupplier is synchronous (session state only — no DB).
-     * Staggered by index so requests don't all fire at once.
+     *
+     * Receives the full supplier snapshot directly — does NOT close over the
+     * live `suppliers` context value.  This is intentional: we want the data
+     * that was present when the user arrived at this page, not a mid-flight
+     * update that could cause a stale read or trigger the effect to re-run.
      */
-    const enrichOne = async (supplierId: string, staggerMs: number) => {
+    const enrichOne = async (
+      supplier: (typeof pending)[number],
+      staggerMs: number
+    ) => {
+      const supplierId = supplier.id;
       await new Promise((r) => setTimeout(r, staggerMs));
 
       // Step 1 — connecting
@@ -119,8 +133,7 @@ export function EnrichmentPage() {
       updateRow(supplierId, { status: "validating", progress: 50 });
       await new Promise((r) => setTimeout(r, 300));
 
-      const supplier = suppliers.find((s) => s.id === supplierId);
-      if (!supplier?.abn || !isValidAbnFormat(supplier.abn)) {
+      if (!supplier.abn || !isValidAbnFormat(supplier.abn)) {
         // Invalid ABN format — mark failed immediately, no network call needed
         updateSupplier(supplierId, {
           isValidated: true,
@@ -180,13 +193,19 @@ export function EnrichmentPage() {
       }
     };
 
-    // Fire all enrichments in parallel, staggered by 700 ms each
-    const allPromises = pending.map((s, i) => enrichOne(s.id, i * 700));
+    // Fire all enrichments in parallel, staggered by 700 ms each.
+    // Each call receives its supplier snapshot, not a context reference.
+    const allPromises = pending.map((s, i) => enrichOne(s, i * 700));
 
     Promise.allSettled(allPromises).then(() => {
       setIsComplete(true);
     });
-  }, [suppliers, updateSupplier, updateRow]);
+    // ── Stable deps only ──────────────────────────────────────────────────
+    // `updateSupplier` and `updateRow` are stable useCallback references.
+    // `suppliers` is intentionally excluded: we snapshot it synchronously
+    // above and never need to re-run this effect when it changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [updateSupplier, updateRow]);
 
   // countdown + auto-redirect
   useEffect(() => {
