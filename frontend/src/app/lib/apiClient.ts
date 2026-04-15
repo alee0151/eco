@@ -27,9 +27,15 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
       const body = await res.json();
       message = body?.detail ?? body?.message ?? message;
     } catch {
-      // ignore JSON parse failure
+      // ignore JSON parse failure on error responses
     }
     throw new ApiError(res.status, message);
+  }
+
+  // 204 No Content / 205 Reset Content — body is empty, do NOT call res.json()
+  // DELETE /api/suppliers/{id} returns 204; calling .json() throws a SyntaxError.
+  if (res.status === 204 || res.status === 205) {
+    return undefined as unknown as T;
   }
 
   return res.json() as Promise<T>;
