@@ -78,10 +78,10 @@ interface MapViewProps {
 }
 
 export default function MapView({ suppliers, summaries, selectedId, onSelect, hoveredId, onHover }: MapViewProps) {
-  const containerRef  = useRef<HTMLDivElement>(null);
-  const mapRef        = useRef<L.Map | null>(null);
-  const markersRef    = useRef<Map<string, L.Marker>>(new Map());
-  const layerGroupRef = useRef<Map<string, L.LayerGroup>>(new Map());
+  const containerRef   = useRef<HTMLDivElement>(null);
+  const mapRef         = useRef<L.Map | null>(null);
+  const markersRef     = useRef<Map<string, L.Marker>>(new Map());
+  const layerGroupRef  = useRef<Map<string, L.LayerGroup>>(new Map());
   const ibraRecordsRef = useRef<IbraRecord[] | null>(null);
 
   const [layerPanelOpen, setLayerPanelOpen] = useState(false);
@@ -110,7 +110,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Supplier markers ──────────────────────────────────────────────────────
+  // ── Supplier markers ───────────────────────────────────────────────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -172,8 +172,6 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
   }, [selectedId, suppliers]);
 
   // ── IBRA draw helper ──────────────────────────────────────────────────────
-  // Rebuilds the entire IBRA layer from cached records + current state.
-  // Called on every relevant state change — never re-fetches from backend.
   const drawIbraLayer = useCallback((records: IbraRecord[]) => {
     const map = mapRef.current;
     if (!map) return;
@@ -187,10 +185,11 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
       ? (summaries.find(sm => sm.supplier_id === selectedId)?.ibra_code ?? null)
       : null;
 
-    // All IBRA codes that have at least one supplier located in them
+    // All IBRA codes that have at least one OTHER supplier located in them
     const highlightedCodes = new Set<string>(
-      summaries.filter(sm => sm.ibra_code && sm.ibra_code !== selectedCode)
-               .map(sm => sm.ibra_code as string)
+      summaries
+        .filter(sm => sm.ibra_code && sm.ibra_code !== selectedCode)
+        .map(sm => sm.ibra_code as string)
     );
 
     records.forEach(record => {
@@ -212,34 +211,35 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           ? (record.shape_area / 1_000_000).toFixed(0)
           : null;
 
-        const supplierBadge = matchedSuppliers.length > 0
-          ? `<br/><span style="display:inline-block;margin-top:4px;padding:2px 6px;"
-             + (isSelected
-               ? `background:#fef3c7;color:#92400e;border-radius:4px;font-size:10px;font-weight:700">📍 `
-               : `background:#dbeafe;color:#1d4ed8;border-radius:4px;font-size:10px;font-weight:600">`)
-            + `${matchedSuppliers.slice(0, 3).join(', ')}${matchedSuppliers.length > 3 ? ` +${matchedSuppliers.length - 3} more` : ''}`
-            + `</span>`
-          : '';
+        // Build the supplier badge HTML using a plain variable to avoid
+        // nested template literals that break Babel's parser.
+        let supplierBadge = '';
+        if (matchedSuppliers.length > 0) {
+          const names = matchedSuppliers.slice(0, 3).join(', ')
+            + (matchedSuppliers.length > 3 ? ` +${matchedSuppliers.length - 3} more` : '');
+          const badgeStyle = isSelected
+            ? 'background:#fef3c7;color:#92400e;border-radius:4px;font-size:10px;font-weight:700'
+            : 'background:#dbeafe;color:#1d4ed8;border-radius:4px;font-size:10px;font-weight:600';
+          const prefix = isSelected ? '\uD83D\uDCCD ' : '';
+          supplierBadge = `<br/><span style="display:inline-block;margin-top:4px;padding:2px 6px;${badgeStyle}">${prefix}${names}</span>`;
+        }
 
-        // Tier styles:
-        //   isSelected    → amber, thick solid border (supplier is located here)
-        //   isHighlighted → blue, solid border (other suppliers located here)
-        //   otherwise     → faint blue dashed outline (reference context)
+        // Three-tier polygon style
         const style = isSelected
           ? { color: IBRA_SELECTED_COLOR, weight: 3,   opacity: 1,   fillColor: IBRA_SELECTED_COLOR, fillOpacity: 0.22, dashArray: undefined as string | undefined }
           : isHighlighted
           ? { color: IBRA_COLOR,          weight: 2.5, opacity: 0.9, fillColor: IBRA_COLOR,          fillOpacity: 0.15, dashArray: undefined as string | undefined }
           : { color: IBRA_COLOR,          weight: 0.8, opacity: 0.4, fillColor: IBRA_COLOR,          fillOpacity: 0.03, dashArray: '4 5' };
 
+        const tooltipContent =
+          `<b style="font-size:12px">${record.ibra_reg_name ?? code ?? 'Unknown'}</b>` +
+          `<br/><span style="font-size:10px;color:#64748b">` +
+          `${record.state ?? 'Australia'}${areakm2 ? ` \u00b7 ${areakm2} km\u00b2` : ''}` +
+          `</span>` +
+          supplierBadge;
+
         L.geoJSON(geojson as any, { style })
-          .bindTooltip(
-            `<b style="font-size:12px">${record.ibra_reg_name ?? code ?? 'Unknown'}</b>`
-            + `<br/><span style="font-size:10px;color:#64748b">`
-            + `${record.state ?? 'Australia'}${areakm2 ? ` · ${areakm2} km²` : ''}`
-            + `</span>`
-            + supplierBadge,
-            { sticky: true }
-          )
+          .bindTooltip(tooltipContent, { sticky: true })
           .addTo(group);
       } catch (err) {
         console.warn('[MapView] IBRA parse error for', record.ibra_reg_code, err);
@@ -368,10 +368,10 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
 
       {/*
         ── Bottom-left control stack ──
-        Flex column (bottom-up):
-          [Risk legend]  ← always at the bottom
-          [Layers btn]   ← directly above legend
-          [Layer panel]  ← expands upward above the Layers btn
+        Flex column rendered bottom-up:
+          [Risk legend]   ← always at the bottom
+          [Layers btn]    ← directly above legend
+          [Layer panel]   ← expands upward above the Layers btn
       */}
       <div className="absolute bottom-4 left-4 z-[1000] flex flex-col items-start gap-2">
 
