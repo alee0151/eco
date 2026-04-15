@@ -10,6 +10,10 @@
  *   Selected supplier's bioregion  → amber fill, thick border
  *   Other supplier bioregions      → blue fill, solid border
  *   Reference regions              → faint blue dashed outline
+ *
+ * CAPAD layer:
+ *   Fetches real records from /api/biodiversity/capad (capad_protected_areas)
+ *   Colour-coded by IUCN category; each marker shows a rich popup.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -18,7 +22,7 @@ import { Layers, X } from 'lucide-react';
 import clsx from 'clsx';
 import wellknown from 'wellknown';
 import { Supplier } from '../../context/SupplierContext';
-import { IbraRecord, SupplierRiskSummary, speciesApi, ibraApi } from '../../lib/api';
+import { IbraRecord, CapadRecord, SupplierRiskSummary, speciesApi, ibraApi, capadApi } from '../../lib/api';
 import 'leaflet/dist/leaflet.css';
 
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png';
@@ -27,6 +31,7 @@ import markerShadow from 'leaflet/dist/images/marker-shadow.png';
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({ iconUrl: markerIcon, iconRetinaUrl: markerIcon2x, shadowUrl: markerShadow });
 
+// ── Risk colours ──────────────────────────────────────────────────────────────
 const RISK_COLORS: Record<string, string> = {
   critical: '#ef4444',
   high:     '#f97316',
@@ -35,9 +40,75 @@ const RISK_COLORS: Record<string, string> = {
   none:     '#94a3b8',
 };
 
-const IBRA_COLOR          = '#2563eb'; // blue  — other supplier regions
-const IBRA_SELECTED_COLOR = '#f59e0b'; // amber — selected supplier's bioregion
+// ── IBRA colours ──────────────────────────────────────────────────────────────
+const IBRA_COLOR          = '#2563eb';
+const IBRA_SELECTED_COLOR = '#f59e0b';
 
+// ── CAPAD IUCN colours ────────────────────────────────────────────────────────
+/**
+ * Colour each protected area marker by its IUCN management category.
+ * Categories Ia / Ib are strict nature reserves → darkest teal.
+ * Not Reported / unknown → neutral slate.
+ */
+const CAPAD_IUCN_COLORS: Record<string, string> = {
+  'Ia':           '#0f4c5c',   // Strict Nature Reserve
+  'Ib':           '#0d6e6e',   // Wilderness Area
+  'II':           '#0d9488',   // National Park
+  'III':          '#06b6d4',   // Natural Monument
+  'IV':           '#16a34a',   // Habitat/Species Management
+  'V':            '#84cc16',   // Protected Landscape/Seascape
+  'VI':           '#10b981',   // Protected Area with Sustainable Use
+  'Not Reported': '#94a3b8',
+  'Not Applicable': '#94a3b8',
+};
+
+function capadIucnColor(cat: string | null): string {
+  if (!cat) return CAPAD_IUCN_COLORS['Not Reported'];
+  return CAPAD_IUCN_COLORS[cat] ?? CAPAD_IUCN_COLORS['Not Reported'];
+}
+
+// ── CAPAD marker HTML ─────────────────────────────────────────────────────────
+function capadIcon(color: string) {
+  return L.divIcon({
+    className: '',
+    html: `<div style="
+      width:10px;height:10px;
+      border-radius:3px;
+      background:${color};
+      border:2px solid white;
+      box-shadow:0 1px 4px rgba(0,0,0,0.3);
+    "></div>`,
+    iconSize: [10, 10],
+    iconAnchor: [5, 5],
+  });
+}
+
+// ── CAPAD popup content ───────────────────────────────────────────────────────
+function capadPopup(r: CapadRecord): string {
+  const color    = capadIucnColor(r.iucn_cat);
+  const area     = r.gis_area_ha != null ? `${Number(r.gis_area_ha).toLocaleString()} ha` : '—';
+  const epbc     = r.epbc_trigger || '—';
+  const authority = r.authority  || '—';
+  const governance = r.governance || '—';
+  return `
+    <div style="min-width:210px;font-family:sans-serif;">
+      <p style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:2px">${r.pa_name ?? 'Protected Area'}</p>
+      <span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;color:white;background:${color};margin-bottom:6px">
+        IUCN ${r.iucn_cat ?? 'Not Reported'}
+      </span>
+      <div style="font-size:11px;color:#334155;line-height:1.7">
+        <p><b>Type:</b> ${r.pa_type ?? '—'} (${r.pa_type_abbr ?? '—'})</p>
+        <p><b>State:</b> ${r.state ?? '—'}</p>
+        <p><b>Area:</b> ${area}</p>
+        <p><b>Governance:</b> ${governance}</p>
+        <p><b>Authority:</b> ${authority}</p>
+        <p><b>EPBC trigger:</b> ${epbc}</p>
+      </div>
+    </div>
+  `;
+}
+
+// ── Risk scoring ──────────────────────────────────────────────────────────────
 function getRiskLevel(summary?: SupplierRiskSummary): string {
   if (!summary) return 'none';
   const score = summary.species_nearby * 2 + summary.protected_areas_nearby * 3 + summary.kba_nearby * 5;
@@ -59,15 +130,29 @@ function createIcon(color: string, size: number, pulse: boolean) {
   });
 }
 
+// ── Layer definitions ─────────────────────────────────────────────────────────
 interface LayerDef { id: string; label: string; color: string; group: string; desc: string; }
 
 const LAYER_DEFS: LayerDef[] = [
   { id: 'species', label: 'Species Occurrences',    color: '#8b5cf6', group: 'Biodiversity',     desc: 'ALA threatened species records near suppliers' },
-  { id: 'capad',   label: 'CAPAD Protected Areas',  color: '#0d9488', group: 'Protected Regions', desc: 'Commonwealth protected areas (CAPAD 2022)' },
+  { id: 'capad',   label: 'CAPAD Protected Areas',  color: '#0d9488', group: 'Protected Regions', desc: 'Real CAPAD 2024 protected areas — coloured by IUCN category' },
   { id: 'kba',     label: 'Key Biodiversity Areas', color: '#16a34a', group: 'Protected Regions', desc: 'BirdLife KBA boundaries' },
   { id: 'ibra',    label: 'IBRA Bioregions',        color: IBRA_COLOR, group: 'Bioregions',       desc: 'IBRA 7 bioregion outlines (all 89 regions)' },
 ];
 
+// ── CAPAD IUCN legend entries for the layer panel ─────────────────────────────
+const CAPAD_LEGEND: { cat: string; label: string }[] = [
+  { cat: 'Ia',           label: 'Ia — Strict Nature Reserve' },
+  { cat: 'Ib',           label: 'Ib — Wilderness Area' },
+  { cat: 'II',           label: 'II — National Park' },
+  { cat: 'III',          label: 'III — Natural Monument' },
+  { cat: 'IV',           label: 'IV — Habitat/Species Mgmt' },
+  { cat: 'V',            label: 'V — Protected Landscape' },
+  { cat: 'VI',           label: 'VI — Sustainable Use' },
+  { cat: 'Not Reported', label: 'Not Reported / N/A' },
+];
+
+// ── Props ─────────────────────────────────────────────────────────────────────
 interface MapViewProps {
   suppliers:  Supplier[];
   summaries:  SupplierRiskSummary[];
@@ -83,10 +168,13 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
   const markersRef     = useRef<Map<string, L.Marker>>(new Map());
   const layerGroupRef  = useRef<Map<string, L.LayerGroup>>(new Map());
   const ibraRecordsRef = useRef<IbraRecord[] | null>(null);
+  // Cache fetched CAPAD records so re-toggling doesn't re-fetch
+  const capadRecordsRef = useRef<CapadRecord[] | null>(null);
 
-  const [layerPanelOpen, setLayerPanelOpen] = useState(false);
-  const [activeLayers,   setActiveLayers]   = useState<Set<string>>(new Set(['species']));
-  const [layerLoading,   setLayerLoading]   = useState<Set<string>>(new Set());
+  const [layerPanelOpen,   setLayerPanelOpen]   = useState(false);
+  const [activeLayers,     setActiveLayers]      = useState<Set<string>>(new Set(['species']));
+  const [layerLoading,     setLayerLoading]      = useState<Set<string>>(new Set());
+  const [capadLegendOpen,  setCapadLegendOpen]   = useState(false);
 
   // ── Init map ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -180,12 +268,10 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     const group = L.layerGroup().addTo(map);
     layerGroupRef.current.set('ibra', group);
 
-    // IBRA code of the currently selected supplier (the region they are IN)
     const selectedCode: string | null = selectedId
       ? (summaries.find(sm => sm.supplier_id === selectedId)?.ibra_code ?? null)
       : null;
 
-    // All IBRA codes that have at least one OTHER supplier located in them
     const highlightedCodes = new Set<string>(
       summaries
         .filter(sm => sm.ibra_code && sm.ibra_code !== selectedCode)
@@ -211,8 +297,6 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           ? (record.shape_area / 1_000_000).toFixed(0)
           : null;
 
-        // Build the supplier badge HTML using a plain variable to avoid
-        // nested template literals that break Babel's parser.
         let supplierBadge = '';
         if (matchedSuppliers.length > 0) {
           const names = matchedSuppliers.slice(0, 3).join(', ')
@@ -224,7 +308,6 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           supplierBadge = `<br/><span style="display:inline-block;margin-top:4px;padding:2px 6px;${badgeStyle}">${prefix}${names}</span>`;
         }
 
-        // Three-tier polygon style
         const style = isSelected
           ? { color: IBRA_SELECTED_COLOR, weight: 3,   opacity: 1,   fillColor: IBRA_SELECTED_COLOR, fillOpacity: 0.22, dashArray: undefined as string | undefined }
           : isHighlighted
@@ -253,6 +336,40 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     drawIbraLayer(ibraRecordsRef.current);
   }, [summaries, selectedId, activeLayers, drawIbraLayer]);
 
+  // ── CAPAD draw helper — real records from DB ───────────────────────────────
+  /**
+   * Render each CAPAD protected area as a small square marker coloured by
+   * its IUCN management category.  Each marker opens a rich popup with:
+   *   PA name, type, IUCN cat, area (ha), governance, authority, EPBC trigger.
+   *
+   * Only records with valid lat/lon are rendered.
+   */
+  const drawCapadLayer = useCallback((records: CapadRecord[]) => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    layerGroupRef.current.get('capad')?.remove();
+    const group = L.layerGroup().addTo(map);
+    layerGroupRef.current.set('capad', group);
+
+    let rendered = 0;
+    records.forEach(r => {
+      if (r.latitude == null || r.longitude == null) return;
+      const color = capadIucnColor(r.iucn_cat);
+      L.marker([r.latitude, r.longitude], { icon: capadIcon(color) })
+        .bindPopup(capadPopup(r), { maxWidth: 260 })
+        .addTo(group);
+      rendered++;
+    });
+    console.info(`[MapView] CAPAD layer: rendered ${rendered} / ${records.length} records`);
+  }, []);
+
+  // ── Re-draw CAPAD when summaries/selection changes ─────────────────────────
+  useEffect(() => {
+    if (!activeLayers.has('capad') || !capadRecordsRef.current) return;
+    drawCapadLayer(capadRecordsRef.current);
+  }, [summaries, selectedId, activeLayers, drawCapadLayer]);
+
   // ── Toggle dataset layers ─────────────────────────────────────────────────
   const toggleLayer = async (layerId: string) => {
     const map = mapRef.current;
@@ -269,6 +386,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     setActiveLayers(prev => new Set(prev).add(layerId));
 
     try {
+      // ── Species ────────────────────────────────────────────────────────────
       if (layerId === 'species') {
         const group = L.layerGroup().addTo(map);
         layerGroupRef.current.set(layerId, group);
@@ -290,19 +408,83 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
         }
       }
 
+      // ── CAPAD — fetch real records from capad_protected_areas ─────────────
       if (layerId === 'capad') {
-        const group = L.layerGroup().addTo(map);
-        layerGroupRef.current.set(layerId, group);
-        suppliers.filter(s => s.coordinates).forEach(s => {
-          const sm = summaries.find(r => r.supplier_id === s.id);
-          if (!sm || sm.protected_areas_nearby === 0) return;
-          L.circle([s.coordinates!.lat, s.coordinates!.lng], {
-            radius: 55000, color: '#0d9488', fillColor: '#0d9488', fillOpacity: 0.05, weight: 1.5, dashArray: '6 4',
-          }).bindTooltip(`${sm.protected_areas_nearby} protected areas within ~50 km of ${s.enrichedName ?? s.name}`)
-            .addTo(group);
-        });
+        if (!capadRecordsRef.current) {
+          /**
+           * Fetch strategy:
+           *   1. Collect the unique state codes from supplier risk summaries.
+           *      The backend's capad/by-state endpoint returns active records
+           *      only, ordered by area desc, up to 500 per state.
+           *   2. If no supplier states are known yet, fall back to a general
+           *      list (limit 1500, active only) so the layer always renders.
+           *   3. Deduplicate by pa_id to avoid duplicate markers when states
+           *      overlap or when a supplier has no ibra_code yet.
+           */
+          const supplierStates = [
+            ...new Set(
+              summaries
+                .map(sm => {
+                  // ibra_code is 3 chars; we need the state string from the
+                  // supplier's enrichedAddress / region or from CAPAD state.
+                  // Fall back to fetching for each state known from suppliers.
+                  return null; // resolved below via general list
+                })
+                .filter(Boolean) as string[]
+            ),
+          ];
+
+          // Determine states from the supplier objects directly.
+          const statesFromSuppliers = [
+            ...new Set(
+              suppliers
+                .map(s => {
+                  // Use the state code embedded in the enrichedAddress or region field.
+                  // Common patterns: "..., VIC" or "Victoria" etc.
+                  const r = s.region ?? '';
+                  const match = r.match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/i);
+                  return match ? match[1].toUpperCase() : null;
+                })
+                .filter(Boolean) as string[]
+            ),
+          ];
+
+          let records: CapadRecord[];
+          if (statesFromSuppliers.length > 0) {
+            // Fetch per-state (up to 500 each, active only)
+            const pages = await Promise.all(
+              statesFromSuppliers.map(st =>
+                capadApi.byState(st, 500).catch(() => [] as CapadRecord[])
+              )
+            );
+            // Also fetch a general page for any areas without a matched state
+            const general = await capadApi.list({ is_active: true, limit: 500 }).catch(() => [] as CapadRecord[]);
+            const all = [...pages.flat(), ...general];
+            // Deduplicate by pa_id
+            const seen = new Set<string>();
+            records = all.filter(r => {
+              const key = r.pa_id ?? String(r.id);
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+          } else {
+            // No supplier state info — load a general batch
+            const [p1, p2, p3] = await Promise.all([
+              capadApi.list({ is_active: true, limit: 500, offset: 0    }).catch(() => [] as CapadRecord[]),
+              capadApi.list({ is_active: true, limit: 500, offset: 500  }).catch(() => [] as CapadRecord[]),
+              capadApi.list({ is_active: true, limit: 500, offset: 1000 }).catch(() => [] as CapadRecord[]),
+            ]);
+            records = [...p1, ...p2, ...p3];
+          }
+
+          capadRecordsRef.current = records;
+          console.info(`[MapView] CAPAD: fetched ${records.length} total records`);
+        }
+        drawCapadLayer(capadRecordsRef.current);
       }
 
+      // ── KBA ───────────────────────────────────────────────────────────────
       if (layerId === 'kba') {
         const group = L.layerGroup().addTo(map);
         layerGroupRef.current.set(layerId, group);
@@ -316,6 +498,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
         });
       }
 
+      // ── IBRA ──────────────────────────────────────────────────────────────
       if (layerId === 'ibra') {
         if (!ibraRecordsRef.current) {
           const [page1, page2] = await Promise.all([
@@ -377,7 +560,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
 
         {/* Layer panel — renders above the button when open */}
         {layerPanelOpen && (
-          <div className="w-[240px] bg-white/97 backdrop-blur-sm rounded-xl shadow-lg border border-slate-200/80 overflow-hidden">
+          <div className="w-[260px] bg-white/97 backdrop-blur-sm rounded-xl shadow-lg border border-slate-200/80 overflow-hidden">
             <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
               <span className="text-xs text-slate-800" style={{ fontWeight: 600 }}>Map Layers</span>
               <button
@@ -395,26 +578,52 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
                   const isActive  = activeLayers.has(layer.id);
                   const isLoading = layerLoading.has(layer.id);
                   return (
-                    <div
-                      key={layer.id}
-                      className={clsx(
-                        'flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors select-none',
-                        isActive ? 'bg-slate-50' : 'hover:bg-slate-50/60'
-                      )}
-                      onClick={() => toggleLayer(layer.id)}
-                    >
+                    <div key={layer.id}>
                       <div
-                        className={clsx('w-8 h-4 rounded-full border-2 flex items-center transition-all duration-200', isActive ? 'justify-end' : 'justify-start')}
-                        style={{ borderColor: layer.color, backgroundColor: isActive ? layer.color + '30' : 'transparent' }}
+                        className={clsx(
+                          'flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors select-none',
+                          isActive ? 'bg-slate-50' : 'hover:bg-slate-50/60'
+                        )}
+                        onClick={() => toggleLayer(layer.id)}
                       >
-                        <div className="w-3 h-3 rounded-full mx-0.5" style={{ backgroundColor: isActive ? layer.color : '#cbd5e1' }} />
+                        <div
+                          className={clsx('w-8 h-4 rounded-full border-2 flex items-center transition-all duration-200', isActive ? 'justify-end' : 'justify-start')}
+                          style={{ borderColor: layer.color, backgroundColor: isActive ? layer.color + '30' : 'transparent' }}
+                        >
+                          <div className="w-3 h-3 rounded-full mx-0.5" style={{ backgroundColor: isActive ? layer.color : '#cbd5e1' }} />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[12px] text-slate-700" style={{ fontWeight: isActive ? 600 : 500 }}>{layer.label}</p>
+                          <p className="text-[10px] text-slate-400 leading-tight">{layer.desc}</p>
+                        </div>
+                        {isLoading && (
+                          <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full animate-spin" />
+                        )}
                       </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-[12px] text-slate-700" style={{ fontWeight: isActive ? 600 : 500 }}>{layer.label}</p>
-                        <p className="text-[10px] text-slate-400 leading-tight">{layer.desc}</p>
-                      </div>
-                      {isLoading && (
-                        <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full animate-spin" />
+
+                      {/* CAPAD IUCN colour legend — shown when layer is active */}
+                      {layer.id === 'capad' && isActive && (
+                        <div className="px-4 pb-2">
+                          <button
+                            className="text-[10px] text-slate-400 hover:text-slate-600 underline underline-offset-2 mb-1"
+                            onClick={e => { e.stopPropagation(); setCapadLegendOpen(v => !v); }}
+                          >
+                            {capadLegendOpen ? 'Hide' : 'Show'} IUCN colour key
+                          </button>
+                          {capadLegendOpen && (
+                            <div className="grid grid-cols-1 gap-0.5">
+                              {CAPAD_LEGEND.map(entry => (
+                                <div key={entry.cat} className="flex items-center gap-2">
+                                  <div
+                                    className="w-3 h-3 rounded-sm shrink-0 border border-white shadow-sm"
+                                    style={{ backgroundColor: capadIucnColor(entry.cat) }}
+                                  />
+                                  <span className="text-[10px] text-slate-600">{entry.label}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                       )}
                     </div>
                   );
