@@ -42,11 +42,15 @@ DEFAULT_TIMEOUT = 120  # seconds
 # Instantiated at module load; uses OPENROUTER_API_KEY from the environment.
 # The base_url swap is the only thing that differs from a standard OpenAI setup.
 
-client = AsyncOpenAI(
-    api_key=os.getenv("OPENROUTER_API_KEY", ""),
-    base_url="https://openrouter.ai/api/v1",
-)
+# client = AsyncOpenAI(
+#     api_key=os.getenv("OPENROUTER_API_KEY", ""),
+#     base_url="https://openrouter.ai/api/v1",
+# )
 
+client = AsyncOpenAI(
+    base_url="https://router.huggingface.co/v1",
+    api_key=os.getenv("HF_TOKEN"),
+)
 
 # ── Response schema ───────────────────────────────────────────────────────────
 
