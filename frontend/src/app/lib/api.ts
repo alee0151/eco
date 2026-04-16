@@ -1,5 +1,5 @@
 /**
- * api.ts  —  Centralised typed API client
+ * api.ts — Centralised typed API client
  */
 
 const BASE: string = import.meta.env.VITE_API_URL ?? '';
@@ -34,6 +34,53 @@ function buildQuery(params: Record<string, string | number | boolean | undefined
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
+
+export interface CapadNearby {
+  name:       string;
+  iucn_cat:   string | null;
+  pa_type:    string | null;
+  governance: string | null;
+  area_ha:    number | null;
+  epbc:       string | null;
+  state:      string | null;
+  dist_km:    number | null;
+}
+
+export interface KbaNearby {
+  name:     string;
+  class:    string | null;
+  status:   string | null;
+  area_km2: number | null;
+  dist_km:  number | null;
+}
+
+export interface SupplierRiskSummary {
+  // identity
+  supplier_id:   string;
+  supplier_name: string;
+  lat:           number;
+  lng:           number;
+  // IBRA
+  ibra_region:    string | null;
+  ibra_code:      string | null;
+  ibra_area_km2:  number | null;
+  // CAPAD
+  protected_areas_nearby:  number;
+  capad_nearby:            CapadNearby[];
+  iucn_distribution:       Record<string, number>;
+  governance_distribution: Record<string, number>;
+  epbc_triggered_count:    number;
+  // KBA
+  kba_nearby_count: number;
+  kba_nearby:       KbaNearby[];
+  // Species
+  species_nearby:           number;
+  threatened_species_names: string[];
+  species_kingdoms:         string[];
+  threatened_from_dataset:  number;
+  // Narrative
+  assessment_notes: string | null;
+}
 
 export interface SpeciesRecord {
   occurrence_id:    string;
@@ -124,19 +171,6 @@ export interface IbraRecord {
   geometry:      string | null;
 }
 
-export interface SupplierRiskSummary {
-  supplier_id:              string;
-  supplier_name:            string;
-  lat:                      number;
-  lng:                      number;
-  ibra_region:              string | null;
-  ibra_code:                string | null;
-  protected_areas_nearby:   number;
-  kba_nearby:               number;
-  species_nearby:           number;
-  threatened_species_names: string[];
-}
-
 export interface ExtractFieldConfidence {
   name:      number;
   abn:       number;
@@ -213,11 +247,6 @@ export const capadApi = {
   regions: (params?: { state?: string; limit?: number; offset?: number }) =>
     request<CapadRegion[]>(`/api/biodiversity/capad/regions${buildQuery(params ?? {})}`),
 
-  /**
-   * Fetch CAPAD protected area polygons whose centroid falls within a
-   * bounding box. Use this for on-demand map layer loading near suppliers.
-   * Adds a padding buffer around the bbox automatically on the frontend.
-   */
   regionsByBbox: (bbox: { min_lat: number; max_lat: number; min_lng: number; max_lng: number; limit?: number }) =>
     request<CapadRegion[]>(`/api/biodiversity/capad/regions/by-bbox${buildQuery(bbox)}`),
 

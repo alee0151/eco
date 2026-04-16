@@ -1,44 +1,35 @@
 """
-schemas.py
-
-Pydantic response schemas for the real DB tables:
-  species, kba, capad, ibra
-
-Also keeps the Epic 1 Supplier schemas used by routes/suppliers.py.
+schemas.py — Pydantic response models
 """
 
-from pydantic import BaseModel, ConfigDict
-from typing import Optional, List
+from __future__ import annotations
+from typing import Optional, List, Any
+from pydantic import BaseModel
 
-
-# ── species ──────────────────────────────────────────────────────────────────────────────
 
 class SpeciesOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    occurrence_id:    Optional[str]   = None
+    decimallatitude:  Optional[float] = None
+    decimallongitude: Optional[float] = None
+    scientificname:   Optional[str]   = None
+    vernacularname:   Optional[str]   = None
+    taxonconceptid:   Optional[str]   = None
+    kingdom:          Optional[str]   = None
+    occurrencestatus: Optional[str]   = None
+    basisofrecord:    Optional[str]   = None
+    eventdate:        Optional[str]   = None
+    stateprovince:    Optional[str]   = None
+    dataresourcename: Optional[str]   = None
+    is_obscured:      Optional[bool]  = None
+    source_dataset:   Optional[str]   = None
+    ala_licence:      Optional[str]   = None
+    geom_wkt:         Optional[str]   = None
 
-    occurrence_id:    str
-    decimallatitude:  Optional[float]  = None
-    decimallongitude: Optional[float]  = None
-    scientificname:   Optional[str]    = None
-    vernacularname:   Optional[str]    = None
-    taxonconceptid:   Optional[str]    = None
-    kingdom:          Optional[str]    = None
-    occurrencestatus: Optional[str]    = None
-    basisofrecord:    Optional[str]    = None
-    eventdate:        Optional[str]    = None
-    stateprovince:    Optional[str]    = None
-    dataresourcename: Optional[str]    = None
-    is_obscured:      Optional[bool]   = None
-    source_dataset:   Optional[str]    = None
-    ala_licence:      Optional[str]    = None
-    geom_wkt:         Optional[str]    = None
+    class Config:
+        from_attributes = True
 
-
-# ── kba ───────────────────────────────────────────────────────────────────────────────
 
 class KbaOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id:           int
     sit_rec_id:   Optional[int]   = None
     region:       Optional[str]   = None
@@ -54,149 +45,109 @@ class KbaOut(BaseModel):
     iba_status:   Optional[str]   = None
     source:       Optional[str]   = None
     shape_area:   Optional[float] = None
-    geometry:     Optional[str]   = None  # WKT for frontend mapping
+    geometry:     Optional[str]   = None
 
+    class Config:
+        from_attributes = True
 
-# ── capad ──────────────────────────────────────────────────────────────────────────────
 
 class CapadOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id:               int
-    pa_id:            Optional[str]   = None
-    pa_name:          Optional[str]   = None
-    pa_type:          Optional[str]   = None
-    pa_type_abbr:     Optional[str]   = None
-    iucn_cat:         Optional[str]   = None
-    nrs_pa:           Optional[bool]  = None
-    gaz_area_ha:      Optional[float] = None
-    gis_area_ha:      Optional[float] = None
-    state:            Optional[str]   = None
-    environ:          Optional[str]   = None
-    epbc_trigger:     Optional[str]   = None
-    latitude:         Optional[float] = None
-    longitude:        Optional[float] = None
-    governance:       Optional[str]   = None
-    authority:        Optional[str]   = None
+    id:                int
+    pa_id:             Optional[str]   = None
+    pa_name:           Optional[str]   = None
+    pa_type:           Optional[str]   = None
+    pa_type_abbr:      Optional[str]   = None
+    iucn_cat:          Optional[str]   = None
+    nrs_pa:            Optional[bool]  = None
+    gaz_area_ha:       Optional[float] = None
+    gis_area_ha:       Optional[float] = None
+    state:             Optional[str]   = None
+    environ:           Optional[str]   = None
+    epbc_trigger:      Optional[str]   = None
+    latitude:          Optional[float] = None
+    longitude:         Optional[float] = None
+    governance:        Optional[str]   = None
+    authority:         Optional[str]   = None
     effective_area_ha: Optional[float] = None
-    source_dataset:   Optional[str]   = None
-    capad_version:    Optional[str]   = None
-    is_active:        Optional[bool]  = None
-    geom_wkt:         Optional[str]   = None  # WKT for frontend mapping
+    source_dataset:    Optional[str]   = None
+    capad_version:     Optional[str]   = None
+    is_active:         Optional[bool]  = None
+    geom_wkt:          Optional[str]   = None
 
+    class Config:
+        from_attributes = True
 
-# ── ibra ───────────────────────────────────────────────────────────────────────────────
 
 class IbraOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    id:            int
+    ibra_reg_name: Optional[str]   = None
+    ibra_reg_code: Optional[str]   = None
+    ibra_reg_num:  Optional[int]   = None
+    state:         Optional[str]   = None
+    shape_area:    Optional[float] = None
+    shape_len:     Optional[float] = None
+    is_active:     Optional[bool]  = None
+    geometry:      Optional[str]   = None
 
-    id:             int
-    ibra_reg_name:  Optional[str]   = None
-    ibra_reg_code:  Optional[str]   = None
-    ibra_reg_num:   Optional[int]   = None
-    state:          Optional[str]   = None
-    shape_area:     Optional[float] = None
-    shape_len:      Optional[float] = None
-    is_active:      Optional[bool]  = None
-    geometry:       Optional[str]   = None  # WKT for frontend mapping
+    class Config:
+        from_attributes = True
 
 
-# ── Supplier risk summary — joins real GIS data to a supplier location ──────
-# Used by Epic 2 risk profile panel (replaces mock epic2-data.ts)
+class CapadNearby(BaseModel):
+    name:       str
+    iucn_cat:   Optional[str]   = None
+    pa_type:    Optional[str]   = None
+    governance: Optional[str]   = None
+    area_ha:    Optional[float] = None
+    epbc:       Optional[str]   = None
+    state:      Optional[str]   = None
+    dist_km:    Optional[float] = None
+
+
+class KbaNearby(BaseModel):
+    name:     str
+    class_:   Optional[str]   = None
+    status:   Optional[str]   = None
+    area_km2: Optional[float] = None
+    dist_km:  Optional[float] = None
+
 
 class SupplierRiskSummary(BaseModel):
-    """
-    Computed risk profile for a supplier lat/lng against real DB data.
+    # identity
+    supplier_id:   str
+    supplier_name: str
+    lat:           float
+    lng:           float
 
-    species_nearby counts only distinct threatened species (Fix 2+3).
-    threatened_species_names is sourced from the same query as species_nearby
-    so the count and list are always consistent (Fix 3).
-    """
-    supplier_id:              str
-    supplier_name:            str
-    lat:                      float
-    lng:                      float
-    ibra_region:              Optional[str]  = None
-    ibra_code:                Optional[str]  = None
-    protected_areas_nearby:   int            = 0
-    kba_nearby:               int            = 0
-    species_nearby:           int            = 0   # distinct threatened species, not raw occurrence count
-    threatened_species_names: List[str]      = []
+    # IBRA
+    ibra_region:    Optional[str]   = None
+    ibra_code:      Optional[str]   = None
+    ibra_area_km2:  Optional[float] = None
 
+    # CAPAD
+    protected_areas_nearby:  int = 0
+    capad_nearby:            List[Any] = []
+    iucn_distribution:       dict[str, int] = {}
+    governance_distribution: dict[str, int] = {}
+    epbc_triggered_count:    int = 0
 
-# ── Epic 1 Supplier schemas ───────────────────────────────────────────────
+    # KBA
+    kba_nearby_count: int = 0
+    kba_nearby:       List[Any] = []
 
-class SupplierOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    # Species
+    species_nearby:           int = 0
+    threatened_species_names: List[str] = []
+    species_kingdoms:         List[str] = []
+    threatened_from_dataset:  int = 0
 
-    id:                  str
-    name:                str
-    abn:                 Optional[str]  = None
-    address:             Optional[str]  = None
-    commodity:           Optional[str]  = None
-    region:              Optional[str]  = None
-    confidence_score:    Optional[int]  = None
-    status:              str
-    is_validated:        bool
-    enriched_name:       Optional[str]  = None
-    enriched_address:    Optional[str]  = None
-    abr_status:          Optional[str]  = None
-    abn_found:           Optional[bool] = None
-    name_discrepancy:    Optional[bool] = None
-    address_discrepancy: Optional[bool] = None
-    lat:                 Optional[float] = None
-    lng:                 Optional[float] = None
-    resolution_level:    Optional[str]  = None
-    inference_method:    Optional[str]  = None
-    file_name:           Optional[str]  = None
-    file_type:           Optional[str]  = None
-    warnings:            Optional[str]  = None
+    # Narrative
+    assessment_notes: Optional[str] = None
 
+    # Keep legacy alias so existing callers don't break
+    @property
+    def kba_nearby_int(self) -> int:
+        return self.kba_nearby_count
 
-class SupplierCreate(BaseModel):
-    id:               str
-    name:             str
-    abn:              Optional[str]  = None
-    address:          Optional[str]  = None
-    commodity:        Optional[str]  = None
-    region:           Optional[str]  = None
-    confidence_score: Optional[int]  = None
-    status:           str            = "pending"
-    file_name:        Optional[str]  = None
-    file_type:        Optional[str]  = None
-    warnings:         Optional[str]  = None
-
-
-class SupplierPatch(BaseModel):
-    """
-    Request body for PATCH /api/suppliers/{id}.
-
-    All fields are Optional — callers only include what they want to change
-    (JSON Merge Patch semantics, RFC 7396). FastAPI/Pydantic validates types
-    before the route handler runs, preventing type-unsafe DB writes that the
-    previous `body: dict` approach allowed.
-
-    The allowed-field allowlist in the route handler is kept as a secondary
-    defence-in-depth guard.
-    """
-    name:                Optional[str]   = None
-    abn:                 Optional[str]   = None
-    address:             Optional[str]   = None
-    commodity:           Optional[str]   = None
-    region:              Optional[str]   = None
-    confidence_score:    Optional[int]   = None
-    status:              Optional[str]   = None
-    is_validated:        Optional[bool]  = None
-    enriched_name:       Optional[str]   = None
-    enriched_address:    Optional[str]   = None
-    abr_status:          Optional[str]   = None
-    abn_found:           Optional[bool]  = None
-    name_discrepancy:    Optional[bool]  = None
-    address_discrepancy: Optional[bool]  = None
-    lat:                 Optional[float] = None
-    lng:                 Optional[float] = None
-    resolution_level:    Optional[str]   = None
-    inference_method:    Optional[str]   = None
-    file_name:           Optional[str]   = None
-    file_type:           Optional[str]   = None
-    warnings:            Optional[str]   = None
+    class Config:
+        from_attributes = True

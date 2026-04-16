@@ -5,23 +5,22 @@ Epic 2 — Live biodiversity data from the real DB tables:
   species, kba, capad, ibra
 
 Endpoints:
-  GET /api/biodiversity/species                     — species occurrences (paginated)
-  GET /api/biodiversity/species/by-bbox             — species within a bounding box
-  GET /api/biodiversity/kba                         — Key Biodiversity Areas (paginated)
-  GET /api/biodiversity/capad                       — Protected areas (paginated)
-  GET /api/biodiversity/capad/regions               — Protected area polygons (geom_wkt, for map rendering)
-  GET /api/biodiversity/capad/regions/by-bbox       — Protected area polygons within a bounding box
-  GET /api/biodiversity/capad/by-state/{state}      — Protected areas filtered by state
-  GET /api/biodiversity/ibra                        — IBRA bioregions
-  GET /api/biodiversity/ibra/{code}                 — Single IBRA region by code
-  GET /api/biodiversity/counts                      — Real DB row counts for stat cards
-  GET /api/biodiversity/risk-summary                — Risk summary for a supplier lat/lng
+  GET /api/biodiversity/species                 — species occurrences (paginated)
+  GET /api/biodiversity/species/by-bbox         — species within a bounding box
+  GET /api/biodiversity/kba                     — Key Biodiversity Areas (paginated)
+  GET /api/biodiversity/capad                   — Protected areas (paginated)
+  GET /api/biodiversity/capad/regions           — Protected area polygons (geom_wkt)
+  GET /api/biodiversity/capad/regions/by-bbox   — Protected area polygons within a bounding box
+  GET /api/biodiversity/capad/by-state/{state}  — Protected areas filtered by state
+  GET /api/biodiversity/ibra                    — IBRA bioregions
+  GET /api/biodiversity/ibra/{code}             — Single IBRA region by code
+  GET /api/biodiversity/counts                  — Real DB row counts for stat cards
+  GET /api/biodiversity/risk-summary            — Detailed risk summary for a supplier lat/lng
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text
-from geoalchemy2.functions import ST_SetSRID, ST_MakePoint, ST_DWithin
 from typing import Optional, List
 
 from database import get_db
@@ -31,7 +30,6 @@ from schemas import SpeciesOut, KbaOut, CapadOut, IbraOut, SupplierRiskSummary
 router = APIRouter()
 
 DEFAULT_BUFFER_DEG = 0.5
-DEFAULT_BUFFER_METRES = 55_000
 
 STATE_ABBREV_MAP: dict[str, str] = {
     "NSW": "New South Wales",
@@ -49,14 +47,7 @@ def _resolve_state(raw: str) -> str:
     return STATE_ABBREV_MAP.get(raw.upper().strip(), raw)
 
 
-SPECIES_QUALITY_FILTERS = [
-    Species.occurrencestatus.ilike("present"),
-    Species.is_obscured.is_(False),
-    Species.basisofrecord.in_(["HUMAN_OBSERVATION", "MACHINE_OBSERVATION"]),
-]
-
-
-# ── Species ────────────────────────────────────────────────────────
+# ── Species ────────────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/species", response_model=List[SpeciesOut])
 async def list_species(
@@ -92,14 +83,13 @@ async def species_by_bbox(
         .where(Species.decimallongitude.isnot(None))
         .where(Species.decimallatitude.between(min_lat, max_lat))
         .where(Species.decimallongitude.between(min_lng, max_lng))
-        .where(*SPECIES_QUALITY_FILTERS)
         .limit(limit)
     )
     result = await db.execute(q)
     return result.scalars().all()
 
 
-# ── KBA ──────────────────────────────────────────────────────────
+# ── KBA ────────────────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/kba", response_model=List[KbaOut])
 async def list_kba(
@@ -124,14 +114,14 @@ async def get_kba(kba_id: int, db: AsyncSession = Depends(get_db)):
     return kba
 
 
-# ── CAPAD ──────────────────────────────────────────────────────────
+# ── CAPAD ──────────────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/capad", response_model=List[CapadOut])
 async def list_capad(
-    limit:     int           = Query(200, ge=1, le=2000),
-    offset:    int           = Query(0,   ge=0),
-    state:     Optional[str] = Query(None),
-    pa_type:   Optional[str] = Query(None),
+    limit:     int            = Query(200, ge=1, le=2000),
+    offset:    int            = Query(0,   ge=0),
+    state:     Optional[str]  = Query(None),
+    pa_type:   Optional[str]  = Query(None),
     is_active: Optional[bool] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -149,21 +139,13 @@ async def list_capad(
 
 @router.get("/biodiversity/capad/regions/by-bbox")
 async def capad_regions_by_bbox(
-    min_lat: float = Query(..., description="South boundary of bounding box"),
-    max_lat: float = Query(..., description="North boundary of bounding box"),
-    min_lng: float = Query(..., description="West boundary of bounding box"),
-    max_lng: float = Query(..., description="East boundary of bounding box"),
+    min_lat: float = Query(...),
+    max_lat: float = Query(...),
+    min_lng: float = Query(...),
+    max_lng: float = Query(...),
     limit:   int   = Query(2000, ge=1, le=5000),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Return CAPAD protected area polygons whose centroid falls within the
-    supplied bounding box. Uses latitude/longitude centroid columns for
-    compatibility with installations that may not have PostGIS geom index.
-
-    Ordered by area DESC so large regions paint first and smaller parks
-    render on top.
-    """
     q = (
         select(
             Capad.id, Capad.pa_id, Capad.pa_name, Capad.pa_type,
@@ -172,7 +154,7 @@ async def capad_regions_by_bbox(
             Capad.epbc_trigger, Capad.geom_wkt,
         )
         .where(Capad.geom_wkt.isnot(None))
-        .where(Capad.is_active == True)  # noqa: E712
+        .where(Capad.is_active == True)       # noqa: E712
         .where(Capad.latitude.isnot(None))
         .where(Capad.longitude.isnot(None))
         .where(Capad.latitude.between(min_lat, max_lat))
@@ -191,10 +173,6 @@ async def capad_regions(
     offset: int           = Query(0,   ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Lightweight CAPAD polygon list for map rendering.
-    Ordered by area DESC so large regions paint first and smaller parks sit on top.
-    """
     q = (
         select(
             Capad.id, Capad.pa_id, Capad.pa_name, Capad.pa_type,
@@ -203,7 +181,7 @@ async def capad_regions(
             Capad.epbc_trigger, Capad.geom_wkt,
         )
         .where(Capad.geom_wkt.isnot(None))
-        .where(Capad.is_active == True)  # noqa: E712
+        .where(Capad.is_active == True)       # noqa: E712
     )
     if state:
         q = q.where(Capad.state.ilike(f"%{state}%"))
@@ -221,7 +199,7 @@ async def capad_by_state(
     result = await db.execute(
         select(Capad)
         .where(Capad.state.ilike(f"%{state}%"))
-        .where(Capad.is_active == True)  # noqa: E712
+        .where(Capad.is_active == True)       # noqa: E712
         .order_by(Capad.gis_area_ha.desc())
         .limit(limit)
     )
@@ -236,7 +214,7 @@ async def get_capad(capad_id: int, db: AsyncSession = Depends(get_db)):
     return capad
 
 
-# ── IBRA ──────────────────────────────────────────────────────────
+# ── IBRA ───────────────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/ibra", response_model=List[IbraOut])
 async def list_ibra(
@@ -264,12 +242,13 @@ async def get_ibra_by_code(code: str, db: AsyncSession = Depends(get_db)):
     return ibra
 
 
-# ── DB Counts ─────────────────────────────────────────────────────────
+# ── DB counts ──────────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/counts")
 async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
     capad_res   = await db.execute(
-        select(func.count()).select_from(Capad).where(Capad.is_active == True)  # noqa: E712
+        select(func.count()).select_from(Capad)
+        .where(Capad.is_active == True)       # noqa: E712
     )
     kba_res     = await db.execute(
         select(func.count()).select_from(Kba)
@@ -284,7 +263,7 @@ async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
     }
 
 
-# ── Supplier Risk Summary ──────────────────────────────────────────────
+# ── Risk Summary ───────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/risk-summary", response_model=SupplierRiskSummary)
 async def risk_summary(
@@ -300,11 +279,11 @@ async def risk_summary(
     min_lng = lng - buffer_deg
     max_lng = lng + buffer_deg
 
-    # ── 1. IBRA ───────────────────────────────────────────────
+    # ── 1. IBRA nearest region ─────────────────────────────────────────────
     ibra_row = (
         await db.execute(
             text("""
-                SELECT ibra_reg_name, ibra_reg_code
+                SELECT ibra_reg_name, ibra_reg_code, shape_area
                 FROM   ibra
                 WHERE  geom IS NOT NULL
                 ORDER  BY geom <-> ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
@@ -313,85 +292,194 @@ async def risk_summary(
             {"lng": lng, "lat": lat},
         )
     ).first()
-    ibra_name = ibra_row[0] if ibra_row else None
-    ibra_code = ibra_row[1] if ibra_row else None
+    ibra_name       = ibra_row[0] if ibra_row else None
+    ibra_code       = ibra_row[1] if ibra_row else None
+    ibra_area_km2   = round(float(ibra_row[2]) / 1_000_000, 0) if (ibra_row and ibra_row[2]) else None
 
-    # ── 2. Species ────────────────────────────────────────────
+    # ── 2. Species — count distinct threatened taxa ────────────────────────
+    # Strategy: bbox filter on lat/lng columns only, NO basisofrecord or
+    # dataresourcename filter so we don't miss records stored with
+    # different capitalisation or dataset names in the local DB.
+    # We deduplicate on taxonconceptid so one species sighted many times
+    # counts once.
     species_row = (
         await db.execute(
             text("""
-                WITH threatened AS (
+                WITH nearby AS (
                     SELECT
-                        taxonconceptid,
-                        MIN(vernacularname) FILTER (WHERE vernacularname IS NOT NULL)
-                            AS representative_name
+                        COALESCE(taxonconceptid, occurrence_id::text)   AS taxon_key,
+                        COALESCE(
+                            NULLIF(TRIM(vernacularname), ''),
+                            NULLIF(TRIM(scientificname), ''),
+                            'Unknown'
+                        )                                               AS display_name,
+                        kingdom,
+                        dataresourcename
                     FROM   species
-                    WHERE  taxonconceptid IS NOT NULL
-                      AND  decimallatitude  IS NOT NULL
+                    WHERE  decimallatitude  IS NOT NULL
                       AND  decimallongitude IS NOT NULL
                       AND  decimallatitude  BETWEEN :min_lat AND :max_lat
                       AND  decimallongitude BETWEEN :min_lng AND :max_lng
-                      AND  (
-                               dataresourcename ILIKE '%%threatened%%'
-                            OR dataresourcename ILIKE '%%sensitive%%'
-                            OR dataresourcename ILIKE '%%epbc%%'
-                           )
-                      AND  occurrencestatus ILIKE 'present'
-                      AND  is_obscured IS NOT TRUE
-                      AND  basisofrecord IN ('HUMAN_OBSERVATION', 'MACHINE_OBSERVATION')
-                    GROUP BY taxonconceptid
+                ),
+                deduped AS (
+                    SELECT DISTINCT ON (taxon_key)
+                        taxon_key,
+                        display_name,
+                        kingdom,
+                        dataresourcename
+                    FROM   nearby
+                    ORDER  BY taxon_key, display_name
                 )
                 SELECT
-                    COUNT(*)                                          AS species_count,
-                    ARRAY_AGG(representative_name ORDER BY representative_name)
-                        FILTER (WHERE representative_name IS NOT NULL) AS names
-                FROM threatened
+                    COUNT(*)                                                          AS species_count,
+                    ARRAY_AGG(display_name ORDER BY display_name)
+                        FILTER (WHERE display_name IS NOT NULL)                      AS names,
+                    ARRAY_AGG(DISTINCT kingdom)
+                        FILTER (WHERE kingdom IS NOT NULL)                           AS kingdoms,
+                    COUNT(*) FILTER (
+                        WHERE dataresourcename ILIKE '%%threatened%%'
+                           OR dataresourcename ILIKE '%%sensitive%%'
+                           OR dataresourcename ILIKE '%%epbc%%'
+                           OR dataresourcename ILIKE '%%conservation%%'
+                    )                                                                 AS threatened_from_dataset
+                FROM deduped
             """),
             {"min_lat": min_lat, "max_lat": max_lat,
              "min_lng": min_lng, "max_lng": max_lng},
         )
     ).first()
-    species_count = int(species_row[0] or 0) if species_row else 0
-    species_names = list((species_row[1] or [])[:20]) if species_row else []
 
-    # ── 3. CAPAD ────────────────────────────────────────────
-    buffer_metres = buffer_deg * 111_000
-    try:
-        capad_res = await db.execute(
-            select(func.count()).select_from(Capad)
-            .where(Capad.geom.isnot(None))
-            .where(Capad.is_active == True)  # noqa: E712
-            .where(
-                ST_DWithin(
-                    Capad.geom.cast(text("geography")),
-                    func.ST_SetSRID(
-                        func.ST_MakePoint(lng, lat), 4326
-                    ).cast(text("geography")),
-                    buffer_metres,
-                )
-            )
-        )
-        capad_count = capad_res.scalar() or 0
-    except Exception:
-        capad_res = await db.execute(
-            select(func.count()).select_from(Capad)
-            .where(Capad.latitude.isnot(None))
-            .where(Capad.longitude.isnot(None))
-            .where(Capad.latitude.between(min_lat, max_lat))
-            .where(Capad.longitude.between(min_lng, max_lng))
-            .where(Capad.is_active == True)  # noqa: E712
-        )
-        capad_count = capad_res.scalar() or 0
+    species_count   = int(species_row[0] or 0)        if species_row else 0
+    species_names   = list((species_row[1] or [])[:20]) if species_row else []
+    species_kingdoms = list((species_row[2] or []))   if species_row else []
+    threatened_ds   = int(species_row[3] or 0)        if species_row else 0
 
-    # ── 4. KBA ───────────────────────────────────────────────
-    kba_res = await db.execute(
-        select(func.count()).select_from(Kba)
-        .where(Kba.sit_lat.isnot(None))
-        .where(Kba.sit_long.isnot(None))
-        .where(Kba.sit_lat.between(min_lat, max_lat))
-        .where(Kba.sit_long.between(min_lng, max_lng))
+    # ── 3. CAPAD nearby — also collect IUCN + governance breakdown ─────────
+    capad_detail_rows = (
+        await db.execute(
+            text("""
+                SELECT
+                    pa_name,
+                    iucn_cat,
+                    pa_type,
+                    governance,
+                    gis_area_ha,
+                    epbc_trigger,
+                    state,
+                    SQRT(
+                        POWER(latitude  - :lat, 2) +
+                        POWER(longitude - :lng, 2)
+                    ) * 111.0 AS dist_km
+                FROM  capad
+                WHERE is_active = TRUE
+                  AND latitude   IS NOT NULL
+                  AND longitude  IS NOT NULL
+                  AND latitude   BETWEEN :min_lat AND :max_lat
+                  AND longitude  BETWEEN :min_lng AND :max_lng
+                ORDER BY dist_km ASC
+                LIMIT 50
+            """),
+            {"lat": lat, "lng": lng,
+             "min_lat": min_lat, "max_lat": max_lat,
+             "min_lng": min_lng, "max_lng": max_lng},
+        )
+    ).fetchall()
+
+    capad_count = len(capad_detail_rows)
+
+    # Nearest 5 protected areas with detail
+    capad_nearby: list[dict] = [
+        {
+            "name":        row[0] or "Unknown",
+            "iucn_cat":    row[1] or "Not Reported",
+            "pa_type":     row[2] or "",
+            "governance":  row[3] or "",
+            "area_ha":     round(float(row[4]), 0) if row[4] else None,
+            "epbc":        row[5] or "",
+            "state":       row[6] or "",
+            "dist_km":     round(float(row[7]), 1) if row[7] else None,
+        }
+        for row in capad_detail_rows[:5]
+    ]
+
+    # IUCN category distribution
+    from collections import Counter
+    iucn_counts = dict(Counter(
+        r[1] or "Not Reported" for r in capad_detail_rows
+    ))
+
+    # Governance distribution
+    gov_counts = dict(Counter(
+        r[3] or "Unknown" for r in capad_detail_rows
+    ))
+
+    # EPBC-triggered count
+    epbc_count = sum(
+        1 for r in capad_detail_rows if r[5] and r[5].strip().upper() == "YES"
     )
-    kba_count = kba_res.scalar() or 0
+
+    # ── 4. KBAs ────────────────────────────────────────────────────────────
+    kba_detail_rows = (
+        await db.execute(
+            text("""
+                SELECT
+                    COALESCE(int_name, nat_name, 'KBA')   AS kba_name,
+                    kba_class,
+                    kba_status,
+                    sit_area_km2,
+                    SQRT(
+                        POWER(sit_lat  - :lat, 2) +
+                        POWER(sit_long - :lng, 2)
+                    ) * 111.0 AS dist_km
+                FROM  kba
+                WHERE sit_lat  IS NOT NULL
+                  AND sit_long IS NOT NULL
+                  AND sit_lat  BETWEEN :min_lat AND :max_lat
+                  AND sit_long BETWEEN :min_lng AND :max_lng
+                ORDER BY dist_km ASC
+                LIMIT 10
+            """),
+            {"lat": lat, "lng": lng,
+             "min_lat": min_lat, "max_lat": max_lat,
+             "min_lng": min_lng, "max_lng": max_lng},
+        )
+    ).fetchall()
+
+    kba_count = len(kba_detail_rows)
+    kba_nearby: list[dict] = [
+        {
+            "name":     row[0],
+            "class":    row[1] or "",
+            "status":   row[2] or "",
+            "area_km2": round(float(row[3]), 1) if row[3] else None,
+            "dist_km":  round(float(row[4]), 1) if row[4] else None,
+        }
+        for row in kba_detail_rows[:5]
+    ]
+
+    # ── 5. Build assessment notes ──────────────────────────────────────────
+    notes_parts: list[str] = []
+    if ibra_name:
+        area_str = f" ({int(ibra_area_km2):,} km²)" if ibra_area_km2 else ""
+        notes_parts.append(f"Located within the {ibra_name}{area_str} IBRA bioregion.")
+    if capad_count:
+        pa_word = "protected area" if capad_count == 1 else "protected areas"
+        notes_parts.append(
+            f"{capad_count} {pa_word} found within {round(buffer_deg * 111)} km."
+            + (f" {epbc_count} trigger EPBC Act provisions." if epbc_count else "")
+        )
+    if kba_count:
+        kba_word = "Key Biodiversity Area" if kba_count == 1 else "Key Biodiversity Areas"
+        notes_parts.append(f"{kba_count} {kba_word} in proximity.")
+    if species_count:
+        notes_parts.append(
+            f"{species_count} species occurrence{'s' if species_count != 1 else ''} recorded nearby"
+            + (f", including {threatened_ds} from conservation-priority datasets." if threatened_ds else ".")
+        )
+    if not notes_parts:
+        notes_parts.append("No significant biodiversity features detected in the immediate vicinity.")
+
+    assessment_notes = " ".join(notes_parts)
 
     return SupplierRiskSummary(
         supplier_id=supplier_id,
@@ -400,8 +488,17 @@ async def risk_summary(
         lng=lng,
         ibra_region=ibra_name,
         ibra_code=ibra_code,
+        ibra_area_km2=ibra_area_km2,
         protected_areas_nearby=capad_count,
-        kba_nearby=kba_count,
+        capad_nearby=capad_nearby,
+        iucn_distribution=iucn_counts,
+        governance_distribution=gov_counts,
+        epbc_triggered_count=epbc_count,
+        kba_nearby_count=kba_count,
+        kba_nearby=kba_nearby,
         species_nearby=species_count,
         threatened_species_names=species_names,
+        species_kingdoms=species_kingdoms,
+        threatened_from_dataset=threatened_ds,
+        assessment_notes=assessment_notes,
     )
