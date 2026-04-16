@@ -4,9 +4,19 @@ POST /api/extract
 Accepts a multipart upload of a PDF or image file.
 
 OCR  : Tesseract (pytesseract) — free, runs 100 % locally.
-LLM  : HuggingFace Inference API — free tier, no credits required.
-        Set HF_API_KEY in backend/.env  (get one at https://huggingface.co/settings/tokens)
-        Set HF_MODEL   in backend/.env  (default: mistralai/Mistral-7B-Instruct-v0.3)
+LLM  : HuggingFace Inference Router — free tier, no credits required.
+        Uses: https://router.huggingface.co/hf-inference/models/{model}/v1/chat/completions
+        Set HF_TOKEN in backend/.env  (get one at https://huggingface.co/settings/tokens)
+        Set HF_MODEL  in backend/.env  (default: Qwen/Qwen2.5-7B-Instruct)
+
+Why Qwen2.5-7B-Instruct?
+  ✓ Generative model — produces free-form JSON output
+  ✓ Strong instruction following and structured output
+  ✓ Reliably available on HF free inference router
+  ✓ No credits required
+
+NOTE: Do NOT use extractive QA models (e.g. roberta-base-squad2, bert-*).
+      Those models only extract text spans — they cannot generate JSON.
 
 Address extraction scope
 ------------------------
@@ -16,13 +26,13 @@ No street name, no street number, no unit, no country.
 
 Environment variables
 ---------------------
-HF_API_KEY   Required. HuggingFace token (read access is enough).
-             Free tier: https://huggingface.co/settings/tokens
-HF_MODEL     Model repo (default: mistralai/Mistral-7B-Instruct-v0.3)
-             Other free options:
-               Qwen/Qwen2.5-7B-Instruct
-               microsoft/Phi-3-mini-4k-instruct
-               HuggingFaceH4/zephyr-7b-beta
+HF_TOKEN   Required. HuggingFace token (read access is enough).
+           Free tier: https://huggingface.co/settings/tokens
+HF_MODEL   Generative model repo (default: Qwen/Qwen2.5-7B-Instruct)
+           Other confirmed working free options:
+             microsoft/Phi-3-mini-4k-instruct
+             HuggingFaceH4/zephyr-7b-beta
+             meta-llama/Llama-3.1-8B-Instruct
 """
 
 import io
@@ -38,9 +48,9 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Default free model on HuggingFace Inference API
-DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
-HF_API_BASE   = "https://api-inference.huggingface.co/models"
+# Default: generative model on HF free inference router
+DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+HF_ROUTER_BASE = "https://router.huggingface.co/hf-inference/models"
 
 
 # ── Response schema ───────────────────────────────────────────────────────────
@@ -257,29 +267,31 @@ OCR TEXT:
 """
 
 
-# ── LLM call — HuggingFace Inference API ───────────────────────────────────────
+# ── LLM call — HuggingFace Inference Router ─────────────────────────────────────
 
 def run_llm(ocr_text: str) -> dict:
     """
-    Send OCR text to the HuggingFace free Inference API and return parsed JSON.
+    Send OCR text to the HuggingFace Inference Router and return parsed JSON.
 
-    Uses the /v1/chat/completions endpoint (OpenAI-compatible, available on
-    most instruction-tuned models on HF).
-    Authenticated with a free HF read token — no payment required.
+    URL pattern (same as the HF snippet example):
+      https://router.huggingface.co/hf-inference/models/{model}/v1/chat/completions
+
+    Uses a FREE HF read token — no payment required.
+    Model MUST be a generative/instruction-tuned LLM (not extractive QA like roberta).
     """
-    api_key = os.getenv("HF_API_KEY", "").strip()
+    api_key = os.getenv("HF_TOKEN", "").strip()
     if not api_key:
         raise HTTPException(
             status_code=503,
             detail=(
-                "HF_API_KEY is not configured. "
+                "HF_TOKEN is not configured. "
                 "Create a free token at https://huggingface.co/settings/tokens "
-                "and add HF_API_KEY=hf_... to backend/.env"
+                "and add HF_TOKEN=hf_... to backend/.env"
             ),
         )
 
     model   = os.getenv("HF_MODEL", DEFAULT_MODEL)
-    url     = f"{HF_API_BASE}/{model}/v1/chat/completions"
+    url     = f"{HF_ROUTER_BASE}/{model}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
@@ -291,24 +303,24 @@ def run_llm(ocr_text: str) -> dict:
         "max_tokens":  1024,
     }
 
-    logger.info("[extract] HF model: %s", model)
+    logger.info("[extract] HF router model: %s  url: %s", model, url)
 
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=60)
     except httpx.ConnectError as exc:
-        raise HTTPException(status_code=503, detail=f"Cannot reach HuggingFace API: {exc}")
+        raise HTTPException(status_code=503, detail=f"Cannot reach HuggingFace router: {exc}")
 
     if resp.status_code == 401:
         raise HTTPException(
             status_code=401,
-            detail="HuggingFace authentication failed — check HF_API_KEY in backend/.env",
+            detail="HuggingFace authentication failed — check HF_TOKEN in backend/.env",
         )
     if resp.status_code == 404:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"Model '{model}' not found on HuggingFace or does not support "
-                "the /v1/chat/completions endpoint. Try a different HF_MODEL."
+                f"Model '{model}' not found on HF router. "
+                "Use a generative instruction model e.g. Qwen/Qwen2.5-7B-Instruct"
             ),
         )
     if resp.status_code == 429:
@@ -321,13 +333,13 @@ def run_llm(ocr_text: str) -> dict:
             status_code=503,
             detail=(
                 f"Model '{model}' is loading on HuggingFace (cold start). "
-                "Wait 20–60 seconds and retry, or set HF_MODEL to a smaller model."
+                "Wait 20–60 seconds and retry."
             ),
         )
     if resp.status_code != 200:
         raise HTTPException(
             status_code=502,
-            detail=f"HuggingFace API error {resp.status_code}: {resp.text[:300]}",
+            detail=f"HuggingFace router error {resp.status_code}: {resp.text[:300]}",
         )
 
     try:
@@ -343,7 +355,7 @@ def run_llm(ocr_text: str) -> dict:
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$",       "", raw).strip()
 
-    # Some models echo the prompt before the JSON — extract the first { ... } block
+    # Some models echo the prompt — extract the first { ... } block
     json_match = re.search(r"(\{.*\})", raw, re.DOTALL)
     if json_match:
         raw = json_match.group(1)
@@ -471,10 +483,10 @@ async def extract(
     Pipeline:
       1. Validate file type & size.
       2. Run Tesseract OCR  →  raw text.
-      3. Send raw text to HuggingFace Inference API  →  structured JSON.
+      3. Send to HF router (Qwen2.5-7B-Instruct)  →  structured JSON.
          address = "suburb state postcode" only.
       4. Validate ABN checksum.
-      5. Sanitise address: strip any street/unit/country pollution, validate AU format.
+      5. Sanitise address.
       6. Return ExtractResult.
     """
     ct = (file.content_type or "").lower()
