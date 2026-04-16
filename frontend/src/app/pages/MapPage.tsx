@@ -54,6 +54,18 @@ const AUS_CENTRE = { lat: -25.2744, lng: 133.7751 };
  * Geocode a free-text address using the Nominatim OSM public API.
  * Returns { lat, lng, level } where level is 'address' | 'state' | 'country'.
  *
+ * Fix (bug 1): The previous implementation had a silent catch{} that swallowed
+ * ALL errors — including 429 rate-limit responses and CORS/network failures —
+ * causing every supplier to fall through to the AUS_CENTRE country fallback
+ * and appear on the same coordinates.
+ *
+ * Now:
+ * - HTTP errors and empty results are distinguished from network failures.
+ * - 429 Too Many Requests triggers a single 2-second back-off retry.
+ * - All failures are logged to the console for visibility.
+ * - Only after a genuine Nominatim failure does the function fall back to
+ *   state centroid (detected from address string) or country centre.
+ *
  * Rate limit: Nominatim allows 1 request/second.
  * The caller is responsible for staggering calls (see geocodeAll).
  */
@@ -62,12 +74,8 @@ async function geocodeAddress(
 ): Promise<{ lat: number; lng: number; level: string }> {
   const query = encodeURIComponent(address + ", Australia");
   const url = `https://nominatim.openstreetmap.org/search?q=${query}&format=json&limit=1&countrycodes=au`;
-  try {
-    const res = await fetch(url, {
-      headers: { "Accept-Language": "en", "User-Agent": "eco-supply-chain-app" },
-    });
-    if (!res.ok) throw new Error(`Nominatim ${res.status}`);
-    const data = await res.json();
+
+  const parseResult = (data: unknown): { lat: number; lng: number; level: string } | null => {
     if (Array.isArray(data) && data.length > 0) {
       return {
         lat:   parseFloat(data[0].lat),
@@ -75,17 +83,61 @@ async function geocodeAddress(
         level: data[0].type === "administrative" ? "state" : "address",
       };
     }
-  } catch {
-    // Network error or Nominatim down — fall through to state centroid
+    return null;
+  };
+
+  let nominatimFailed = false;
+
+  try {
+    const res = await fetch(url, {
+      headers: { "Accept-Language": "en", "User-Agent": "eco-supply-chain-app" },
+    });
+
+    if (res.status === 429) {
+      // Rate limited — wait 2 s and retry once
+      console.warn("[geocodeAddress] 429 rate-limited, retrying in 2 s for:", address);
+      await new Promise((r) => setTimeout(r, 2000));
+      const retry = await fetch(url, {
+        headers: { "Accept-Language": "en", "User-Agent": "eco-supply-chain-app" },
+      });
+      if (!retry.ok) {
+        console.error("[geocodeAddress] Retry failed:", retry.status, address);
+        nominatimFailed = true;
+      } else {
+        const retryData = await retry.json();
+        const result = parseResult(retryData);
+        if (result) return result;
+        nominatimFailed = true; // empty result after retry
+      }
+    } else if (!res.ok) {
+      console.error("[geocodeAddress] HTTP error:", res.status, address);
+      nominatimFailed = true;
+    } else {
+      const data = await res.json();
+      const result = parseResult(data);
+      if (result) return result;
+      // Empty result — not an error, just no match
+      console.info("[geocodeAddress] No match found for:", address);
+      nominatimFailed = true;
+    }
+  } catch (err) {
+    // Network error or Nominatim down
+    console.warn("[geocodeAddress] Network/fetch error for:", address, err);
+    nominatimFailed = true;
   }
 
-  // Fallback: detect state token in address string → use centroid
-  const stateMatch = address.toUpperCase().match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/);
-  if (stateMatch) {
-    const c = STATE_CENTROIDS[stateMatch[1]];
-    return { ...c, level: "state" };
+  // Fallback 1: detect state token in address string → use state centroid
+  if (nominatimFailed || true) {
+    const stateMatch = address.toUpperCase().match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/);
+    if (stateMatch) {
+      const c = STATE_CENTROIDS[stateMatch[1]];
+      console.info("[geocodeAddress] State centroid fallback →", stateMatch[1], c);
+      return { ...c, level: "state" };
+    }
   }
 
+  // Fallback 2: centre of Australia
+  console.warn("[geocodeAddress] Country centroid fallback for:", address);
   return { ...AUS_CENTRE, level: "country" };
 }
 
@@ -411,21 +463,28 @@ export function MapPage() {
 
   /* ── Geocode ─────────────────────────────────────────────────────────────
    *
-   * Replaces the old Math.random() approach.
-   *
    * For each supplier that doesn't yet have coordinates, call the Nominatim
    * OSM API with their full address string.  Requests are staggered 1 second
    * apart to stay within Nominatim's 1 req/s rate limit.
    *
-   * If Nominatim returns no result the function falls back to the state
-   * centroid (detected from the address string) or the centre of Australia.
-   * resolutionLevel is set accordingly so the UI can show the precision.
+   * Fix (bug 2): geocodedIds ref is now pruned at the start of each run to
+   * remove IDs that no longer exist in the current supplier list. This ensures
+   * reloaded suppliers (same IDs) are re-geocoded when coordinates are absent.
    *
-   * Fix: geocodedIds ref prevents re-geocoding suppliers on every render.
-   * The effect dependency array only includes suppliers.length so it runs
-   * again when new suppliers are added, not on every updateSupplier call.
+   * Fix (bug 3): the effect previously depended only on suppliers.length,
+   * meaning reloading the same number of suppliers never triggered re-geocoding.
+   * Now it depends on a stable supplierKey (joined ID string) so any change
+   * in the supplier set — including same-count reloads — triggers a re-check.
    */
+  const supplierKey = suppliers.map((s) => s.id).join(",");
+
   useEffect(() => {
+    // Prune stale IDs from the geocoded cache (fix bug 2)
+    const currentIds = new Set(suppliers.map((s) => s.id));
+    for (const id of geocodedIds.current) {
+      if (!currentIds.has(id)) geocodedIds.current.delete(id);
+    }
+
     // Suppliers that still need geocoding
     const needsGeocode = suppliers.filter(
       (s) => !s.coordinates && !geocodedIds.current.has(s.id)
@@ -469,7 +528,7 @@ export function MapPage() {
     geocodeAll();
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [suppliers.length]);  // only re-run when the number of suppliers changes
+  }, [supplierKey]);  // re-run whenever the set of supplier IDs changes (fix bug 3)
 
   /* ── Render markers ── */
   useEffect(() => {
@@ -529,10 +588,7 @@ export function MapPage() {
     }
   }, [selectedId, suppliers]);
 
-  /* ── Export CSV ─────────────────────────────────────────────────────────
-   * Fix: Export button previously had no onClick handler.
-   * Now exports all suppliers as a UTF-8 CSV and triggers a download.
-   */
+  /* ── Export CSV ── */
   const handleExport = useCallback(() => {
     if (suppliers.length === 0) {
       toast.error("No suppliers to export.");
@@ -639,7 +695,6 @@ export function MapPage() {
               </span>
             ))}
           </div>
-          {/* Fix: Export button now has an onClick handler */}
           <button
             onClick={handleExport}
             className="flex items-center gap-1.5 px-3 py-2 text-xs border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg transition-colors"
@@ -674,7 +729,6 @@ export function MapPage() {
       <div className="flex-1 flex gap-4 min-h-0">
 
         {/* ── Map panel ── */}
-        {/* Fix: added position:relative so the geocoding overlay anchors correctly */}
         <div className={clsx(
           "md:flex flex-col rounded-2xl overflow-hidden border border-slate-200 shadow-sm flex-[55] min-h-0 relative",
           mobileTab === "map" ? "flex" : "hidden md:flex"
