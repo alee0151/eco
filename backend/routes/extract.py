@@ -7,21 +7,18 @@ Pipeline
 --------
   1. Validate file type & size.
   2. Run Tesseract OCR  →  raw text  (100 % local, no API key needed).
-  3. POST the OCR text to Ollama /api/generate  →  structured JSON.
-     Endpoint : {OLLAMA_URL}/api/generate
-     Payload  : { "model": "...", "prompt": "...", "stream": false }
+  3. POST the OCR text to OpenRouter /chat/completions  →  structured JSON.
+     Endpoint : https://openrouter.ai/api/v1/chat/completions
+     Model    : openrouter/free  (or OPENROUTER_MODEL env var)
   4. Validate ABN checksum (ATO algorithm).
   5. Post-process address  →  strip unit/number, validate AU format.
   6. Return ExtractResult.
 
 Environment variables
 ---------------------
-OLLAMA_URL          Required. Full base URL of the Ollama server.
-                    Example: https://my-ollama-server.example.com
-                    Example: http://localhost:11434
-OLLAMA_MODEL        Model name to use (default: gpt-oss:20b)
-OLLAMA_TIMEOUT      HTTP timeout in seconds (default: 600).
-                    Large models like gpt-oss:20b can take 3-5 min on first run.
+OPENROUTER_API_KEY  Required. Your OpenRouter API key.
+OPENROUTER_MODEL    Model name to use (default: openrouter/auto)
+OPENROUTER_TIMEOUT  HTTP timeout in seconds (default: 120).
 """
 
 import io
@@ -37,8 +34,10 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-DEFAULT_MODEL   = "gpt-oss:20b"
-DEFAULT_TIMEOUT = 600  # seconds — large models need time
+DEFAULT_MODEL   = "openrouter/auto"
+DEFAULT_TIMEOUT = 120  # seconds
+
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 # ── Response schema ───────────────────────────────────────────────────────────
@@ -89,16 +88,6 @@ def run_ocr(file_bytes: bytes, content_type: str) -> str:
 
 
 # ── Prompt ───────────────────────────────────────────────────────────────────
-#
-# Designed to be maximally explicit about JSON-only output.
-# Three separate reinforcements of the JSON rule:
-#   1. System identity line ("You output ONLY JSON")
-#   2. Explicit FORBIDDEN list before the output section
-#   3. FINAL REMINDER at the very bottom of the prompt
-#
-# This addresses the "unparseable JSON" error where the model wraps
-# its output in prose, explanation, or markdown code fences.
-# ───────────────────────────────────────────────────────────────────
 
 EXTRACT_PROMPT = """\
 You are a JSON-only data-extraction engine for an Australian supply-chain risk platform.
@@ -227,7 +216,7 @@ Do not write anything before {{ or after }}.
 """
 
 
-# ── JSON extraction helper ───────────────────────────────────────────────────────
+# ── JSON extraction helper ────────────────────────────────────────────────────
 
 def _extract_json(raw: str) -> dict:
     """
@@ -239,18 +228,15 @@ def _extract_json(raw: str) -> dict:
       3. Regex-extract the first { ... } block and parse that.
       4. If all attempts fail, log the raw output and raise HTTP 502.
     """
-    # Step 1: strip markdown fences
     cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", raw.strip(), flags=re.MULTILINE)
     cleaned = re.sub(r"\s*```$",           "", cleaned.strip(), flags=re.MULTILINE)
     cleaned = cleaned.strip()
 
-    # Step 2: direct parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Step 3: pull out first {...} block (handles prose before/after JSON)
     match = re.search(r"(\{[\s\S]*\})", cleaned)
     if match:
         try:
@@ -258,105 +244,108 @@ def _extract_json(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Step 4: give up — log full raw output to help debugging
     logger.error(
-        "[extract] Could not parse JSON from Ollama response.\n"
+        "[extract] Could not parse JSON from OpenRouter response.\n"
         "--- RAW RESPONSE (first 1000 chars) ---\n%s\n--- END ---",
         raw[:1000],
     )
     raise HTTPException(
         status_code=502,
         detail=(
-            "Ollama returned unparseable JSON. "
+            "OpenRouter returned unparseable JSON. "
             "Check backend logs for the raw model output. "
-            "Try a larger model or increase OLLAMA_TIMEOUT."
+            "Try a different model or increase OPENROUTER_TIMEOUT."
         ),
     )
 
 
-# ── Ollama LLM call (async) ───────────────────────────────────────────────────
+# ── OpenRouter LLM call (async) ───────────────────────────────────────────────
 
 async def run_llm(ocr_text: str) -> dict:
     """
-    Async POST to {OLLAMA_URL}/api/generate.
+    Async POST to OpenRouter /chat/completions.
 
     Uses httpx.AsyncClient so the FastAPI event loop is never blocked.
-    Timeout is read from OLLAMA_TIMEOUT env var (default 600 s) to
-    accommodate large models that need several minutes on first inference.
+    Timeout is read from OPENROUTER_TIMEOUT env var (default 120 s).
 
     Request shape:
-        POST  $OLLAMA_URL/api/generate
+        POST  https://openrouter.ai/api/v1/chat/completions
+        Authorization: Bearer <OPENROUTER_API_KEY>
         Content-Type: application/json
         {
-            "model":  "gpt-oss:20b",
-            "prompt": "<extraction prompt>",
-            "stream": false,
-            "format": "json"
+            "model":    "openrouter/auto",
+            "messages": [{"role": "user", "content": "<prompt>"}],
+            "temperature": 0
         }
     """
-    ollama_url = os.getenv("OLLAMA_URL", "").strip()
-    if not ollama_url:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
         raise HTTPException(
             status_code=503,
             detail=(
-                "OLLAMA_URL is not configured. "
-                "Add OLLAMA_URL=https://your-ollama-server to backend/.env"
+                "OPENROUTER_API_KEY is not configured. "
+                "Add OPENROUTER_API_KEY=<your_key> to backend/.env"
             ),
         )
 
-    model   = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
-    url     = f"{ollama_url.rstrip('/')}/api/generate"
-    timeout = float(os.getenv("OLLAMA_TIMEOUT", DEFAULT_TIMEOUT))
+    model   = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+    timeout = float(os.getenv("OPENROUTER_TIMEOUT", DEFAULT_TIMEOUT))
 
     payload = {
-        "model":  model,
-        "prompt": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
-        "stream": False,
-        # "format": "json",   # tells Ollama to enforce JSON output at the token level
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
+            }
+        ],
+        "temperature": 0,
     }
-    print(payload)
 
-    logger.info("[extract] POST %s  model=%s  timeout=%.0fs", url, model, timeout)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+    }
+
+    logger.info("[extract] POST %s  model=%s  timeout=%.0fs", OPENROUTER_API_URL, model, timeout)
 
     http_timeout = httpx.Timeout(timeout, connect=30.0)
 
     try:
         async with httpx.AsyncClient(timeout=http_timeout) as client:
-            resp = await client.post(url, json=payload)
-            print("Response:\n",resp.json())
+            resp = await client.post(OPENROUTER_API_URL, json=payload, headers=headers)
             resp.raise_for_status()
 
     except httpx.ReadTimeout:
         raise HTTPException(
             status_code=504,
             detail=(
-                f"Ollama did not respond within {timeout:.0f} seconds. "
-                f"Model '{model}' may still be loading or the document is very long. "
-                f"Increase the limit: set OLLAMA_TIMEOUT=900 in backend/.env"
+                f"OpenRouter did not respond within {timeout:.0f} seconds. "
+                f"Increase the limit: set OPENROUTER_TIMEOUT=300 in backend/.env"
             ),
         )
     except httpx.ConnectError:
         raise HTTPException(
             status_code=503,
             detail=(
-                f"Cannot reach Ollama at '{ollama_url}'. "
-                "Check OLLAMA_URL and that the server is reachable."
+                "Cannot reach OpenRouter at 'https://openrouter.ai'. "
+                "Check your internet connection."
             ),
         )
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Ollama returned HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+            detail=f"OpenRouter returned HTTP {exc.response.status_code}: {exc.response.text[:300]}",
         )
 
-    raw = resp.json().get("response", "")
-    print(raw)
-    logger.debug("[extract] raw Ollama response: %s", raw)
+    data = resp.json()
+    raw  = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    logger.debug("[extract] raw OpenRouter response: %s", raw)
 
     return _extract_json(raw)
 
 
-# ── ABN validation (ATO checksum) ────────────────────────────────────────────
+# ── ABN validation (ATO checksum) ─────────────────────────────────────────────
 
 def _validate_abn(abn: str) -> list[str]:
     warnings: list[str] = []
@@ -375,7 +364,7 @@ def _validate_abn(abn: str) -> list[str]:
     return warnings
 
 
-# ── Address post-processing & validation ─────────────────────────────────────
+# ── Address post-processing & validation ──────────────────────────────────────
 
 _AU_STATES = {"NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"}
 
@@ -453,9 +442,9 @@ async def extract(
     Pipeline:
       1. Validate file type & size.
       2. Tesseract OCR  →  raw text.
-      3. POST to {OLLAMA_URL}/api/generate  →  structured JSON.
-         model = OLLAMA_MODEL env var (default: gpt-oss:20b)
-         timeout = OLLAMA_TIMEOUT env var in seconds (default: 600)
+      3. POST to OpenRouter /chat/completions  →  structured JSON.
+         model   = OPENROUTER_MODEL env var (default: openrouter/auto)
+         timeout = OPENROUTER_TIMEOUT env var in seconds (default: 120)
       4. Validate ABN checksum (ATO algorithm).
       5. Post-process address: strip unit/number, validate AU format.
       6. Return ExtractResult.
@@ -487,7 +476,7 @@ async def extract(
             ]
         )
 
-    # ── Step 2: Ollama → structured JSON ──────────────────────────────────────────
+    # ── Step 2: OpenRouter → structured JSON ──────────────────────────────────
     raw = await run_llm(ocr_text)
     conf_raw  = raw.get("confidence", {})
     warnings  = list(raw.get("warnings", []))
@@ -498,7 +487,7 @@ async def extract(
     if abn_value:
         warnings.extend(_validate_abn(abn_value))
 
-    # ── Step 4: Address sanitisation ────────────────────────────────────────────
+    # ── Step 4: Address sanitisation ──────────────────────────────────────────
     llm_addr_conf = float(conf_raw.get("address", 0))
     cleaned_addr, warnings, addr_conf_floor = _validate_address(llm_addr, warnings)
     final_addr_conf = max(llm_addr_conf, addr_conf_floor) if cleaned_addr else 0.0
