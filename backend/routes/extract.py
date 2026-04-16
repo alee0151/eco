@@ -7,9 +7,9 @@ Pipeline
 --------
   1. Validate file type & size.
   2. Run Tesseract OCR  →  raw text  (100 % local, no API key needed).
-  3. POST the OCR text to OpenRouter /chat/completions  →  structured JSON.
-     Endpoint : https://openrouter.ai/api/v1/chat/completions
-     Model    : openrouter/free  (or OPENROUTER_MODEL env var)
+  3. Send OCR text to OpenRouter via the OpenAI-compatible client  →  structured JSON.
+     Base URL : https://openrouter.ai/api/v1
+     Model    : OPENROUTER_MODEL env var (default: openrouter/auto)
   4. Validate ABN checksum (ATO algorithm).
   5. Post-process address  →  strip unit/number, validate AU format.
   6. Return ExtractResult.
@@ -27,7 +27,7 @@ import logging
 import os
 import re
 
-import httpx
+from openai import AsyncOpenAI
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
@@ -37,7 +37,15 @@ router = APIRouter()
 DEFAULT_MODEL   = "openrouter/auto"
 DEFAULT_TIMEOUT = 120  # seconds
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# ── OpenRouter client (OpenAI-compatible) ───────────────────────────────────────
+# Instantiated at module load; uses OPENROUTER_API_KEY from the environment.
+# The base_url swap is the only thing that differs from a standard OpenAI setup.
+
+client = AsyncOpenAI(
+    api_key=os.getenv("OPENROUTER_API_KEY", ""),
+    base_url="https://openrouter.ai/api/v1",
+)
 
 
 # ── Response schema ───────────────────────────────────────────────────────────
@@ -88,6 +96,16 @@ def run_ocr(file_bytes: bytes, content_type: str) -> str:
 
 
 # ── Prompt ───────────────────────────────────────────────────────────────────
+#
+# Designed to be maximally explicit about JSON-only output.
+# Three separate reinforcements of the JSON rule:
+#   1. System identity line ("You output ONLY JSON")
+#   2. Explicit FORBIDDEN list before the output section
+#   3. FINAL REMINDER at the very bottom of the prompt
+#
+# This addresses the "unparseable JSON" error where the model wraps
+# its output in prose, explanation, or markdown code fences.
+# ───────────────────────────────────────────────────────────────────
 
 EXTRACT_PROMPT = """\
 You are a JSON-only data-extraction engine for an Australian supply-chain risk platform.
@@ -228,15 +246,18 @@ def _extract_json(raw: str) -> dict:
       3. Regex-extract the first { ... } block and parse that.
       4. If all attempts fail, log the raw output and raise HTTP 502.
     """
+    # Step 1: strip markdown fences
     cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", raw.strip(), flags=re.MULTILINE)
     cleaned = re.sub(r"\s*```$",           "", cleaned.strip(), flags=re.MULTILINE)
     cleaned = cleaned.strip()
 
+    # Step 2: direct parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
+    # Step 3: pull out first {...} block (handles prose before/after JSON)
     match = re.search(r"(\{[\s\S]*\})", cleaned)
     if match:
         try:
@@ -244,6 +265,7 @@ def _extract_json(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
+    # Step 4: give up — log full raw output to help debugging
     logger.error(
         "[extract] Could not parse JSON from OpenRouter response.\n"
         "--- RAW RESPONSE (first 1000 chars) ---\n%s\n--- END ---",
@@ -259,27 +281,20 @@ def _extract_json(raw: str) -> dict:
     )
 
 
-# ── OpenRouter LLM call (async) ───────────────────────────────────────────────
+# ── OpenRouter LLM call (async, OpenAI-compatible client) ──────────────────────
 
 async def run_llm(ocr_text: str) -> dict:
     """
-    Async POST to OpenRouter /chat/completions.
+    Calls OpenRouter using the OpenAI-compatible AsyncOpenAI client.
 
-    Uses httpx.AsyncClient so the FastAPI event loop is never blocked.
-    Timeout is read from OPENROUTER_TIMEOUT env var (default 120 s).
+    The client is initialised at module load with:
+        base_url = "https://openrouter.ai/api/v1"
+        api_key  = OPENROUTER_API_KEY env var
 
-    Request shape:
-        POST  https://openrouter.ai/api/v1/chat/completions
-        Authorization: Bearer <OPENROUTER_API_KEY>
-        Content-Type: application/json
-        {
-            "model":    "openrouter/auto",
-            "messages": [{"role": "user", "content": "<prompt>"}],
-            "temperature": 0
-        }
+    Model and timeout are read from env vars at call time so they can be
+    changed without restarting the server.
     """
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
+    if not client.api_key:
         raise HTTPException(
             status_code=503,
             detail=(
@@ -291,55 +306,24 @@ async def run_llm(ocr_text: str) -> dict:
     model   = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
     timeout = float(os.getenv("OPENROUTER_TIMEOUT", DEFAULT_TIMEOUT))
 
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
-            }
-        ],
-        "temperature": 0,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-    }
-
-    logger.info("[extract] POST %s  model=%s  timeout=%.0fs", OPENROUTER_API_URL, model, timeout)
-
-    http_timeout = httpx.Timeout(timeout, connect=30.0)
+    logger.info("[extract] OpenRouter call  model=%s  timeout=%.0fs", model, timeout)
 
     try:
-        async with httpx.AsyncClient(timeout=http_timeout) as client:
-            resp = await client.post(OPENROUTER_API_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-
-    except httpx.ReadTimeout:
-        raise HTTPException(
-            status_code=504,
-            detail=(
-                f"OpenRouter did not respond within {timeout:.0f} seconds. "
-                f"Increase the limit: set OPENROUTER_TIMEOUT=300 in backend/.env"
-            ),
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000])}],
+            temperature=0,
+            timeout=timeout,
         )
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Cannot reach OpenRouter at 'https://openrouter.ai'. "
-                "Check your internet connection."
-            ),
-        )
-    except httpx.HTTPStatusError as exc:
+    except Exception as exc:
+        # Surface any openai / httpx errors as a clean HTTP 502
+        logger.error("[extract] OpenRouter error: %s", exc)
         raise HTTPException(
             status_code=502,
-            detail=f"OpenRouter returned HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+            detail=f"OpenRouter request failed: {exc}",
         )
 
-    data = resp.json()
-    raw  = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    raw = response.choices[0].message.content or ""
     logger.debug("[extract] raw OpenRouter response: %s", raw)
 
     return _extract_json(raw)
@@ -442,7 +426,7 @@ async def extract(
     Pipeline:
       1. Validate file type & size.
       2. Tesseract OCR  →  raw text.
-      3. POST to OpenRouter /chat/completions  →  structured JSON.
+      3. OpenRouter (OpenAI-compatible client)  →  structured JSON.
          model   = OPENROUTER_MODEL env var (default: openrouter/auto)
          timeout = OPENROUTER_TIMEOUT env var in seconds (default: 120)
       4. Validate ABN checksum (ATO algorithm).
