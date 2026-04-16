@@ -2,15 +2,21 @@
  * SupplierList.tsx — left panel of the Biodiversity split layout.
  *
  * Design: ALL uploaded suppliers are ALWAYS visible immediately.
- * - Suppliers with a computed risk summary → full risk card
- * - Suppliers with coordinates but no summary yet → skeleton card (shimmer)
- * - Suppliers without coordinates yet → muted "awaiting geocoding" card
+ * - Suppliers with a computed risk summary  → full risk card
+ * - Suppliers with coordinates, no summary  → skeleton card (shimmer)
+ * - Suppliers without coordinates yet        → ApprovedSupplierCard showing
+ *   all known data (name, ABN, address, commodity, confidence, status)
+ *   with a geocoding-in-progress badge; transitions to a full risk card
+ *   once coordinates + summary arrive.
  *
  * Risk details load in the background without blocking the UI.
  */
 
 import { useState } from 'react';
-import { Search, MapPin, AlertTriangle, Shield, TreePine, Layers, Bird, Clock } from 'lucide-react';
+import {
+  Search, MapPin, AlertTriangle, Shield, TreePine,
+  Layers, Bird, Clock, Building2, Package, Hash,
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import clsx from 'clsx';
 import { Supplier } from '../../context/SupplierContext';
@@ -47,6 +53,13 @@ const RISK_COLORS: Record<string, { light: string; border: string; text: string;
   low:      { light: 'bg-emerald-50', border: 'border-emerald-200',text: 'text-emerald-700',dot: '#10b981' },
 };
 
+const STATUS_STYLES: Record<string, { pill: string; label: string }> = {
+  approved:  { pill: 'bg-emerald-50 text-emerald-700 border-emerald-200', label: 'Approved'  },
+  validated: { pill: 'bg-blue-50    text-blue-700    border-blue-200',    label: 'Validated' },
+  pending:   { pill: 'bg-amber-50   text-amber-700   border-amber-200',   label: 'Pending'   },
+  rejected:  { pill: 'bg-red-50     text-red-700     border-red-200',     label: 'Rejected'  },
+};
+
 /* ── Skeleton card (has coords, awaiting risk API) ─────────────────────── */
 function SkeletonCard({ name }: { name: string }) {
   return (
@@ -76,31 +89,125 @@ function SkeletonCard({ name }: { name: string }) {
   );
 }
 
-/* ── No-coords card (uploaded but not yet geocoded) ────────────────────── */
-function AwaitingGeocodingCard({ supplier }: { supplier: Supplier }) {
+/**
+ * ApprovedSupplierCard
+ * Shown for every supplier that has been validated/approved but whose
+ * coordinates have not yet been resolved (geocoding pending or missing).
+ *
+ * Displays ALL data already held in session context so the panel is
+ * immediately useful.  A slim geocoding badge communicates what is
+ * still outstanding.  The card is fully clickable so the right panel
+ * also shows approved supplier details while the user waits.
+ */
+function ApprovedSupplierCard({
+  supplier,
+  isSelected,
+  isHovered,
+  onSelect,
+  onHover,
+}: {
+  supplier:   Supplier;
+  isSelected: boolean;
+  isHovered:  boolean;
+  onSelect:   (id: string) => void;
+  onHover:    (id: string | null) => void;
+}) {
+  const statusStyle = STATUS_STYLES[supplier.status] ?? STATUS_STYLES.pending;
+  const displayName = supplier.enrichedName ?? supplier.name;
+  const displayAddr = supplier.enrichedAddress ?? supplier.address;
+  const confidence  = supplier.confidenceScore ?? 0;
+
+  // Confidence ring colour
+  const ringColor =
+    confidence >= 80 ? '#10b981' :
+    confidence >= 50 ? '#f59e0b' : '#ef4444';
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, scale: 0.97 }}
-      className="rounded-xl border border-dashed border-slate-200 bg-slate-50 overflow-hidden"
+      onClick={() => onSelect(supplier.id)}
+      onMouseEnter={() => onHover(supplier.id)}
+      onMouseLeave={() => onHover(null)}
+      className={clsx(
+        'rounded-xl border overflow-hidden transition-all duration-200 cursor-pointer bg-white',
+        isSelected
+          ? 'border-emerald-300 shadow-md shadow-emerald-100/60'
+          : isHovered
+          ? 'border-slate-300 shadow-sm'
+          : 'border-slate-200 hover:border-slate-300',
+      )}
     >
       <div className="px-3 py-2.5 flex items-start gap-2.5">
-        {/* Placeholder badge */}
-        <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 flex items-center justify-center flex-shrink-0">
-          <Clock className="w-4 h-4 text-slate-300" />
-        </div>
-        <div className="flex-1 min-w-0">
-          <p className="text-[13px] text-slate-600 truncate" style={{ fontWeight: 600 }}>
-            {supplier.enrichedName ?? supplier.name}
-          </p>
-          <div className="flex items-center gap-1 mt-0.5">
-            <MapPin className="w-2.5 h-2.5 text-slate-300" />
-            <span className="text-[11px] text-slate-400">{supplier.address || supplier.region || 'No address'}</span>
-          </div>
-          <span className="inline-flex items-center gap-1 mt-1.5 text-[10px] text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>
-            <Clock className="w-2.5 h-2.5" /> Awaiting geocoding
+
+        {/* Confidence ring badge */}
+        <div
+          className="w-10 h-10 rounded-xl flex flex-col items-center justify-center flex-shrink-0 border bg-slate-50"
+          style={{ borderColor: ringColor + '55' }}
+        >
+          <span className="text-[13px] leading-none" style={{ fontWeight: 700, color: ringColor }}>
+            {confidence}
           </span>
+          <span className="text-[8px] uppercase tracking-wide text-slate-400" style={{ fontWeight: 600 }}>conf</span>
+        </div>
+
+        <div className="flex-1 min-w-0">
+          {/* Name + status */}
+          <div className="flex items-start justify-between gap-1.5">
+            <p className="text-[13px] text-slate-900 truncate leading-tight" style={{ fontWeight: 600 }}>
+              {displayName}
+            </p>
+            <span
+              className={clsx('text-[9px] px-1.5 py-0.5 rounded-full border whitespace-nowrap flex-shrink-0 capitalize', statusStyle.pill)}
+              style={{ fontWeight: 700 }}
+            >
+              {statusStyle.label}
+            </span>
+          </div>
+
+          {/* ABN */}
+          {supplier.abn && (
+            <div className="flex items-center gap-1 mt-0.5">
+              <Hash className="w-2.5 h-2.5 text-slate-300 flex-shrink-0" />
+              <span className="text-[11px] text-slate-400 font-mono">{supplier.abn}</span>
+            </div>
+          )}
+
+          {/* Address */}
+          {displayAddr && (
+            <div className="flex items-center gap-1 mt-0.5">
+              <MapPin className="w-2.5 h-2.5 text-slate-300 flex-shrink-0" />
+              <span className="text-[11px] text-slate-500 truncate">{displayAddr}</span>
+            </div>
+          )}
+
+          {/* Commodity + region row */}
+          <div className="flex items-center gap-3 mt-1">
+            {supplier.commodity && (
+              <div className="flex items-center gap-1">
+                <Package className="w-2.5 h-2.5 text-slate-300" />
+                <span className="text-[11px] text-slate-500 truncate max-w-[80px]">{supplier.commodity}</span>
+              </div>
+            )}
+            {supplier.region && (
+              <div className="flex items-center gap-1">
+                <Building2 className="w-2.5 h-2.5 text-slate-300" />
+                <span className="text-[11px] text-slate-500 truncate max-w-[80px]">{supplier.region}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Geocoding-pending badge */}
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <span
+              className="inline-flex items-center gap-1 text-[10px] text-amber-600 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded-full"
+              style={{ fontWeight: 600 }}
+            >
+              <Clock className="w-2.5 h-2.5" />
+              Awaiting location data
+            </span>
+          </div>
         </div>
       </div>
     </motion.div>
@@ -125,7 +232,7 @@ export default function SupplierList({
     s => s.coordinates && !summaries.find(r => r.supplier_id === s.id)
   );
 
-  // Suppliers with no coordinates at all (uploaded but not geocoded yet)
+  // Suppliers without coordinates (approved but awaiting geocoding)
   const noCoords = suppliers.filter(s => !s.coordinates);
 
   const totalVisible  = suppliers.length;
@@ -144,12 +251,25 @@ export default function SupplierList({
       const q = search.toLowerCase();
       const matchSearch =
         supplier.name.toLowerCase().includes(q) ||
-        (supplier.region ?? '').toLowerCase().includes(q) ||
-        (summary.ibra_region ?? '').toLowerCase().includes(q);
+        (supplier.enrichedName  ?? '').toLowerCase().includes(q) ||
+        (supplier.region        ?? '').toLowerCase().includes(q) ||
+        (summary.ibra_region    ?? '').toLowerCase().includes(q);
       const matchRisk = filterRisk === 'all' || riskLevel(summary) === filterRisk;
       return matchSearch && matchRisk;
     })
     .sort((a, b) => riskScore(b.summary) - riskScore(a.summary));
+
+  // noCoords cards also participate in search so they don't disappear on typing
+  const filteredNoCoords = noCoords.filter(s => {
+    if (!search) return true;
+    const q = search.toLowerCase();
+    return (
+      s.name.toLowerCase().includes(q) ||
+      (s.enrichedName ?? '').toLowerCase().includes(q) ||
+      (s.region       ?? '').toLowerCase().includes(q) ||
+      (s.address      ?? '').toLowerCase().includes(q)
+    );
+  });
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -159,22 +279,19 @@ export default function SupplierList({
           <Layers className="w-4 h-4 text-emerald-600" />
           <span className="text-sm text-slate-800" style={{ fontWeight: 600 }}>Suppliers</span>
 
-          {/* Total uploaded count */}
           <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>
             {totalVisible}
           </span>
 
-          {/* Assessed progress — visible while risk loading */}
           {riskLoading && (
             <span className="text-xs text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>
               {assessedCount}/{totalVisible} assessed
             </span>
           )}
 
-          {/* Awaiting geocoding badge */}
           {noCoords.length > 0 && (
             <span className="text-xs text-amber-500 bg-amber-50 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>
-              {noCoords.length} need geocoding
+              {noCoords.length} awaiting location
             </span>
           )}
         </div>
@@ -298,15 +415,22 @@ export default function SupplierList({
             <SkeletonCard key={`skel-${s.id}`} name={s.enrichedName ?? s.name} />
           ))}
 
-          {/* ── Awaiting geocoding cards (uploaded, no coords yet) ── */}
-          {noCoords.map(s => (
-            <AwaitingGeocodingCard key={`nogeo-${s.id}`} supplier={s} />
+          {/* ── Approved supplier cards (no coords yet, but data available) ── */}
+          {filteredNoCoords.map(s => (
+            <ApprovedSupplierCard
+              key={`approved-${s.id}`}
+              supplier={s}
+              isSelected={selectedId === s.id}
+              isHovered={hoveredId   === s.id}
+              onSelect={onSelect}
+              onHover={onHover}
+            />
           ))}
 
         </AnimatePresence>
 
-        {/* Empty state: search returned nothing but data exists */}
-        {filtered.length === 0 && withSummary.length > 0 && !riskLoading && (
+        {/* Empty state: search returned nothing */}
+        {filtered.length === 0 && filteredNoCoords.length === 0 && withSummary.length > 0 && !riskLoading && (
           <div className="text-center py-16">
             <Search className="w-8 h-8 text-slate-200 mx-auto mb-3" />
             <p className="text-sm text-slate-400">No suppliers match this filter.</p>

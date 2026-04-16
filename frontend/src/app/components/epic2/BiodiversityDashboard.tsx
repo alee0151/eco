@@ -4,7 +4,7 @@
  * Three-panel layout wired to live data:
  *   LEFT   — SupplierList  (visible immediately from session context)
  *   CENTRE — MapView       (real geocoded coords, layer toggles)
- *   RIGHT  — RiskProfile   (live risk summary for selected supplier)
+ *   RIGHT  — RiskProfile   (risk summary OR approved-supplier detail)
  *
  * Performance design
  * ------------------
@@ -12,10 +12,12 @@
  *    soon as the component mounts — no user action required.
  * 2. Risk summaries are computed in a CONCURRENCY-LIMITED queue (3 at a time)
  *    so the backend is not hammered with N simultaneous requests.
- * 3. Supplier cards are ALWAYS visible.  A slim banner indicates loading
+ * 3. Supplier cards are ALWAYS visible. A slim banner indicates loading
  *    without replacing the supplier list.
- * 4. Prefetched layer data is passed into MapView so the first layer toggle
- *    is instant — no fetch needed on click.
+ * 4. Approved supplier data is shown immediately in both SupplierList and
+ *    RiskProfile while geocoding / risk computation is still pending.
+ * 5. computeRisk watches geocodedCount (not suppliers.length) so it
+ *    re-fires whenever coordinates land on an existing supplier.
  */
 
 import { useState, useEffect, useRef } from 'react';
@@ -148,10 +150,17 @@ export default function BiodiversityDashboard() {
     setRiskLoading(false);
   };
 
-  // Trigger once when suppliers are ready — never blocks rendering
+  // Re-fire computeRisk whenever:
+  //   (a) a new supplier is added (suppliers.length changes), OR
+  //   (b) coordinates land on an existing supplier (geocodedCount changes).
+  // Watching geocodedCount instead of only suppliers.length ensures the
+  // risk queue runs even when geocoding resolves without adding new rows.
+  const geocodedCount = suppliers.filter(s => !!s.coordinates).length;
+
   useEffect(() => {
-    if (suppliers.length > 0) computeRisk();
-  }, [suppliers.length]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (geocodedCount > 0) computeRisk();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [geocodedCount, suppliers.length]);
 
   // ── CSV export ────────────────────────────────────────────────────────
   const handleExport = () => {
@@ -305,7 +314,7 @@ export default function BiodiversityDashboard() {
           />
         </div>
 
-        {/* RIGHT — Risk profile */}
+        {/* RIGHT — Risk profile (or approved supplier detail) */}
         <div className="hidden md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm w-[320px] shrink-0 min-h-0 overflow-hidden">
           <RiskProfile
             supplier={selectedSupplier}
