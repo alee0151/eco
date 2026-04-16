@@ -89,66 +89,99 @@ def run_ocr(file_bytes: bytes, content_type: str) -> str:
 
 
 # ── Prompt ───────────────────────────────────────────────────────────────────
+#
+# Designed to be maximally explicit about JSON-only output.
+# Three separate reinforcements of the JSON rule:
+#   1. System identity line ("You output ONLY JSON")
+#   2. Explicit FORBIDDEN list before the output section
+#   3. FINAL REMINDER at the very bottom of the prompt
+#
+# This addresses the "unparseable JSON" error where the model wraps
+# its output in prose, explanation, or markdown code fences.
+# ───────────────────────────────────────────────────────────────────
 
 EXTRACT_PROMPT = """\
-You are a data-extraction assistant for an Australian supply-chain risk platform.
-Your task is to extract structured information from the raw OCR text of a supplier document
+You are a JSON-only data-extraction engine for an Australian supply-chain risk platform.
+You output ONLY a single valid JSON object. You NEVER output prose, explanation, or commentary.
+
+=== YOUR TASK ===
+Extract four fields from the OCR text of an Australian supplier document
 (invoice, purchase order, delivery docket, supplier registration form, or similar).
 
 === FIELDS TO EXTRACT ===
 
 1. name
-   The legal name of the SUPPLIER (the company or individual SELLING or DELIVERING goods/services).
-   - Look for labels like: "Supplier", "From:", "Sold by:", "Issued by:", "Vendor:",
-     "ABN holder", or a company name near an ABN.
-   - Do NOT return the buyer / customer / "Bill To" / "Ship To" / "Deliver To" company name.
+   The legal trading name of the SUPPLIER — the entity SELLING or DELIVERING the goods/services.
+   HOW TO FIND IT:
+   ✓ Look for labels: "Supplier:", "From:", "Sold by:", "Issued by:", "Vendor:", "ABN holder:"
+   ✓ A company name printed immediately above or beside an ABN is almost always the supplier.
+   ✓ The supplier name is usually in the document header or letterhead.
+   DO NOT return:
+   ✗ The buyer, customer, or consignee name.
+   ✗ Names near labels "To:", "Bill To:", "Ship To:", "Deliver To:", "Attention:", "Customer:".
+   ✗ A person's name unless it is the registered business name.
 
 2. abn
-   The Australian Business Number of the SUPPLIER (11 digits, spaces allowed).
-   - Must be associated with the supplier name, not the buyer.
-   - Format example: "51 824 753 556" or "51824753556".
+   The Australian Business Number (ABN) of the SUPPLIER only.
+   HOW TO FIND IT:
+   ✓ Look for "ABN", "A.B.N.", or "ABN:" followed by 11 digits (spaces are allowed).
+   ✓ Must belong to the supplier, not the buyer.
+   RULES:
+   ✗ Must be exactly 11 digits. Spaces are allowed: "51 824 753 556" or "51824753556".
+   ✗ Do NOT return ACN (9 digits) or any other identifier.
+   ✗ If two ABNs appear, choose the one beside or below the supplier name.
 
 3. address
-   The SUPPLIER'S location for GNAF geocoding.
-   Return ONLY these four components joined in this exact format:
-     "<street_name> <suburb> <state> <postcode>"
+   The SUPPLIER'S physical location.
+   Return ONLY these components in this exact format:
+     "<street_name> <suburb> <state_abbreviation> <postcode>"
 
-   STRICT RULES:
-   a) MUST be the supplier's OWN address — NOT the buyer/customer address.
-   b) Priority order when multiple addresses appear:
-      1st — Address labelled "From:", "Supplier Address:", "Our Address:",
-             "Business Address:", "Registered Address:", "Principal Place of Business:"
-      2nd — Address immediately below or beside the supplier name / ABN.
-      3rd — Address in the header/letterhead of the document.
-      IGNORE labels: "To:", "Bill To:", "Ship To:", "Deliver To:",
-             "Remittance Address:", "Customer Address:", "Attention:"
-   c) street_name  — The street NAME and TYPE ONLY (e.g. "Collins Street", "St Kilda Road").
-                      Do NOT include the street number or unit/level.
-   d) suburb       — The suburb or town name.
-   e) state        — Two-or-three-letter abbreviation: NSW VIC QLD WA SA TAS ACT NT.
-   f) postcode     — 4-digit Australian postcode.
-   g) Do NOT include unit numbers, suite numbers, floor/level numbers, or street numbers.
-   h) Do NOT include the country name.
-   i) Do NOT include PO Box unless no physical address exists; add a warning if used.
-   j) If the suburb + state + postcode are known but the street name is not, omit street_name.
+   STRICT FORMAT RULES:
+   a) Output ONLY street name, suburb, state abbreviation, and 4-digit postcode.
+   b) State MUST be one of: NSW  VIC  QLD  WA  SA  TAS  ACT  NT
+   c) Postcode MUST be exactly 4 digits.
+   d) Do NOT include the street number (e.g. "42"), unit, suite, level, or floor.
+   e) Do NOT include the country name (e.g. "Australia").
+   f) Do NOT include a comma anywhere in the address string.
+   g) If no street name is visible, return just "<suburb> <state> <postcode>".
+   h) If nothing identifiable is found, return empty string "".
 
-   Example outputs for the address field:
+   ADDRESS PRIORITY — when multiple addresses appear, use this order:
+   1st — labelled "From:", "Supplier Address:", "Our Address:", "Business Address:",
+          "Registered Address:", "Principal Place of Business:"
+   2nd — address immediately beside or below the supplier name or ABN
+   3rd — address in the document header or letterhead
+   IGNORE labels: "To:", "Bill To:", "Ship To:", "Deliver To:",
+                  "Remittance Address:", "Customer Address:", "Attention:"
+
+   EXAMPLES of valid address output:
      "Collins Street Melbourne VIC 3000"
      "Settlement Road Keperra QLD 4054"
-     "Melbourne VIC 3000"  (no street name found)
+     "Canberra Avenue Griffith ACT 2603"
+     "Melbourne VIC 3000"   (no street name found)
 
 4. commodity
-   The primary product or commodity supplied (e.g. Timber, Seafood, Grain, Steel,
-   Electrical Components). Use a short noun phrase (1–4 words).
+   The primary product or service being supplied.
+   Use a short noun phrase of 1–4 words.
+   EXAMPLES: "Timber", "Seafood", "Grain", "Steel", "Electrical Components", "Fresh Produce".
+   DO NOT describe the document type (e.g. "Invoice" or "Purchase Order").
+   DO NOT use vague terms like "Goods" or "Services" unless nothing more specific is present.
 
-=== OUTPUT FORMAT ===
+=== FORBIDDEN — YOUR RESPONSE MUST NOT CONTAIN ===
+  ✗ Any sentence, word, or phrase outside the JSON object
+  ✗ Markdown code fences (```json ... ``` or ``` ... ```)
+  ✗ Any explanation of what you found or did not find
+  ✗ Any apology or uncertainty statement
+  ✗ Any text before the opening brace {{
+  ✗ Any text after the closing brace }}
 
-Return ONLY valid JSON in this exact shape (no prose, no markdown fences):
+=== REQUIRED OUTPUT FORMAT ===
+Your entire response must be exactly this JSON structure and nothing else:
 {{
-  "name":      "...",
-  "abn":       "...",
-  "address":   "...",
-  "commodity": "...",
+  "name":      "<supplier name or empty string>",
+  "abn":       "<11-digit ABN with spaces or empty string>",
+  "address":   "<street suburb state postcode or empty string>",
+  "commodity": "<1-4 word noun phrase or empty string>",
   "confidence": {{
     "name":      0.0,
     "abn":       0.0,
@@ -158,31 +191,87 @@ Return ONLY valid JSON in this exact shape (no prose, no markdown fences):
   "warnings": []
 }}
 
-=== CONFIDENCE SCORING ===
-  address:  1.0 = street name + suburb + state + postcode
-            0.7 = suburb + state + postcode (no street name)
-            0.4 = state + postcode only
-            0.0 = not found
-  name/abn/commodity: 1.0 = clearly labelled | 0.5 = inferred | 0.0 = not found
+=== CONFIDENCE VALUES (0.0 to 1.0) ===
+  name / abn / commodity:
+    1.0 = clearly labelled in the document
+    0.5 = inferred from context (not explicitly labelled)
+    0.0 = not found
+  address:
+    1.0 = street name + suburb + state + postcode all present
+    0.7 = suburb + state + postcode (no street name)
+    0.4 = state + postcode only
+    0.0 = not found
 
-=== WARNINGS ===
-Add a warning string for:
-  "Address is a PO Box — no physical street name found"
+=== WARNINGS ARRAY ===
+Add one string per issue detected:
+  "Address is a PO Box — no physical street address found"
   "Address missing postcode"
   "Address missing state abbreviation"
-  "Address may belong to buyer, not supplier — verify manually"
-  "ABN digit count incorrect"
-  "Multiple supplier addresses found — used address nearest to ABN"
+  "Address may belong to buyer not supplier — verify manually"
+  "ABN does not have 11 digits"
+  "Two ABNs found — used ABN nearest to supplier name"
+  "Multiple addresses found — used address nearest to supplier ABN"
 
 === GENERAL RULES ===
-- If a field cannot be found, use empty string "".
-- Do NOT invent data that is not present in the OCR text.
+  • If a field cannot be found, use empty string "" — never null or undefined.
+  • Do NOT invent or guess data that is not present in the OCR text.
+  • Do NOT copy text from the FORBIDDEN examples above into the output.
 
-OCR TEXT:
+OCR TEXT TO EXTRACT FROM:
 ---
 {ocr_text}
 ---
+
+REMEMBER: Output the JSON object and absolutely nothing else.
+Do not write anything before {{ or after }}.
 """
+
+
+# ── JSON extraction helper ───────────────────────────────────────────────────────
+
+def _extract_json(raw: str) -> dict:
+    """
+    Robustly extract a JSON object from the model's raw response string.
+
+    Handles the most common model output quirks in this order:
+      1. Strip markdown code fences (```json ... ``` or ``` ... ```).
+      2. Try to parse the whole string directly.
+      3. Regex-extract the first { ... } block and parse that.
+      4. If all attempts fail, log the raw output and raise HTTP 502.
+    """
+    # Step 1: strip markdown fences
+    cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", raw.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"\s*```$",           "", cleaned.strip(), flags=re.MULTILINE)
+    cleaned = cleaned.strip()
+
+    # Step 2: direct parse
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Step 3: pull out first {...} block (handles prose before/after JSON)
+    match = re.search(r"(\{[\s\S]*\})", cleaned)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Step 4: give up — log full raw output to help debugging
+    logger.error(
+        "[extract] Could not parse JSON from Ollama response.\n"
+        "--- RAW RESPONSE (first 1000 chars) ---\n%s\n--- END ---",
+        raw[:1000],
+    )
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "Ollama returned unparseable JSON. "
+            "Check backend logs for the raw model output. "
+            "Try a larger model or increase OLLAMA_TIMEOUT."
+        ),
+    )
 
 
 # ── Ollama LLM call (async) ───────────────────────────────────────────────────
@@ -195,13 +284,14 @@ async def run_llm(ocr_text: str) -> dict:
     Timeout is read from OLLAMA_TIMEOUT env var (default 600 s) to
     accommodate large models that need several minutes on first inference.
 
-    Request shape (matches the Ollama application API):
+    Request shape:
         POST  $OLLAMA_URL/api/generate
         Content-Type: application/json
         {
             "model":  "gpt-oss:20b",
             "prompt": "<extraction prompt>",
-            "stream": false
+            "stream": false,
+            "format": "json"
         }
     """
     ollama_url = os.getenv("OLLAMA_URL", "").strip()
@@ -222,14 +312,11 @@ async def run_llm(ocr_text: str) -> dict:
         "model":  model,
         "prompt": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
         "stream": False,
-        "format": "json",
+        "format": "json",   # tells Ollama to enforce JSON output at the token level
     }
 
     logger.info("[extract] POST %s  model=%s  timeout=%.0fs", url, model, timeout)
 
-    # httpx.Timeout splits into connect / read / write / pool timeouts.
-    # The read timeout is the one that was firing (model inference time).
-    # We set all components to the same generous value.
     http_timeout = httpx.Timeout(timeout, connect=30.0)
 
     try:
@@ -243,8 +330,7 @@ async def run_llm(ocr_text: str) -> dict:
             detail=(
                 f"Ollama did not respond within {timeout:.0f} seconds. "
                 f"Model '{model}' may still be loading or the document is very long. "
-                f"You can increase the limit by setting OLLAMA_TIMEOUT in backend/.env "
-                f"(e.g. OLLAMA_TIMEOUT=900)."
+                f"Increase the limit: set OLLAMA_TIMEOUT=900 in backend/.env"
             ),
         )
     except httpx.ConnectError:
@@ -252,7 +338,7 @@ async def run_llm(ocr_text: str) -> dict:
             status_code=503,
             detail=(
                 f"Cannot reach Ollama at '{ollama_url}'. "
-                "Check that OLLAMA_URL is correct and the server is reachable."
+                "Check OLLAMA_URL and that the server is reachable."
             ),
         )
     except httpx.HTTPStatusError as exc:
@@ -261,18 +347,10 @@ async def run_llm(ocr_text: str) -> dict:
             detail=f"Ollama returned HTTP {exc.response.status_code}: {exc.response.text[:300]}",
         )
 
-    raw = resp.json().get("response", "{}")
-    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-    raw = re.sub(r"\n?```$",       "", raw.strip())
+    raw = resp.json().get("response", "")
+    logger.debug("[extract] raw Ollama response: %s", raw[:500])
 
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("[extract] Ollama non-JSON response: %s", raw[:500])
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama returned unparseable JSON: {exc}",
-        )
+    return _extract_json(raw)
 
 
 # ── ABN validation (ATO checksum) ────────────────────────────────────────────
