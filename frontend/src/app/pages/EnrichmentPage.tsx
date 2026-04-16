@@ -14,15 +14,17 @@ import {
   Zap,
   Clock,
   AlertTriangle,
+  MapPin,
 } from "lucide-react";
 import clsx from "clsx";
-import { enrichApi } from "../lib/api";
+import { enrichApi, parseAddressApi } from "../lib/api";
 import { geocodeSupplier } from "../lib/geocode";
 
 type StepStatus =
   | "waiting"
   | "connecting"
   | "validating"
+  | "parsing"
   | "enriching"
   | "geocoding"
   | "done"
@@ -36,6 +38,7 @@ interface SupplierProgress {
   status: StepStatus;
   progress: number;
   statusLabel: string;
+  parsedAddress?: string;   // structured formatted address from LLM
   errorMsg?: string;
 }
 
@@ -43,6 +46,7 @@ const LABELS: Record<StepStatus, string> = {
   waiting:    "In queue",
   connecting: "Connecting to ABR...",
   validating: "Validating ABN...",
+  parsing:    "Parsing address...",
   enriching:  "Enriching data...",
   geocoding:  "Geocoding address...",
   done:       "Enriched & Located",
@@ -50,11 +54,6 @@ const LABELS: Record<StepStatus, string> = {
   error:      "Service unavailable",
 };
 
-/**
- * Validates an ABN against the Australian Business Register format:
- * - Strip all spaces and hyphens
- * - Must be exactly 11 digits
- */
 function isValidAbnFormat(abn: string): boolean {
   const digits = abn.replace(/[\s\-]/g, "");
   return /^\d{11}$/.test(digits);
@@ -89,7 +88,6 @@ export function EnrichmentPage() {
     if (started.current) return;
     started.current = true;
 
-    // Snapshot suppliers once at effect start — intentional exclusion from deps
     const pending = suppliers.filter((s) => !s.isValidated);
 
     if (pending.length === 0) {
@@ -109,13 +107,16 @@ export function EnrichmentPage() {
     );
 
     /**
-     * Enrich a single supplier via POST /api/enrich, then immediately
-     * geocode the resulting address.
+     * Full enrichment pipeline for one supplier:
      *
-     * FIX 1: geocodeSupplier is now called after ABR enrichment and the
-     *        resulting coordinates are written back via updateSupplier.
-     * FIX 2: geocodeSupplier receives enrichedAddress (post-ABR) as the
-     *        primary input, falling back to rawAddress then supplierName.
+     *  1. connecting   — stagger delay
+     *  2. validating   — client-side ABN format check
+     *  3. parsing      — POST /api/parse-address  → structured address JSON
+     *  4. enriching    — POST /api/enrich          → ABR lookup
+     *  5. geocoding    — geocodeSupplier()          → lat/lng via Nominatim
+     *
+     * Address priority for geocoding:
+     *   enrichedAddress (ABR) > parsedAddress.formatted (LLM) > rawAddress (CSV)
      */
     const enrichOne = async (
       supplier: (typeof pending)[number],
@@ -124,32 +125,61 @@ export function EnrichmentPage() {
       const supplierId = supplier.id;
       await new Promise((r) => setTimeout(r, staggerMs));
 
-      // Step 1 — connecting
-      updateRow(supplierId, { status: "connecting", progress: 20 });
-      await new Promise((r) => setTimeout(r, 400));
-
-      // Step 2 — client-side format check
-      updateRow(supplierId, { status: "validating", progress: 40 });
+      // ── Step 1: connecting ──────────────────────────────────────────────
+      updateRow(supplierId, { status: "connecting", progress: 15 });
       await new Promise((r) => setTimeout(r, 300));
 
+      // ── Step 2: client-side ABN format check ────────────────────────────
+      updateRow(supplierId, { status: "validating", progress: 30 });
+      await new Promise((r) => setTimeout(r, 200));
+
+      // ── Step 3: LLM address parsing ─────────────────────────────────────
+      // Always run regardless of ABN validity — gives geocoder the best
+      // possible structured address even when ABR enrichment fails.
+      updateRow(supplierId, { status: "parsing", progress: 45 });
+      let parsedFormatted: string | undefined;
+
+      if (supplier.address?.trim()) {
+        try {
+          const parsed = await parseAddressApi.parse(supplier.address);
+          parsedFormatted = parsed.formatted || undefined;
+
+          // Store structured components on the supplier record
+          updateSupplier(supplierId, {
+            parsedAddress: {
+              unit:      parsed.unit,
+              street:    parsed.street,
+              suburb:    parsed.suburb,
+              state:     parsed.state,
+              postcode:  parsed.postcode,
+              country:   parsed.country,
+              formatted: parsed.formatted,
+            },
+          });
+
+          updateRow(supplierId, { parsedAddress: parsed.formatted });
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        } catch (_) {
+          // Non-fatal: fall back to raw address
+          parsedFormatted = supplier.address;
+        }
+      }
+
+      // ── Invalid ABN: skip ABR, geocode with parsed/raw address ───────────
       if (!supplier.abn || !isValidAbnFormat(supplier.abn)) {
-        // Invalid ABN — skip ABR call but still attempt geocoding
         updateSupplier(supplierId, {
-          isValidated:    true,
-          abnFound:       false,
-          abrStatus:      "",
+          isValidated:     true,
+          abnFound:        false,
+          abrStatus:       "",
           confidenceScore: 10,
         });
-
-        // Geocode with raw address only (no enrichedAddress available)
         updateRow(supplierId, { status: "geocoding", progress: 70 });
-        await runGeocode(supplierId, undefined, supplier.address, supplier.name);
-
+        await runGeocode(supplierId, undefined, parsedFormatted ?? supplier.address, supplier.name);
         updateRow(supplierId, { status: "failed", progress: 100 });
         return;
       }
 
-      // Step 3 — enrich via ABR backend
+      // ── Step 4: ABR enrichment ───────────────────────────────────────────
       updateRow(supplierId, { status: "enriching", progress: 60 });
 
       let enrichedAddress: string | undefined;
@@ -165,7 +195,6 @@ export function EnrichmentPage() {
         enrichedAddress = enriched.enriched_address ?? undefined;
         enrichedName    = enriched.enriched_name    ?? undefined;
 
-        // Persist ABR enrichment data (synchronous in-memory)
         updateSupplier(supplierId, {
           isValidated:        true,
           enrichedName,
@@ -178,13 +207,18 @@ export function EnrichmentPage() {
         });
 
         updateRow(supplierId, {
-          status: enriched.abn_found ? "geocoding" : "failed",
+          status:   enriched.abn_found ? "geocoding" : "failed",
           progress: 75,
         });
 
         if (!enriched.abn_found) {
-          // ABN not found — still geocode with raw address as best effort
-          await runGeocode(supplierId, undefined, supplier.address, supplier.name);
+          // ABN not in ABR: geocode with parsed address as best effort
+          await runGeocode(
+            supplierId,
+            undefined,
+            parsedFormatted ?? supplier.address,
+            supplier.name,
+          );
           updateRow(supplierId, { status: "failed", progress: 100 });
           return;
         }
@@ -193,49 +227,39 @@ export function EnrichmentPage() {
         const isUnavailable =
           msg.includes("404") || msg.includes("500") || msg.includes("fetch");
 
-        updateSupplier(supplierId, {
-          isValidated:    true,
-          confidenceScore: 0,
-        });
+        updateSupplier(supplierId, { isValidated: true, confidenceScore: 0 });
 
-        // Still attempt geocoding on network/service error so the map
-        // has the best possible coordinates from the raw address.
         updateRow(supplierId, { status: "geocoding", progress: 75 });
-        await runGeocode(supplierId, undefined, supplier.address, supplier.name);
-
+        await runGeocode(
+          supplierId,
+          undefined,
+          parsedFormatted ?? supplier.address,
+          supplier.name,
+        );
         updateRow(supplierId, {
           status:   isUnavailable ? "error" : "failed",
           progress: 100,
-          errorMsg: isUnavailable
-            ? "ABR service unavailable — check backend"
-            : msg,
+          errorMsg: isUnavailable ? "ABR service unavailable — check backend" : msg,
         });
         return;
       }
 
-      // Step 4 — geocode the ABR-validated address
-      // FIX: enrichedAddress is passed as the primary input so Nominatim
-      // receives the full validated street address rather than an
-      // abbreviated or ambiguous raw CSV value.
-      updateRow(supplierId, { status: "geocoding", progress: 80 });
+      // ── Step 5: geocoding ────────────────────────────────────────────────
+      // Address priority:
+      //   enrichedAddress (ABR)  — most authoritative
+      //   parsedFormatted  (LLM) — structured, clean fallback
+      //   supplier.address (CSV) — raw OCR value, last resort
+      updateRow(supplierId, { status: "geocoding", progress: 85 });
       await runGeocode(
         supplierId,
-        enrichedAddress,   // ← FIX 2: prefer enriched (post-ABR) address
-        supplier.address,  // fallback: original CSV
-        enrichedName ?? supplier.name,
+        enrichedAddress,                          // ABR address (highest priority)
+        parsedFormatted ?? supplier.address,      // LLM-parsed or raw CSV
+        enrichedName    ?? supplier.name,
       );
 
       updateRow(supplierId, { status: "done", progress: 100 });
     };
 
-    /**
-     * Run geocoding for one supplier and write coordinates back to context.
-     *
-     * FIX 1: This function did not previously exist — coordinates were never
-     *        written back to supplier state, so s.coordinates was always
-     *        undefined, causing supplierBbox() in MapView to return null and
-     *        all map layer fetches to silently bail out.
-     */
     const runGeocode = async (
       supplierId: string,
       enrichedAddr: string | undefined,
@@ -249,26 +273,22 @@ export function EnrichmentPage() {
             coordinates:     { lat: geo.lat, lng: geo.lng },
             resolutionLevel: geo.resolutionLevel,
             inferenceMethod: geo.inferenceMethod,
-            // surface a warning badge if only coarse resolution was achieved
             ...(geo.resolutionLevel !== 'facility' && geo.resolutionLevel !== 'regional'
               ? { warnings: [`Geocode resolution: ${geo.resolutionLevel} via ${geo.inferenceMethod}`] }
               : {}),
           });
         }
       } catch {
-        // Non-fatal: supplier will appear in ApprovedSupplierCard with
-        // "Awaiting location data" badge rather than crashing the enrichment.
+        // Non-fatal
       }
     };
 
-    // Fire all enrichments in parallel, staggered by 700 ms each.
     const allPromises = pending.map((s, i) => enrichOne(s, i * 700));
     Promise.allSettled(allPromises).then(() => setIsComplete(true));
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [updateSupplier, updateRow]);
 
-  // countdown + auto-redirect
   useEffect(() => {
     if (!isComplete) return;
     const t = setInterval(() => {
@@ -290,10 +310,11 @@ export function EnrichmentPage() {
 
   const pipelineSteps = [
     { icon: Search,   label: "Lookup",   threshold: 0   },
-    { icon: Globe,    label: "Connect",  threshold: 20  },
-    { icon: Shield,   label: "Validate", threshold: 40  },
+    { icon: Globe,    label: "Connect",  threshold: 15  },
+    { icon: Shield,   label: "Validate", threshold: 30  },
+    { icon: MapPin,   label: "Parse",    threshold: 45  },
     { icon: Database, label: "Enrich",   threshold: 60  },
-    { icon: Globe,    label: "Geocode",  threshold: 80  },
+    { icon: Globe,    label: "Geocode",  threshold: 85  },
     { icon: Zap,      label: "Complete", threshold: 100 },
   ];
 
@@ -328,9 +349,9 @@ export function EnrichmentPage() {
         <p className="text-slate-500 mt-2 max-w-md mx-auto text-sm">
           {isComplete
             ? `${successCount} of ${progress.length} suppliers validated and geocoded.${
-                failCount  > 0 ? ` ${failCount} ABN not found.`      : ""}
-              ${errorCount > 0 ? ` ${errorCount} service errors.`    : ""}`
-            : "Validating ABNs via the Australian Business Register, then geocoding each supplier address to Australia..."}
+                failCount  > 0 ? ` ${failCount} ABN not found.`   : ""}
+              ${errorCount > 0 ? ` ${errorCount} service errors.` : ""}`
+            : "Parsing addresses, validating ABNs via the Australian Business Register, then geocoding each supplier to Australia..."}
         </p>
       </motion.div>
 
@@ -354,7 +375,7 @@ export function EnrichmentPage() {
           />
         </div>
 
-        {/* Pipeline visualization — now includes Geocode step */}
+        {/* 7-step pipeline visualization */}
         <div className="flex items-center justify-between relative">
           <div className="absolute top-4 left-6 right-6 h-[2px] bg-slate-100 z-0" />
           <motion.div
@@ -392,10 +413,11 @@ export function EnrichmentPage() {
               transition={{ delay: i * 0.06 }}
               className={clsx(
                 "bg-white rounded-xl border px-5 py-4 flex items-center gap-4 transition-all",
-                sp.status === "done"    ? "border-emerald-200" :
-                sp.status === "failed"  ? "border-red-200"    :
-                sp.status === "error"   ? "border-amber-200"  :
-                sp.status === "geocoding" ? "border-blue-200" :
+                sp.status === "done"      ? "border-emerald-200" :
+                sp.status === "failed"    ? "border-red-200"     :
+                sp.status === "error"     ? "border-amber-200"   :
+                sp.status === "geocoding" ? "border-blue-200"    :
+                sp.status === "parsing"   ? "border-violet-200"  :
                 "border-slate-200"
               )}
             >
@@ -422,6 +444,10 @@ export function EnrichmentPage() {
                   <div className="w-9 h-9 rounded-lg bg-slate-50 flex items-center justify-center">
                     <Clock className="w-5 h-5 text-slate-300" />
                   </div>
+                ) : sp.status === "parsing" ? (
+                  <div className="w-9 h-9 rounded-lg bg-violet-50 flex items-center justify-center">
+                    <MapPin className="w-5 h-5 text-violet-400 animate-pulse" />
+                  </div>
                 ) : sp.status === "geocoding" ? (
                   <div className="w-9 h-9 rounded-lg bg-blue-50 flex items-center justify-center">
                     <Globe className="w-5 h-5 text-blue-400 animate-pulse" />
@@ -443,6 +469,7 @@ export function EnrichmentPage() {
                       sp.status === "failed"    ? "bg-red-50 text-red-600"         :
                       sp.status === "error"     ? "bg-amber-50 text-amber-600"     :
                       sp.status === "geocoding" ? "bg-blue-50 text-blue-600"       :
+                      sp.status === "parsing"   ? "bg-violet-50 text-violet-600"   :
                       sp.status === "waiting"   ? "bg-slate-50 text-slate-400"     :
                       "bg-blue-50 text-blue-600"
                     )}
@@ -452,6 +479,11 @@ export function EnrichmentPage() {
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5">ABN: {sp.abn || "Not provided"}</p>
+                {sp.parsedAddress && (
+                  <p className="text-xs text-violet-500 mt-0.5 truncate">
+                    📍 {sp.parsedAddress}
+                  </p>
+                )}
                 {sp.errorMsg && <p className="text-xs text-amber-500 mt-0.5 truncate">{sp.errorMsg}</p>}
                 <div className="mt-2 h-1 bg-slate-100 rounded-full overflow-hidden">
                   <motion.div
@@ -459,6 +491,7 @@ export function EnrichmentPage() {
                       "h-full rounded-full",
                       sp.status === "failed"  ? "bg-red-300"    :
                       sp.status === "error"   ? "bg-amber-300"  :
+                      sp.status === "parsing" ? "bg-violet-400" :
                       "bg-emerald-400"
                     )}
                     animate={{ width: `${sp.progress}%` }}

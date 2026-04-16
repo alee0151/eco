@@ -193,9 +193,22 @@ export interface EnrichResult {
   enriched_name:       string | null;
   enriched_address:    string | null;
   abr_status:          string | null;
+  entity_type:         string | null;
   name_discrepancy:    boolean | null;
   address_discrepancy: boolean | null;
   confidence_score:    number | null;
+  lookup_method:       string | null;
+}
+
+// ── Parsed address (from /api/parse-address) ──────────────────────────────────
+export interface ParsedAddress {
+  unit:      string;
+  street:    string;
+  suburb:    string;
+  state:     string;
+  postcode:  string;
+  country:   string;
+  formatted: string;   // geocodable single-line string
 }
 
 // ── Extract API ───────────────────────────────────────────────────────────────
@@ -215,6 +228,16 @@ export const enrichApi = {
     request<EnrichResult>('/api/enrich', {
       method: 'POST',
       body: JSON.stringify({ abn, name, address }),
+    }),
+};
+
+// ── Parse Address API ─────────────────────────────────────────────────────────
+
+export const parseAddressApi = {
+  parse: (address: string): Promise<ParsedAddress> =>
+    request<ParsedAddress>('/api/parse-address', {
+      method: 'POST',
+      body: JSON.stringify({ address }),
     }),
 };
 
