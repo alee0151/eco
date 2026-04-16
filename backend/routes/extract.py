@@ -4,10 +4,10 @@ POST /api/extract
 Accepts a multipart upload of a PDF or image file.
 
 OCR  : Tesseract (pytesseract) — free, runs 100 % locally.
-LLM  : Ollama — free, runs 100 % locally.
-        Install Ollama from https://ollama.com and pull a model:
-          ollama pull llama3.2          # default
-          ollama pull mistral            # lighter alternative
+LLM  : OpenRouter  — cloud API, OpenAI-compatible.
+        Set OPENROUTER_API_KEY in backend/.env
+        Set OPENROUTER_MODEL  in backend/.env  (default: openrouter/auto)
+        Register at https://openrouter.ai
 
 Address extraction scope
 ------------------------
@@ -17,8 +17,11 @@ No street name, no street number, no unit, no country.
 
 Environment variables
 ---------------------
-OLLAMA_MODEL      Model name to use (default: llama3.2)
-OLLAMA_BASE_URL   Ollama server URL   (default: http://localhost:11434)
+OPENROUTER_API_KEY   Required. Your OpenRouter API key.
+OPENROUTER_MODEL     Model slug (default: openrouter/auto)
+                     Examples: meta-llama/llama-3.2-11b-vision-instruct:free
+                               mistralai/mistral-7b-instruct:free
+                               openrouter/auto
 """
 
 import io
@@ -27,12 +30,35 @@ import logging
 import os
 import re
 
-import httpx
+from openai import OpenAI
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ── OpenRouter client ──────────────────────────────────────────────────────────────
+
+def _get_openrouter_client() -> OpenAI:
+    """
+    Build and return an OpenAI-compatible client pointed at OpenRouter.
+    Raises HTTP 503 immediately if OPENROUTER_API_KEY is not set.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "OPENROUTER_API_KEY is not configured. "
+                "Register at https://openrouter.ai and add "
+                "OPENROUTER_API_KEY=<your-key> to backend/.env"
+            ),
+        )
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
 
 
 # ── Response schema ───────────────────────────────────────────────────────────
@@ -249,45 +275,61 @@ OCR TEXT:
 """
 
 
-# ── LLM call ───────────────────────────────────────────────────────────────────
+# ── LLM call — OpenRouter ───────────────────────────────────────────────────────
 
 def run_llm(ocr_text: str) -> dict:
-    model    = os.getenv("OLLAMA_MODEL",    "llama3.2")
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    url      = f"{base_url}/api/generate"
+    """
+    Send OCR text to OpenRouter and return parsed JSON dict.
 
-    payload = {
-        "model":  model,
-        "prompt": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
-        "stream": False,
-        "format": "json",
-    }
+    Uses the OpenAI-compatible chat completions endpoint.
+    Model is configurable via OPENROUTER_MODEL env var.
+    temperature=0 for deterministic, structured output.
+    """
+    model  = os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+    client = _get_openrouter_client()
 
     try:
-        resp = httpx.post(url, json=payload, timeout=120)
-        resp.raise_for_status()
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail="Cannot reach Ollama. Make sure Ollama is running: ollama serve",
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role":    "user",
+                    "content": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
+                }
+            ],
+            temperature=0,
         )
-    except httpx.HTTPStatusError as exc:
+    except Exception as exc:
+        # Catch OpenAI SDK errors (AuthenticationError, RateLimitError, etc.)
+        err = str(exc)
+        if "401" in err or "authentication" in err.lower() or "api key" in err.lower():
+            raise HTTPException(
+                status_code=401,
+                detail=f"OpenRouter authentication failed — check OPENROUTER_API_KEY: {err}",
+            )
+        if "429" in err or "rate" in err.lower():
+            raise HTTPException(
+                status_code=429,
+                detail=f"OpenRouter rate limit exceeded: {err}",
+            )
         raise HTTPException(
             status_code=502,
-            detail=f"Ollama returned HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+            detail=f"OpenRouter request failed: {err}",
         )
 
-    raw = resp.json().get("response", "{}")
-    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-    raw = re.sub(r"\n?```$",       "", raw.strip())
+    raw = (response.choices[0].message.content or "").strip()
+
+    # Strip markdown code fences if the model wraps its output
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$",       "", raw).strip()
 
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        logger.error("Ollama non-JSON response: %s", raw[:500])
+        logger.error("OpenRouter non-JSON response: %s", raw[:500])
         raise HTTPException(
             status_code=502,
-            detail=f"Ollama returned unparseable JSON: {exc}",
+            detail=f"OpenRouter returned unparseable JSON: {exc}",
         )
 
 
@@ -314,7 +356,6 @@ def _validate_abn(abn: str) -> list[str]:
 
 _AU_STATES = {"NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"}
 
-# Matches state + 4-digit postcode anywhere in the string
 _STATE_POSTCODE_RE = re.compile(
     r"\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\s+(\d{4})\b",
     re.IGNORECASE,
@@ -328,66 +369,42 @@ _BUYER_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Anything that looks like a street: leading digits, or known street-type words
 _STREET_POLLUTION_RE = re.compile(
-    r"(^\d+[A-Za-z]?\s)"                            # leading street number
+    r"(^\d+[A-Za-z]?\s)"
     r"|(\b(street|st|road|rd|avenue|ave|drive|dr"
     r"|place|pl|lane|ln|boulevard|blvd|way|court"
     r"|ct|crescent|cres|terrace|tce|close|cl"
-    r"|parade|pde|highway|hwy|circuit|cct)\b)",      # street type word
+    r"|parade|pde|highway|hwy|circuit|cct)\b)",
     re.IGNORECASE,
 )
 
 
 def _sanitise_address(address: str, existing_warnings: list[str]) -> tuple[str, list[str], float]:
-    """
-    Defensive post-processor for the LLM-extracted address.
-
-    Expected input:  "suburb state postcode"  (LLM should already be clean)
-    This function:
-      1. Strips country name, commas, unit/level prefixes, leading numbers.
-      2. Detects and warns if street name/type words remain.
-      3. Validates state abbreviation and 4-digit postcode are present.
-      4. Returns (cleaned, warnings, confidence_floor).
-    """
     warnings = list(existing_warnings)
 
     if not address:
         return "", warnings, 0.0
 
-    # ─ Strip country
     cleaned = re.sub(r",?\s*\bAustralia\b", "", address, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r",?\s*\bAU\b",        "", cleaned,  flags=re.IGNORECASE).strip()
-
-    # ─ Strip commas (rule 6)
     cleaned = cleaned.replace(",", " ")
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-
-    # ─ Strip unit/level/suite/PO Box prefix
     cleaned = re.sub(
         r"^(unit|u|suite|ste|level|lvl|floor|fl|apt|apartment|lot|p\.?o\.?\s*box)\s+[\w/]+\s*",
         "", cleaned, flags=re.IGNORECASE
     ).strip()
-
-    # ─ Strip leading street number
     cleaned = re.sub(r"^\d+[A-Za-z]?[\s,/\\-]+", "", cleaned).strip()
 
-    # ─ Flag buyer-side label
     if _BUYER_LABEL_RE.match(cleaned):
         warnings.append("Address may belong to buyer, not supplier — verify manually.")
-
-    # ─ Flag PO Box
-    if _PO_BOX_RE.search(address):   # check original before stripping
+    if _PO_BOX_RE.search(address):
         warnings.append("Address is a PO Box — used suburb/state/postcode only.")
-
-    # ─ Warn if street pollution still detected after stripping
     if _STREET_POLLUTION_RE.search(cleaned):
         warnings.append(
             "Address appears to contain a street name or number — "
             "only suburb/state/postcode expected."
         )
 
-    # ─ Validate state + postcode
     state_match = _STATE_POSTCODE_RE.search(cleaned)
     if not state_match:
         warnings.append(
@@ -400,14 +417,12 @@ def _sanitise_address(address: str, existing_warnings: list[str]) -> tuple[str, 
     if state_found not in _AU_STATES:
         warnings.append(f"Address state '{state_found}' not recognised.")
 
-    # ─ Check for suburb (text before the state token)
     text_before_state = cleaned[: state_match.start()].strip()
     has_suburb = bool(text_before_state)
     if not has_suburb:
         warnings.append("Address missing suburb.")
 
     confidence_floor = 1.0 if has_suburb else 0.5
-
     return cleaned, warnings, confidence_floor
 
 
@@ -431,7 +446,7 @@ async def extract(
     Pipeline:
       1. Validate file type & size.
       2. Run Tesseract OCR  →  raw text.
-      3. Send raw text to Ollama  →  structured JSON.
+      3. Send raw text to OpenRouter  →  structured JSON.
          address = "suburb state postcode" only.
       4. Validate ABN checksum.
       5. Sanitise address: strip any street/unit/country pollution, validate AU format.
