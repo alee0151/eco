@@ -18,7 +18,7 @@ Endpoints:
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, or_
 from geoalchemy2.functions import ST_Within, ST_SetSRID, ST_MakePoint
 from typing import Optional, List
 
@@ -55,9 +55,21 @@ def _resolve_state(raw: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Threatened-species dataset filter
-# Only count species from ALA threatened-species data resources.
+#
+# Widens the match to cover all ALA sensitive/threatened data resources:
+#   - "threatened" (original)
+#   - "sensitive"  (ALA Sensitive Species List)
+#   - "epbc"       (Environment Protection and Biodiversity Conservation Act)
+#
+# Use OR so a resource name matching any keyword is included.
 # ---------------------------------------------------------------------------
-THREATENED_RESOURCE_FILTER = Species.dataresourcename.ilike("%threatened%")
+def _threatened_filter():
+    return or_(
+        Species.dataresourcename.ilike("%threatened%"),
+        Species.dataresourcename.ilike("%sensitive%"),
+        Species.dataresourcename.ilike("%epbc%"),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Species quality filters
@@ -260,15 +272,14 @@ async def risk_summary(
     Given a supplier lat/lng, compute a biodiversity risk summary by:
 
     1. IBRA lookup  — ST_Within(supplier_point, ibra.geom) against the real
-                      MULTIPOLYGON boundaries.  No approximation, no guessing.
-                      Falls back to ST_DWithin (nearest region) if the point
-                      sits exactly on a boundary or in a gap between regions.
+                      MULTIPOLYGON boundaries.  Falls back to nearest region.
 
-    2. Species      — Count distinct threatened species whose confirmed
-                      occurrences (present, non-obscured, reliable basis)
-                      fall within the bounding box around the supplier.
+    2. Species      — COUNT(DISTINCT scientificname) of threatened/sensitive
+                      species whose confirmed occurrences fall within the
+                      bounding box. Uses a single aggregation query — no
+                      broken subquery wrapping.
 
-    3. CAPAD        — Count protected area centroids within the buffer.
+    3. CAPAD        — Count active protected area centroids within the buffer.
 
     4. KBA          — Count Key Biodiversity Area centroids within the buffer.
     """
@@ -278,19 +289,10 @@ async def risk_summary(
     max_lng = lng + buffer_deg
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 1. IBRA region — exact ST_Within against MULTIPOLYGON boundaries
-    #
-    # ST_MakePoint(lng, lat) constructs a PostGIS Point from the supplier
-    # coordinates.  ST_SetSRID assigns SRID 4326 (WGS84) so the SRID matches
-    # ibra.geom (also 4326).  ST_Within returns TRUE only for the region whose
-    # polygon actually contains the point — this is exact, not approximate.
-    #
-    # Fallback: if no region contains the point (e.g. supplier is offshore or
-    # on a boundary), ST_DWithin finds the nearest region within 1 degree.
+    # 1. IBRA region — exact ST_Within then nearest fallback
     # ──────────────────────────────────────────────────────────────────────────
     supplier_point = ST_SetSRID(ST_MakePoint(lng, lat), 4326)
 
-    # Primary: exact containment
     ibra_exact_result = await db.execute(
         select(Ibra.ibra_reg_name, Ibra.ibra_reg_code)
         .where(Ibra.geom.isnot(None))
@@ -299,7 +301,6 @@ async def risk_summary(
     )
     ibra_row = ibra_exact_result.first()
 
-    # Fallback: nearest region within 1 degree (~100 km)
     if not ibra_row:
         ibra_near_result = await db.execute(
             text("""
@@ -317,25 +318,26 @@ async def risk_summary(
     ibra_code = ibra_row[1] if ibra_row else None
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 2. Threatened species — distinct count + names
+    # 2. Threatened species — COUNT(DISTINCT scientificname)
     #
-    # Quality filters applied:
-    #   - occurrencestatus = 'present'   (exclude absent records)
-    #   - is_obscured = FALSE            (exclude ±10 km fuzzed coordinates)
-    #   - basisofrecord IN (HUMAN_OBSERVATION, MACHINE_OBSERVATION)
-    #                                    (exclude museum specimens / literature)
+    # FIX: use a single aggregation query instead of wrapping a subquery.
+    # COUNT(DISTINCT scientificname) counts unique species names directly —
+    # no double-wrapping, no subquery, no LIMIT interference.
     #
-    # A separate COUNT query (no LIMIT) gives the true total; the names query
-    # caps at 20 for the response payload only.
+    # scientificname is used (not vernacularname) because:
+    #   - vernacularname is NULL for many records, causing undercounting
+    #   - scientificname is the canonical identifier in the ALA dataset
+    #
+    # Threatened filter widens to cover all ALA sensitive/threatened resources.
     # ──────────────────────────────────────────────────────────────────────────
-    base_species_q = (
-        select(Species.vernacularname)
+    species_count_result = await db.execute(
+        select(func.count(func.distinct(Species.scientificname)))
         .where(Species.decimallatitude.isnot(None))
         .where(Species.decimallongitude.isnot(None))
         .where(Species.decimallatitude.between(min_lat, max_lat))
         .where(Species.decimallongitude.between(min_lng, max_lng))
-        .where(THREATENED_RESOURCE_FILTER)
-        .where(Species.vernacularname.isnot(None))
+        .where(_threatened_filter())
+        .where(Species.scientificname.isnot(None))
         .where(Species.occurrencestatus.ilike("present"))
         .where(Species.is_obscured.is_(False))
         .where(Species.basisofrecord.in_([
@@ -343,26 +345,33 @@ async def risk_summary(
             "MACHINE_OBSERVATION",
         ]))
     )
-
-    # True distinct count — no LIMIT so we get the real number
-    count_q = select(func.count()).select_from(
-        base_species_q.distinct().subquery()
-    )
-    species_count_result = await db.execute(count_q)
     species_count = species_count_result.scalar() or 0
 
-    # Top-20 names for the response panel
-    names_q = (
-        base_species_q
-        .group_by(Species.vernacularname)
+    # Top-20 vernacular names for the response panel (NULL-safe: fall back to scientificname)
+    names_result = await db.execute(
+        select(
+            func.coalesce(Species.vernacularname, Species.scientificname).label("display_name")
+        )
+        .where(Species.decimallatitude.isnot(None))
+        .where(Species.decimallongitude.isnot(None))
+        .where(Species.decimallatitude.between(min_lat, max_lat))
+        .where(Species.decimallongitude.between(min_lng, max_lng))
+        .where(_threatened_filter())
+        .where(Species.scientificname.isnot(None))
+        .where(Species.occurrencestatus.ilike("present"))
+        .where(Species.is_obscured.is_(False))
+        .where(Species.basisofrecord.in_([
+            "HUMAN_OBSERVATION",
+            "MACHINE_OBSERVATION",
+        ]))
+        .group_by(Species.scientificname, Species.vernacularname)
         .order_by(func.count(Species.occurrence_id).desc())
         .limit(20)
     )
-    names_result = await db.execute(names_q)
     species_names = [row[0] for row in names_result.fetchall() if row[0]]
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 3. CAPAD — protected area centroids within the buffer
+    # 3. CAPAD — active protected area centroids within the buffer
     # ──────────────────────────────────────────────────────────────────────────
     capad_count_result = await db.execute(
         select(func.count()).select_from(Capad)
@@ -370,6 +379,7 @@ async def risk_summary(
         .where(Capad.longitude.isnot(None))
         .where(Capad.latitude.between(min_lat, max_lat))
         .where(Capad.longitude.between(min_lng, max_lng))
+        .where(Capad.is_active.is_(True))
     )
     capad_count = capad_count_result.scalar() or 0
 
