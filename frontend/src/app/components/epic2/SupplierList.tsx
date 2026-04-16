@@ -61,14 +61,11 @@ const STATUS_STYLES: Record<string, { pill: string; label: string }> = {
 };
 
 /* ── Skeleton card (has coords, awaiting risk API) ─────────────────────── */
+// Root element is a plain div — the motion.div wrapper lives at the
+// AnimatePresence call-site so Framer Motion can attach its ref directly.
 function SkeletonCard({ name }: { name: string }) {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.97 }}
-      className="rounded-xl border border-slate-200 bg-white overflow-hidden"
-    >
+    <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
       <div className="px-3 py-2.5 flex items-start gap-2.5">
         <div className="w-10 h-10 rounded-xl bg-slate-100 animate-pulse flex-shrink-0" />
         <div className="flex-1 min-w-0 space-y-2">
@@ -85,7 +82,7 @@ function SkeletonCard({ name }: { name: string }) {
           <div className="h-1 w-full rounded-full bg-slate-100 animate-pulse" />
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }
 
@@ -94,10 +91,8 @@ function SkeletonCard({ name }: { name: string }) {
  * Shown for every supplier that has been validated/approved but whose
  * coordinates have not yet been resolved (geocoding pending or missing).
  *
- * Displays ALL data already held in session context so the panel is
- * immediately useful.  A slim geocoding badge communicates what is
- * still outstanding.  The card is fully clickable so the right panel
- * also shows approved supplier details while the user waits.
+ * Root element is a plain div — the motion.div wrapper lives at the
+ * AnimatePresence call-site so Framer Motion can attach its ref directly.
  */
 function ApprovedSupplierCard({
   supplier,
@@ -117,16 +112,12 @@ function ApprovedSupplierCard({
   const displayAddr = supplier.enrichedAddress ?? supplier.address;
   const confidence  = supplier.confidenceScore ?? 0;
 
-  // Confidence ring colour
   const ringColor =
     confidence >= 80 ? '#10b981' :
     confidence >= 50 ? '#f59e0b' : '#ef4444';
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.97 }}
+    <div
       onClick={() => onSelect(supplier.id)}
       onMouseEnter={() => onHover(supplier.id)}
       onMouseLeave={() => onHover(null)}
@@ -210,7 +201,7 @@ function ApprovedSupplierCard({
           </div>
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }
 
@@ -222,17 +213,14 @@ export default function SupplierList({
   const [search,     setSearch]     = useState('');
   const [filterRisk, setFilterRisk] = useState<RiskFilter>('all');
 
-  // Suppliers with a completed risk summary
   const withSummary = suppliers
     .map(s => ({ supplier: s, summary: summaries.find(r => r.supplier_id === s.id) }))
     .filter(({ summary }) => summary != null) as { supplier: Supplier; summary: SupplierRiskSummary }[];
 
-  // Suppliers with coordinates but summary not yet computed
   const pending = suppliers.filter(
     s => s.coordinates && !summaries.find(r => r.supplier_id === s.id)
   );
 
-  // Suppliers without coordinates (approved but awaiting geocoding)
   const noCoords = suppliers.filter(s => !s.coordinates);
 
   const totalVisible  = suppliers.length;
@@ -259,7 +247,6 @@ export default function SupplierList({
     })
     .sort((a, b) => riskScore(b.summary) - riskScore(a.summary));
 
-  // noCoords cards also participate in search so they don't disappear on typing
   const filteredNoCoords = noCoords.filter(s => {
     if (!search) return true;
     const q = search.toLowerCase();
@@ -308,7 +295,7 @@ export default function SupplierList({
           />
         </div>
 
-        {/* Risk filter tabs — only meaningful once some summaries exist */}
+        {/* Risk filter tabs */}
         {withSummary.length > 0 && (
           <div className="flex items-center gap-1 bg-slate-100 rounded-lg p-0.5">
             {(['all', 'critical', 'high', 'medium', 'low'] as RiskFilter[]).map(level => (
@@ -412,19 +399,32 @@ export default function SupplierList({
 
           {/* ── Skeleton cards (has coords, risk still computing) ── */}
           {riskLoading && pending.map(s => (
-            <SkeletonCard key={`skel-${s.id}`} name={s.enrichedName ?? s.name} />
+            <motion.div
+              key={`skel-${s.id}`}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.97 }}
+            >
+              <SkeletonCard name={s.enrichedName ?? s.name} />
+            </motion.div>
           ))}
 
-          {/* ── Approved supplier cards (no coords yet, but data available) ── */}
+          {/* ── Approved supplier cards (no coords yet) ── */}
           {filteredNoCoords.map(s => (
-            <ApprovedSupplierCard
+            <motion.div
               key={`approved-${s.id}`}
-              supplier={s}
-              isSelected={selectedId === s.id}
-              isHovered={hoveredId   === s.id}
-              onSelect={onSelect}
-              onHover={onHover}
-            />
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.97 }}
+            >
+              <ApprovedSupplierCard
+                supplier={s}
+                isSelected={selectedId === s.id}
+                isHovered={hoveredId   === s.id}
+                onSelect={onSelect}
+                onHover={onHover}
+              />
+            </motion.div>
           ))}
 
         </AnimatePresence>
