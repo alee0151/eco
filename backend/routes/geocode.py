@@ -10,17 +10,41 @@ GET https://api.psma.com.au/v2/addresses/geocoder
   ?address=<street_name suburb state postcode>
   &maxNumberOfResults=1
 
-Example:
+Example request:
   https://api.psma.com.au/v2/addresses/geocoder
     ?maxNumberOfResults=1
     &address=Cooma NSW 2630
 
-Flow  (single call, no two-step lookup)
+Example response (GeoJSON FeatureCollection):
+  {
+    "type": "FeatureCollection",
+    "features": [
+      {
+        "type": "Feature",
+        "properties": {
+          "geoFeature":       "LOCALITY",
+          "formattedAddress": "COOMA NSW 2630",
+          "localityId":       "loc2ea88964023a",   # locality-level match
+          # for street/address-level matches: "addressId": "GAACT..."
+        },
+        "geometry": {
+          "type":        "Point",
+          "coordinates": [149.12022377, -36.25076511]   # [lng, lat]
+        },
+        "matchScore":   100,
+        "matchType":    "Locality",
+        "matchQuality": "Exact"
+      }
+    ]
+  }
+
+Flow  (single call per query attempt)
 -----
-1. Build ordered query strings from the request body (most → least specific).
-2. For each query: GET /v2/addresses/geocoder?address=<q>&maxNumberOfResults=1
-3. Parse lat/lng from the first result.
-4. If no result for any query → return Australia centre
+1. Build ordered query strings (most → least specific).
+2. GET /v2/addresses/geocoder?address=<q>&maxNumberOfResults=1
+3. Parse features[0]:  geometry.coordinates[lng,lat], properties.geoFeature,
+   properties.formattedAddress, matchScore, properties.addressId / localityId.
+4. If no features for any query → return Australia centre
    (source="centroid", resolution_level="unknown").
 
 No Nominatim / OSM fallback.  No state centroid fallback.
@@ -34,13 +58,11 @@ Request body
   "state":    "VIC",
   "postcode": "3000"
 }
-All fields are optional but at least one should be non-empty.
 
 Environment variables
 ---------------------
 GEOSCAPE_API_KEY   Geoscape API key — passed as the raw Authorization header value.
                    Register at https://geoscape.com.au/geoscape-developer-centre/
-                   If unset, the endpoint returns Australia centre immediately.
 """
 
 import logging
@@ -64,8 +86,8 @@ AUS_CENTRE       = (-25.2744, 133.7751)
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
 class GeocodeRequest(BaseModel):
-    address:  str = ""   # pre-formatted GNAF addressString (street_name suburb state postcode)
-    street:   str = ""   # street name + type, NO unit or street number
+    address:  str = ""   # pre-formatted GNAF addressString: street_name suburb state postcode
+    street:   str = ""   # street name + type only (no unit, no street number)
     suburb:   str = ""
     state:    str = ""   # NSW / VIC / QLD / WA / SA / TAS / ACT / NT
     postcode: str = ""
@@ -93,10 +115,9 @@ def _build_queries(body: GeocodeRequest) -> list[str]:
     """
     Return an ordered list of `address=` values to try, most → least specific.
 
-    All queries follow the format expected by the v2 geocoder example:
-      "<street_name> <suburb> <state> <postcode>"
-    e.g. "Collins Street Melbourne VIC 3000"
-         "Cooma NSW 2630"
+    Format mirrors the v2 example: "<street_name> <suburb> <state> <postcode>"
+      e.g. "Collins Street Melbourne VIC 3000"
+           "Cooma NSW 2630"
     """
     queries: list[str] = []
 
@@ -106,7 +127,7 @@ def _build_queries(body: GeocodeRequest) -> list[str]:
     state    = body.state.strip().upper()
     postcode = body.postcode.strip()
 
-    # 1. Pre-formatted address string from the caller (parse-address output)
+    # 1. Pre-formatted address from the caller (parse-address output)
     if addr:
         queries.append(addr)
 
@@ -116,7 +137,7 @@ def _build_queries(body: GeocodeRequest) -> list[str]:
         if q not in queries:
             queries.append(q)
 
-    # 3. Locality only: suburb + state + postcode (drop street if street failed)
+    # 3. Locality fallback: suburb + state + postcode (drop street)
     if suburb and state:
         q = _join(suburb, state, postcode)
         if q not in queries:
@@ -125,13 +146,19 @@ def _build_queries(body: GeocodeRequest) -> list[str]:
     return queries
 
 
-# ── Resolution level ───────────────────────────────────────────────────────────────
+# ── Resolution level from geoFeature ────────────────────────────────────────────────
 
 def _resolution_from_geo_feature(geo_feature: str) -> str:
     """
-    Map G-NAF geoFeature to internal resolution level.
-      facility → PROPERTY CENTROID, FRONTAGE, BUILDING CENTROID, PARCEL, UNIT
-      regional → STREET, ROAD, SUBURB, POSTCODE, TOWN, LOCALITY
+    Map G-NAF geoFeature (from properties.geoFeature) to internal resolution level.
+
+    Observed v2 values:
+      LOCALITY                        → regional
+      STREET LOCALITY                 → regional
+      PROPERTY CENTROID               → facility
+      FRONTAGE CENTRE SETBACK         → facility
+      BUILDING CENTROID               → facility
+      PARCEL CENTROID                 → facility
     """
     gf = geo_feature.upper()
     if any(k in gf for k in ("PROPERTY", "BUILDING", "FRONTAGE", "PARCEL", "UNIT")):
@@ -141,7 +168,7 @@ def _resolution_from_geo_feature(geo_feature: str) -> str:
     return "facility"
 
 
-# ── GNAF v2 geocoder call ───────────────────────────────────────────────────────────
+# ── GNAF v2 geocoder call ─────────────────────────────────────────────────────────
 
 async def _gnaf_geocode(
     client: httpx.AsyncClient,
@@ -149,27 +176,32 @@ async def _gnaf_geocode(
     address: str,
 ) -> Optional[GeocodeResponse]:
     """
-    Single call to the v2 geocoder.
+    Single GET to /v2/addresses/geocoder.
 
-    GET https://api.psma.com.au/v2/addresses/geocoder
-      ?address=<address>
-      &maxNumberOfResults=1
-
-    Expected response shape (v2):
+    Response is a GeoJSON FeatureCollection:
     {
-      "addressMatches": [
+      "type": "FeatureCollection",
+      "features": [
         {
-          "addressId":       "GAACT715055052",
-          "addressString":   "COOMA NSW 2630",
-          "matchScore":      100,
-          "geocodeType":     "LOCALITY",
-          "latitude":        -36.234,
-          "longitude":       149.123
+          "type": "Feature",
+          "properties": {
+            "geoFeature":       "LOCALITY",
+            "formattedAddress": "COOMA NSW 2630",
+            "localityId":       "loc2ea88964023a",  # locality match
+            # OR "addressId": "GAACT..."           # street/property match
+          },
+          "geometry": {
+            "type":        "Point",
+            "coordinates": [149.12022377, -36.25076511]  # [lng, lat]
+          },
+          "matchScore":   100,
+          "matchType":    "Locality",
+          "matchQuality": "Exact"
         }
       ]
     }
 
-    Returns a GeocodeResponse on success, or None if no match.
+    Returns GeocodeResponse on success, or None if no features.
     """
     try:
         resp = await client.get(
@@ -204,39 +236,52 @@ async def _gnaf_geocode(
         logger.warning("[geocode] GNAF v2 non-JSON response for address=%r", address)
         return None
 
-    matches = body.get("addressMatches") or []
-    if not matches:
-        logger.info("[geocode] GNAF v2: no matches for address=%r", address)
+    # v2 response is a GeoJSON FeatureCollection
+    features = body.get("features") or []
+    if not features:
+        logger.info("[geocode] GNAF v2: no features for address=%r", address)
         return None
 
-    hit = matches[0]
+    feature    = features[0]
+    props      = feature.get("properties") or {}
+    geometry   = feature.get("geometry")   or {}
+    coords     = geometry.get("coordinates") or []  # [lng, lat]
 
-    lat         = hit.get("latitude")
-    lng         = hit.get("longitude")
-    address_id  = str(hit.get("addressId")  or "")
-    addr_str    = str(hit.get("addressString") or address)
-    match_score = int(hit.get("matchScore")  or 0)
-    geocode_type = str(hit.get("geocodeType") or "")
-
-    if lat is None or lng is None:
-        logger.warning("[geocode] GNAF v2: missing lat/lng for address=%r", address)
+    if len(coords) < 2:
+        logger.warning("[geocode] GNAF v2: missing coordinates for address=%r", address)
         return None
 
-    resolution_level = _resolution_from_geo_feature(geocode_type)
+    lng = float(coords[0])
+    lat = float(coords[1])
+
+    # GNAF PID: addressId for property/street matches, localityId for locality matches
+    gnaf_pid = str(
+        props.get("addressId") or
+        props.get("localityId") or
+        ""
+    )
+
+    formatted_address = str(props.get("formattedAddress") or address)
+    geo_feature       = str(props.get("geoFeature")       or "")
+    match_score       = int(feature.get("matchScore")      or 0)
+    match_type        = str(feature.get("matchType")       or "")
+
+    resolution_level = _resolution_from_geo_feature(geo_feature)
 
     logger.info(
-        "[geocode] GNAF v2 hit: %r → addressId=%s lat=%.5f lng=%.5f score=%d type=%s",
-        address, address_id, float(lat), float(lng), match_score, geocode_type,
+        "[geocode] GNAF v2 hit: %r → gnaf_pid=%s lat=%.5f lng=%.5f "
+        "score=%d geoFeature=%r matchType=%s",
+        address, gnaf_pid, lat, lng, match_score, geo_feature, match_type,
     )
 
     return GeocodeResponse(
-        lat              = float(lat),
-        lng              = float(lng),
-        gnaf_pid         = address_id,
+        lat              = lat,
+        lng              = lng,
+        gnaf_pid         = gnaf_pid,
         confidence       = match_score,
         resolution_level = resolution_level,
         inference_method = "gnaf-v2",
-        display_address  = addr_str,
+        display_address  = formatted_address,
         source           = "geoscape",
     )
 
@@ -247,12 +292,12 @@ async def _gnaf_geocode(
 async def geocode(body: GeocodeRequest) -> GeocodeResponse:
     """
     Geocode a supplier address via the GNAF Addresses API v2 geocoder.
-    Single HTTP call per query attempt — no two-step lookup.
+    Single HTTP call per query attempt.
     No Nominatim / OSM fallback.  No state centroid fallback.
 
     Returns Australia centre (source="centroid") if:
       - GEOSCAPE_API_KEY is not set, or
-      - all query attempts return no GNAF matches.
+      - all query attempts return empty features[].
     """
     api_key = os.getenv("GEOSCAPE_API_KEY", "").strip()
 
@@ -291,7 +336,9 @@ async def geocode(body: GeocodeRequest) -> GeocodeResponse:
                 return result
 
     lat, lng = AUS_CENTRE
-    logger.warning("[geocode] GNAF v2 returned no results for any query — returning Australia centre")
+    logger.warning(
+        "[geocode] GNAF v2 returned no features for any query — returning Australia centre"
+    )
     return GeocodeResponse(
         lat=lat, lng=lng,
         resolution_level="unknown",
