@@ -1,36 +1,37 @@
 """
 routes/enrich.py  —  POST /api/enrich
 
-Calls the Australian Business Register (ABR) ABN Lookup API using a
-registered GUID key to validate and enrich supplier data.
+Two-stage ABR enrichment pipeline using the official JSON endpoints:
 
-ABR API docs:  https://abr.business.gov.au/json/
-Register GUID: https://www.abr.business.gov.au/Tools/WebServices
+  Stage 1 — ABN Lookup (when a valid 11-digit ABN is present)
+    GET https://abr.business.gov.au/json/AbnDetails.aspx
+        ?abn=<11digits>&callback=callback&guid=<GUID>
+    → Returns full entity record: name, address, status.
+
+  Stage 2 — Name Lookup fallback (when ABN is missing/invalid OR Stage 1 finds nothing)
+    GET https://abr.business.gov.au/json/MatchingNames.aspx
+        ?name=<supplier+name>&maxResults=10&callback=callback&guid=<GUID>
+    → Returns list of matching entities; we pick the best ABN match.
+    → If a match is found, we re-run Stage 1 with the matched ABN for full details.
 
 Environment variables
 ---------------------
 ABR_GUID   Your registered ABR Web Services GUID (required)
-
-Endpoint behaviour
-------------------
-1. Strip + validate ABN format (11 digits).
-2. Call ABR JSON endpoint:  searchByABN  with the GUID.
-3. Parse business name, address, ABN status from response.
-4. Compare with supplied name/address → set discrepancy flags.
-5. Compute a confidence score (0–100).
-6. Return EnrichResult.
+           Register free at: https://www.abr.business.gov.au/Tools/WebServices
 
 Graceful degradation
 --------------------
-- If ABR_GUID is not configured → 503 with a clear setup message.
-- If ABR is unreachable (network) → 503.
-- If ABN is not found in ABR    → abn_found=False, rest null.
-- All errors are logged; the frontend handles them gracefully.
+- ABR_GUID not configured  →  503 with setup instructions
+- ABR unreachable          →  503
+- ABN not found + no name match →  abn_found=False, confidence=0
+- All errors logged; frontend handles them without crashing
 """
 
+import json
 import logging
 import os
 import re
+from urllib.parse import quote_plus
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -39,17 +40,18 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ── ABR JSON API base URL ──────────────────────────────────────────────────────
-# Returns JSON — no SOAP required.  Only requires a registered GUID.
-ABR_BASE = "https://abr.business.gov.au/json/"
+# ── ABR JSON API endpoints (exact URLs provided) ─────────────────────────────────
+ABR_ABN_URL   = "https://abr.business.gov.au/json/AbnDetails.aspx"
+ABR_NAME_URL  = "https://abr.business.gov.au/json/MatchingNames.aspx"
+CALLBACK_NAME = "callback"   # JSONP callback param — ABR always wraps in this
 
 
-# ── Request / Response schemas ─────────────────────────────────────────────────
+# ── Request / Response schemas ──────────────────────────────────────────────────
 
 class EnrichRequest(BaseModel):
-    abn:     str
-    name:    str = ""
-    address: str = ""
+    abn:     str  = ""
+    name:    str  = ""
+    address: str  = ""
 
 
 class EnrichResult(BaseModel):
@@ -57,55 +59,95 @@ class EnrichResult(BaseModel):
     abn_found:           bool
     enriched_name:       str | None = None
     enriched_address:    str | None = None
-    abr_status:          str | None = None   # e.g. "Active", "Cancelled"
+    abr_status:          str | None = None   # "Active" | "Cancelled" | ...
     name_discrepancy:    bool | None = None
     address_discrepancy: bool | None = None
-    confidence_score:    int | None = None   # 0–100
+    confidence_score:    int  | None = None  # 0–100
+    lookup_method:       str  | None = None  # "abn" | "name" | "name+abn"
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── JSONP stripper ─────────────────────────────────────────────────────────────────
 
-def _clean_abn(raw: str) -> str:
-    """Strip spaces and hyphens; return 11-digit string or raise."""
-    digits = re.sub(r"[\s\-]", "", raw)
-    if not re.match(r"^\d{11}$", digits):
-        raise ValueError(f"ABN '{raw}' is not 11 digits after stripping non-digits.")
-    return digits
-
-
-def _normalise(s: str) -> str:
-    """Lowercase, collapse whitespace — used for fuzzy comparison."""
-    return re.sub(r"\s+", " ", s.lower().strip())
-
-
-def _name_match(abr_name: str, supplied_name: str) -> bool:
-    """True if names are similar enough to not flag as a discrepancy."""
-    if not supplied_name:
-        return True  # no supplied name → nothing to compare
-    a = _normalise(abr_name)
-    b = _normalise(supplied_name)
-    # Exact or substring match
-    return a == b or a in b or b in a
-
-
-def _address_match(abr_addr: str, supplied_addr: str) -> bool:
-    """True if addresses share enough tokens to avoid flagging."""
-    if not supplied_addr or not abr_addr:
-        return True
-    a_tokens = set(_normalise(abr_addr).split())
-    b_tokens = set(_normalise(supplied_addr).split())
-    if not a_tokens or not b_tokens:
-        return True
-    overlap = len(a_tokens & b_tokens) / max(len(a_tokens), len(b_tokens))
-    return overlap >= 0.4   # 40 % token overlap → not a discrepancy
-
-
-def _build_address(abr_entity: dict) -> str | None:
+def _strip_jsonp(text: str) -> str:
     """
-    Assemble a human-readable address from the ABR businessAddress block.
-    ABR JSON fields: addressLine1, suburb, stateCode, postcode
+    ABR always wraps its JSON in a JSONP callback, e.g.:
+        callback({...})
+    Strip the wrapper and return raw JSON.
+    Also handles optional trailing semicolon.
     """
-    addr = abr_entity.get("businessAddress", {})
+    text = text.strip()
+    # Match:  identifier(   ...JSON...   );
+    m = re.match(r"^[a-zA-Z_$][\w$.]*\s*\((.+)\)\s*;?\s*$", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text  # already raw JSON (e.g. future ABR upgrade)
+
+
+def _parse_abr_json(raw_text: str) -> dict:
+    """Strip JSONP wrapper and parse JSON; raise HTTPException on failure."""
+    try:
+        return json.loads(_strip_jsonp(raw_text))
+    except Exception as exc:
+        logger.error("[enrich] ABR unparseable response: %s", raw_text[:300])
+        raise HTTPException(
+            status_code=502,
+            detail=f"ABR returned unparseable response: {exc}",
+        ) from exc
+
+
+# ── ABN helpers ────────────────────────────────────────────────────────────────────
+
+def _clean_abn(raw: str) -> str | None:
+    """Return 11-digit ABN string or None if format is invalid."""
+    digits = re.sub(r"[\s\-]", "", raw or "")
+    return digits if re.match(r"^\d{11}$", digits) else None
+
+
+# ── Field extractors from ABR AbnDetails entity block ──────────────────────────
+
+def _extract_name(entity: dict) -> str | None:
+    """
+    Extract best available business name from AbnDetails entity block.
+    Priority: mainName.organisationName
+              → legalName.organisationName
+              → legalName.givenName + familyName
+              → tradingName[0].organisationName
+    """
+    for key in ("mainName", "legalName"):
+        block = entity.get(key)
+        if isinstance(block, dict):
+            name = block.get("organisationName", "").strip()
+            if name:
+                return name
+            given  = block.get("givenName",  "").strip()
+            family = block.get("familyName", "").strip()
+            full   = f"{given} {family}".strip()
+            if full:
+                return full
+
+    trading = entity.get("tradingName")
+    if isinstance(trading, list):
+        for t in trading:
+            if isinstance(t, dict):
+                n = t.get("organisationName", "").strip()
+                if n:
+                    return n
+    elif isinstance(trading, dict):
+        n = trading.get("organisationName", "").strip()
+        if n:
+            return n
+
+    return None
+
+
+def _build_address(entity: dict) -> str | None:
+    """
+    Assemble geocodable address string from ABR businessAddress block.
+    ABR fields: addressLine1, suburb, stateCode, postcode
+    """
+    addr = entity.get("businessAddress", {})
+    if not isinstance(addr, dict):
+        return None
     parts = [
         addr.get("addressLine1", "").strip(),
         addr.get("suburb",       "").strip(),
@@ -113,52 +155,76 @@ def _build_address(abr_entity: dict) -> str | None:
         addr.get("postcode",     "").strip(),
     ]
     joined = ", ".join(p for p in parts if p)
-    return joined if joined else None
+    return joined or None
 
 
-def _extract_name(abr_entity: dict) -> str | None:
-    """
-    Extract the best available business name from ABR response.
-    Priority: mainName → legalName → tradingName → entityTypeDescription
-    """
-    # mainName is present for companies; legalName for individuals
-    for key in ("mainName", "legalName"):
-        block = abr_entity.get(key, {})
-        if isinstance(block, dict):
-            name = block.get("organisationName") or (
-                f"{block.get('givenName', '')} {block.get('familyName', '')}".strip()
-            )
-            if name:
-                return name
-
-    # tradingName array — take the first active one
-    trading = abr_entity.get("tradingName")
-    if isinstance(trading, list):
-        for t in trading:
-            if isinstance(t, dict) and t.get("organisationName"):
-                return t["organisationName"]
-    elif isinstance(trading, dict) and trading.get("organisationName"):
-        return trading["organisationName"]
-
+def _get_abr_status(entity: dict) -> str | None:
+    """Return entityStatusCode from entityStatus block."""
+    block = entity.get("entityStatus", {})
+    if isinstance(block, dict):
+        return block.get("entityStatusCode")   # "Active" | "Cancelled" | ...
     return None
 
 
+def _get_entity_from_abn_response(data: dict) -> dict | None:
+    """
+    Navigate ABR AbnDetails response structure:
+      ABRPayloadSearchResults.response.businessEntity
+    Returns the entity dict or None if not found / exception returned.
+    """
+    payload      = data.get("ABRPayloadSearchResults", data)
+    response_obj = payload.get("response", payload)
+    if response_obj.get("exceptionDescription"):
+        return None
+    entity = response_obj.get("businessEntity")
+    return entity if isinstance(entity, dict) and entity else None
+
+
+# ── Fuzzy comparison helpers ─────────────────────────────────────────────────────
+
+def _normalise(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").lower().strip())
+
+
+def _name_discrepancy(abr_name: str, supplied_name: str) -> bool:
+    """True = names do NOT match well enough (flag as discrepancy)."""
+    if not supplied_name:
+        return False   # nothing to compare
+    a, b = _normalise(abr_name), _normalise(supplied_name)
+    return not (a == b or a in b or b in a)
+
+
+def _address_discrepancy(abr_addr: str, supplied_addr: str) -> bool:
+    """True = addresses share < 40 % token overlap (flag as discrepancy)."""
+    if not supplied_addr or not abr_addr:
+        return False
+    a_tok = set(_normalise(abr_addr).split())
+    b_tok = set(_normalise(supplied_addr).split())
+    if not a_tok or not b_tok:
+        return False
+    overlap = len(a_tok & b_tok) / max(len(a_tok), len(b_tok))
+    return overlap < 0.4
+
+
+# ── Confidence scoring ───────────────────────────────────────────────────────────────
+
 def _compute_confidence(
-    abn_found: bool,
-    abr_status: str | None,
-    name_discrepancy: bool,
+    abn_found:          bool,
+    abr_status:         str | None,
+    name_discrepancy:   bool,
     address_discrepancy: bool,
-    has_address: bool,
+    has_address:        bool,
+    used_name_lookup:   bool,
 ) -> int:
     """
-    Score 0–100 reflecting how trustworthy the enriched record is.
+    0–100 score reflecting enrichment trustworthiness.
 
-    Scoring rubric:
-      +50   ABN found in ABR
-      +20   ABN status is 'Active'
-      +15   Name matches (no discrepancy)
-      +10   Address matches (no discrepancy)
-      +5    ABR returned a full address
+    +50   ABN confirmed in ABR
+    +20   Status is Active
+    +15   Name matches (no discrepancy)
+    +10   Address matches (no discrepancy)
+    +5    Full address returned by ABR
+    -10   Name-lookup fallback used (lower certainty than direct ABN hit)
     """
     if not abn_found:
         return 0
@@ -171,20 +237,112 @@ def _compute_confidence(
         score += 10
     if has_address:
         score += 5
-    return min(score, 100)
+    if used_name_lookup:
+        score -= 10   # penalty: matched by name, not by ABN directly
+    return max(0, min(score, 100))
 
 
-# ── Endpoint ───────────────────────────────────────────────────────────────────
+# ── ABR HTTP calls ───────────────────────────────────────────────────────────────────
+
+async def _abr_lookup_by_abn(client: httpx.AsyncClient, abn: str, guid: str) -> dict | None:
+    """
+    Stage 1: GET AbnDetails.aspx?abn=<11digits>&callback=callback&guid=<GUID>
+    Returns the parsed entity dict or None if not found.
+    """
+    try:
+        resp = await client.get(
+            ABR_ABN_URL,
+            params={
+                "abn":      abn,
+                "callback": CALLBACK_NAME,
+                "guid":     guid,
+            },
+        )
+        resp.raise_for_status()
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=503, detail="Cannot reach the ABR API. Check your internet connection.") from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"ABR returned HTTP {exc.response.status_code}") from exc
+
+    data = _parse_abr_json(resp.text)
+    return _get_entity_from_abn_response(data)
+
+
+async def _abr_lookup_by_name(client: httpx.AsyncClient, name: str, guid: str) -> list[dict]:
+    """
+    Stage 2: GET MatchingNames.aspx?name=<name>&maxResults=10&callback=callback&guid=<GUID>
+    Returns list of matching name records (each has Abn, Name, State, Postcode, Type).
+    """
+    try:
+        resp = await client.get(
+            ABR_NAME_URL,
+            params={
+                "name":       name,
+                "maxResults": "10",
+                "callback":   CALLBACK_NAME,
+                "guid":       guid,
+            },
+        )
+        resp.raise_for_status()
+    except (httpx.ConnectError, httpx.HTTPStatusError):
+        return []   # name lookup failure is non-fatal; just return empty
+
+    data = _parse_abr_json(resp.text)
+
+    # MatchingNames response structure:
+    # ABRPayloadSearchResults.response.searchResultsList.searchResultsRecord[]
+    payload   = data.get("ABRPayloadSearchResults", data)
+    resp_obj  = payload.get("response", {})
+    results   = resp_obj.get("searchResultsList", {}).get("searchResultsRecord", [])
+    if isinstance(results, dict):
+        results = [results]   # single result returned as object, not list
+    return results if isinstance(results, list) else []
+
+
+def _best_name_match(records: list[dict], supplied_name: str) -> dict | None:
+    """
+    From MatchingNames results, pick the record whose Name is closest
+    to the supplied name using token overlap.
+    Returns the best record dict or None.
+    """
+    if not records:
+        return None
+    supplied_tok = set(_normalise(supplied_name).split())
+    best_record  = None
+    best_score   = 0.0
+    for rec in records:
+        candidate = _normalise(rec.get("Name", ""))
+        cand_tok  = set(candidate.split())
+        if not cand_tok:
+            continue
+        overlap = len(supplied_tok & cand_tok) / max(len(supplied_tok), len(cand_tok))
+        if overlap > best_score:
+            best_score  = overlap
+            best_record = rec
+    # Require at least 30 % overlap to accept the match
+    return best_record if best_score >= 0.3 else None
+
+
+# ── Main endpoint ─────────────────────────────────────────────────────────────────────
 
 @router.post("/enrich", response_model=EnrichResult)
 async def enrich(body: EnrichRequest) -> EnrichResult:
     """
-    Validate an ABN against the ABR and return enriched supplier metadata.
+    Two-stage ABR enrichment:
 
-    Requires ABR_GUID to be set in backend/.env
-    Get your free GUID at: https://www.abr.business.gov.au/Tools/WebServices
+    Stage 1 — Direct ABN lookup (AbnDetails.aspx)
+      Called when a valid 11-digit ABN is provided.
+      Returns full entity: name, address, status, entity type.
+
+    Stage 2 — Name-based fallback (MatchingNames.aspx)
+      Called when:
+        (a) No valid ABN was supplied, OR
+        (b) Stage 1 returned abn_found=False
+      Searches by company name, picks the closest match,
+      then re-runs Stage 1 with the matched ABN for full details.
     """
-    # ── GUID guard ───────────────────────────────────────────────────────────
+
+    # ── GUID guard ────────────────────────────────────────────────────────────
     guid = os.getenv("ABR_GUID", "").strip()
     if not guid:
         raise HTTPException(
@@ -196,112 +354,102 @@ async def enrich(body: EnrichRequest) -> EnrichResult:
             ),
         )
 
-    # ── ABN format check ────────────────────────────────────────────────────
-    try:
-        abn_clean = _clean_abn(body.abn)
-    except ValueError as exc:
-        # Return a graceful not-found rather than a 422 — frontend handles it
-        logger.warning("[enrich] Invalid ABN format: %s", exc)
+    abn_clean        = _clean_abn(body.abn)
+    entity: dict | None = None
+    resolved_abn     = abn_clean or ""
+    used_name_lookup = False
+    lookup_method    = "abn"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+
+        # ── Stage 1: Direct ABN lookup ──────────────────────────────────────────
+        if abn_clean:
+            logger.info("[enrich] Stage 1: ABN lookup for %s", abn_clean)
+            entity = await _abr_lookup_by_abn(client, abn_clean, guid)
+            if entity:
+                lookup_method = "abn"
+                logger.info("[enrich] Stage 1 hit for ABN %s", abn_clean)
+
+        # ── Stage 2: Name fallback ───────────────────────────────────────────────
+        # Triggered if: no valid ABN supplied  OR  Stage 1 returned nothing
+        if entity is None and body.name.strip():
+            logger.info("[enrich] Stage 2: name lookup for %r", body.name.strip())
+            name_records = await _abr_lookup_by_name(client, body.name.strip(), guid)
+            best = _best_name_match(name_records, body.name)
+
+            if best:
+                matched_abn = _clean_abn(best.get("Abn", ""))
+                if matched_abn:
+                    logger.info(
+                        "[enrich] Stage 2 matched %r → ABN %s (name: %s)",
+                        body.name, matched_abn, best.get("Name"),
+                    )
+                    # Re-run Stage 1 with the matched ABN for full details
+                    entity = await _abr_lookup_by_abn(client, matched_abn, guid)
+                    if entity:
+                        resolved_abn     = matched_abn
+                        used_name_lookup = True
+                        lookup_method    = "name+abn"
+                    else:
+                        # Stage 1 miss after name match: use name record directly
+                        resolved_abn     = matched_abn
+                        used_name_lookup = True
+                        lookup_method    = "name"
+                        # Build a minimal entity from MatchingNames record
+                        entity = {
+                            "mainName": {"organisationName": best.get("Name", "")},
+                            "businessAddress": {
+                                "stateCode": best.get("State",    ""),
+                                "postcode":  best.get("Postcode", ""),
+                            },
+                            "entityStatus": {"entityStatusCode": "Active"},
+                        }
+
+    # ── Nothing found ──────────────────────────────────────────────────────────────────
+    if entity is None:
+        logger.info(
+            "[enrich] No ABR record found for ABN=%r name=%r",
+            body.abn, body.name,
+        )
         return EnrichResult(
-            abn=body.abn,
+            abn=body.abn or "",
             abn_found=False,
             confidence_score=0,
+            lookup_method=lookup_method,
         )
 
-    # ── ABR lookup ───────────────────────────────────────────────────────────
-    # ABR JSON endpoint — searchByABN
-    # Docs: https://abr.business.gov.au/json/
-    params = {
-        "abn":          abn_clean,
-        "guid":         guid,
-        "includeHistoricalDetails": "N",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{ABR_BASE}AbnDetails.aspx",
-                params=params,
-            )
-        resp.raise_for_status()
-    except httpx.ConnectError as exc:
-        logger.error("[enrich] ABR unreachable: %s", exc)
-        raise HTTPException(
-            status_code=503,
-            detail="Cannot reach the ABR API. Check your internet connection.",
-        ) from exc
-    except httpx.HTTPStatusError as exc:
-        logger.error("[enrich] ABR HTTP error %s: %s", exc.response.status_code, exc.response.text[:300])
-        raise HTTPException(
-            status_code=502,
-            detail=f"ABR returned HTTP {exc.response.status_code}",
-        ) from exc
-
-    # ── Parse JSON response ──────────────────────────────────────────────────
-    # ABR JSON wraps the response in a callback:  callback({...})
-    # When called without a callback param it returns raw JSON.
-    raw_text = resp.text.strip()
-
-    # Strip JSONP wrapper if present (some ABR endpoints still wrap)
-    jsonp_match = re.match(r"^[a-zA-Z_$][\w$.]*\((.+)\);?$", raw_text, re.DOTALL)
-    if jsonp_match:
-        raw_text = jsonp_match.group(1)
-
-    try:
-        import json
-        data = json.loads(raw_text)
-    except Exception as exc:
-        logger.error("[enrich] ABR non-JSON response: %s", raw_text[:300])
-        raise HTTPException(status_code=502, detail=f"ABR returned unparseable response: {exc}") from exc
-
-    # ABR wraps results in ABRPayloadSearchResults > response > businessEntity
-    payload      = data.get("ABRPayloadSearchResults", data)
-    response_obj = payload.get("response", payload)
-    entity       = response_obj.get("businessEntity", {})
-
-    # ── ABN not found ────────────────────────────────────────────────────────
-    # ABR returns a usageStatement or exception block when ABN not found
-    exception_desc = response_obj.get("exceptionDescription", "")
-    if exception_desc or not entity:
-        logger.info("[enrich] ABN %s not found in ABR: %s", abn_clean, exception_desc)
-        return EnrichResult(
-            abn=abn_clean,
-            abn_found=False,
-            confidence_score=0,
-        )
-
-    # ── Extract fields ───────────────────────────────────────────────────────
-    abn_status_block = entity.get("entityStatus", {})
-    abr_status       = abn_status_block.get("entityStatusCode", None)  # 'Active' | 'Cancelled' | ...
-
+    # ── Extract enriched fields ────────────────────────────────────────────────────
     enriched_name    = _extract_name(entity)
     enriched_address = _build_address(entity)
+    abr_status       = _get_abr_status(entity)
 
-    # ── Discrepancy flags ────────────────────────────────────────────────────
-    name_discrepancy    = not _name_match(enriched_name or "",    body.name)
-    address_discrepancy = not _address_match(enriched_address or "", body.address)
+    name_disc    = _name_discrepancy(enriched_name or "",    body.name)
+    address_disc = _address_discrepancy(enriched_address or "", body.address)
 
     confidence = _compute_confidence(
         abn_found=True,
         abr_status=abr_status,
-        name_discrepancy=name_discrepancy,
-        address_discrepancy=address_discrepancy,
+        name_discrepancy=name_disc,
+        address_discrepancy=address_disc,
         has_address=bool(enriched_address),
+        used_name_lookup=used_name_lookup,
     )
 
     logger.info(
-        "[enrich] ABN %s → name=%r status=%r conf=%d discrepancy(name=%s addr=%s)",
-        abn_clean, enriched_name, abr_status, confidence,
-        name_discrepancy, address_discrepancy,
+        "[enrich] ✓ ABN=%s method=%s name=%r status=%r conf=%d "
+        "discrepancy(name=%s addr=%s)",
+        resolved_abn, lookup_method, enriched_name, abr_status,
+        confidence, name_disc, address_disc,
     )
 
     return EnrichResult(
-        abn=abn_clean,
+        abn=resolved_abn,
         abn_found=True,
         enriched_name=enriched_name,
         enriched_address=enriched_address,
         abr_status=abr_status,
-        name_discrepancy=name_discrepancy,
-        address_discrepancy=address_discrepancy,
+        name_discrepancy=name_disc,
+        address_discrepancy=address_disc,
         confidence_score=confidence,
+        lookup_method=lookup_method,
     )
