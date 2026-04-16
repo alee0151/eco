@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import { useNavigate } from "react-router";
 import { useSuppliers } from "../context/SupplierContext";
 import { Supplier } from "../data/types";
 import { toast } from "sonner";
@@ -27,6 +28,7 @@ import {
   Tag,
   Layers,
   Building2,
+  Leaf,
 } from "lucide-react";
 
 /* ─── Leaflet icon fix ─────────────────────────────────────────────── */
@@ -50,15 +52,6 @@ const STATE_CENTROIDS: Record<string, { lat: number; lng: number }> = {
 };
 const AUS_CENTRE = { lat: -25.2744, lng: 133.7751 };
 
-/**
- * Best geocoding address for a supplier.
- *
- * Priority order:
- *   1. enrichedAddress  (ABR-validated)          — most authoritative
- *   2. parsedAddress.formatted  (LLM-structured) — clean, unambiguous
- *   3. address  (raw CSV/OCR)                    — last resort
- *   4. region                                    — absolute fallback
- */
 function bestGeoAddress(s: Supplier): string {
   return (
     s.enrichedAddress?.trim() ||
@@ -69,11 +62,6 @@ function bestGeoAddress(s: Supplier): string {
   );
 }
 
-/**
- * Best display address for UI (card subtitle, popup, export).
- * Prefers the structured parsed address for human readability;
- * falls back to enriched → raw → region.
- */
 function bestDisplayAddress(s: Supplier): string {
   return (
     s.enrichedAddress?.trim() ||
@@ -109,11 +97,8 @@ async function geocodeAddress(
     });
 
     if (res.status === 429) {
-      console.warn("[geocodeAddress] 429 rate-limited, retrying in 2s for:", address);
       await new Promise((r) => setTimeout(r, 2000));
-      const retry = await fetch(url, {
-        headers: { "Accept-Language": "en", "User-Agent": "eco-supply-chain-app" },
-      });
+      const retry = await fetch(url, { headers: { "Accept-Language": "en", "User-Agent": "eco-supply-chain-app" } });
       if (!retry.ok) {
         nominatimFailed = true;
       } else {
@@ -130,16 +115,13 @@ async function geocodeAddress(
       if (result) return result;
       nominatimFailed = true;
     }
-  } catch (err) {
-    console.warn("[geocodeAddress] Network error for:", address, err);
+  } catch {
     nominatimFailed = true;
   }
 
   if (nominatimFailed) {
     const stateMatch = address.toUpperCase().match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/);
-    if (stateMatch) {
-      return { ...STATE_CENTROIDS[stateMatch[1]], level: "state" };
-    }
+    if (stateMatch) return { ...STATE_CENTROIDS[stateMatch[1]], level: "state" };
   }
 
   return { ...AUS_CENTRE, level: "country" };
@@ -200,13 +182,14 @@ interface CardProps {
   onEditFormChange: (updates: Partial<Supplier>) => void;
   onApprove: () => void;
   onReject: () => void;
+  onBiodiversity: () => void;
   cardRef: (el: HTMLDivElement | null) => void;
 }
 
 function SupplierCard({
   supplier, selected, expanded, editing, editForm,
   onSelect, onToggleExpand, onStartEdit, onCancelEdit, onSaveEdit,
-  onEditFormChange, onApprove, onReject, cardRef,
+  onEditFormChange, onApprove, onReject, onBiodiversity, cardRef,
 }: CardProps) {
   const tier = scoreTier(supplier.confidenceScore || 0);
   const tc = TIER_COLORS[tier];
@@ -214,7 +197,6 @@ function SupplierCard({
   const displayName = supplier.enrichedName || supplier.name || "Unknown";
   const displayAddr = bestDisplayAddress(supplier);
 
-  // Structured address breakdown for expanded view
   const pa = supplier.parsedAddress;
   const hasStructured = pa && (pa.street || pa.suburb || pa.postcode);
 
@@ -315,7 +297,7 @@ function SupplierCard({
                     <DataRow icon={FileText}  label="Source"      value={supplier.fileName || "Upload"} />
                   </div>
 
-                  {/* Structured address breakdown (from LLM parser) */}
+                  {/* Structured address breakdown */}
                   {hasStructured && (
                     <div className="bg-violet-50 border border-violet-100 rounded-lg px-3 py-2.5 space-y-1">
                       <p className="text-[10px] text-violet-500 uppercase tracking-wide mb-1.5" style={{ fontWeight: 700 }}>
@@ -323,7 +305,7 @@ function SupplierCard({
                       </p>
                       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px]">
                         {pa!.unit     && <><span className="text-violet-400">Unit</span>     <span className="text-slate-700">{pa!.unit}</span></>}
-                        {pa!.street   && <><span className="text-violet-400">Street</span>   <span className="text-slate-700 col-span-1">{pa!.street}</span></>}
+                        {pa!.street   && <><span className="text-violet-400">Street</span>   <span className="text-slate-700">{pa!.street}</span></>}
                         {pa!.suburb   && <><span className="text-violet-400">Suburb</span>   <span className="text-slate-700">{pa!.suburb}</span></>}
                         {pa!.state    && <><span className="text-violet-400">State</span>    <span className="text-slate-700">{pa!.state}</span></>}
                         {pa!.postcode && <><span className="text-violet-400">Postcode</span> <span className="text-slate-700">{pa!.postcode}</span></>}
@@ -371,8 +353,18 @@ function SupplierCard({
                     </div>
                   </div>
 
-                  {/* Actions */}
-                  <div className="flex gap-2 pt-0.5">
+                  {/* ── Biodiversity GIS button ── */}
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onBiodiversity(); }}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 text-xs rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-700 transition-colors"
+                    style={{ fontWeight: 600 }}
+                  >
+                    <Leaf className="w-3.5 h-3.5" />
+                    View Biodiversity GIS
+                  </button>
+
+                  {/* Approve / Edit / Reject row */}
+                  <div className="flex gap-2">
                     <button
                       onClick={(e) => { e.stopPropagation(); onStartEdit(); }}
                       className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-xs border border-slate-200 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors"
@@ -403,6 +395,7 @@ function SupplierCard({
                       {supplier.status === "rejected" ? "Rejected" : "Reject"}
                     </button>
                   </div>
+
                 </div>
               )}
             </div>
@@ -427,6 +420,7 @@ function DataRow({ icon: Icon, label, value }: { icon: React.ElementType; label:
 /* ─── Main page ───────────────────────────────────────────────── */
 export function MapPage() {
   const { suppliers, updateSupplier } = useSuppliers();
+  const navigate = useNavigate();
 
   const [geocoding, setGeocoding] = useState(true);
   const [geocodeProgress, setGeocodeProgress] = useState({ done: 0, total: 0 });
@@ -464,10 +458,7 @@ export function MapPage() {
     return () => { map.remove(); mapRef.current = null; };
   }, []);
 
-  /* ── Geocode loop ─────────────────────────────────────────────────────
-   * Uses bestGeoAddress() so parsedAddress.formatted is preferred
-   * over the raw CSV address when enrichedAddress is absent.
-   */
+  /* ── Geocode loop ── */
   const supplierKey = suppliers.map((s) => s.id).join(",");
 
   useEffect(() => {
@@ -493,7 +484,6 @@ export function MapPage() {
         const s = needsGeocode[i];
         geocodedIds.current.add(s.id);
 
-        // ✓ Use bestGeoAddress() — prefers enriched → parsed → raw → region
         const address = bestGeoAddress(s);
         const { lat, lng, level } = await geocodeAddress(address);
 
@@ -537,52 +527,32 @@ export function MapPage() {
 
       const isSelected = s.id === selectedId;
       const icon = createMarkerIcon(s.confidenceScore || 0, isSelected);
-
       const popupAddr = bestDisplayAddress(s);
-
-      // Show structured breakdown in popup if available
       const pa = s.parsedAddress;
       const structuredLine = pa?.suburb
         ? `<p style="font-size:10px;color:#7c3aed;margin-top:2px">📍 ${[pa.street, pa.suburb, pa.state, pa.postcode].filter(Boolean).join(" · ")}</p>`
         : "";
 
+      const popupHtml = `<div style="min-width:200px">
+        <p style="font-weight:700;font-size:13px;color:#0f172a">${s.enrichedName || s.name}</p>
+        <p style="font-size:11px;color:#64748b;margin-top:3px">${popupAddr}</p>
+        ${structuredLine}
+        <p style="font-size:11px;margin-top:6px;font-weight:600;color:${
+          (s.confidenceScore || 0) >= 80 ? "#059669" :
+          (s.confidenceScore || 0) >= 50 ? "#d97706" : "#dc2626"
+        }">Confidence: ${s.confidenceScore || 0}%</p>
+        <p style="font-size:10px;color:#94a3b8;margin-top:2px">${
+          s.resolutionLevel ? `Precision: ${s.resolutionLevel}` : ""
+        }${s.inferenceMethod ? ` · ${s.inferenceMethod}` : ""}</p>
+      </div>`;
+
       const existing = markersRef.current.get(s.id);
       if (existing) {
         existing.setIcon(icon);
-        existing.setPopupContent(
-          `<div style="min-width:200px">
-            <p style="font-weight:700;font-size:13px;color:#0f172a">${s.enrichedName || s.name}</p>
-            <p style="font-size:11px;color:#64748b;margin-top:3px">${popupAddr}</p>
-            ${structuredLine}
-            <p style="font-size:11px;margin-top:6px;font-weight:600;color:${
-              (s.confidenceScore || 0) >= 80 ? "#059669" :
-              (s.confidenceScore || 0) >= 50 ? "#d97706" : "#dc2626"
-            }">Confidence: ${s.confidenceScore || 0}%</p>
-            <p style="font-size:10px;color:#94a3b8;margin-top:2px">${
-              s.resolutionLevel ? `Precision: ${s.resolutionLevel}` : ""
-            }${
-              s.inferenceMethod ? ` · ${s.inferenceMethod}` : ""
-            }</p>
-          </div>`
-        );
+        existing.setPopupContent(popupHtml);
       } else {
         const marker = L.marker(pos, { icon }).addTo(mapRef.current!);
-        marker.bindPopup(
-          `<div style="min-width:200px">
-            <p style="font-weight:700;font-size:13px;color:#0f172a">${s.enrichedName || s.name}</p>
-            <p style="font-size:11px;color:#64748b;margin-top:3px">${popupAddr}</p>
-            ${structuredLine}
-            <p style="font-size:11px;margin-top:6px;font-weight:600;color:${
-              (s.confidenceScore || 0) >= 80 ? "#059669" :
-              (s.confidenceScore || 0) >= 50 ? "#d97706" : "#dc2626"
-            }">Confidence: ${s.confidenceScore || 0}%</p>
-            <p style="font-size:10px;color:#94a3b8;margin-top:2px">${
-              s.resolutionLevel ? `Precision: ${s.resolutionLevel}` : ""
-            }${
-              s.inferenceMethod ? ` · ${s.inferenceMethod}` : ""
-            }</p>
-          </div>`
-        );
+        marker.bindPopup(popupHtml);
         marker.on("click", () => onMarkerClickRef.current(s.id));
         markersRef.current.set(s.id, marker);
       }
@@ -643,12 +613,13 @@ export function MapPage() {
   }, [suppliers]);
 
   /* ── Handlers ── */
-  const handleSelect = (id: string) => { setSelectedId((p) => p === id ? null : id); setMobileTab("map"); };
+  const handleSelect       = (id: string) => { setSelectedId((p) => p === id ? null : id); setMobileTab("map"); };
   const handleToggleExpand = (id: string) => setExpandedId((p) => p === id ? null : id);
-  const handleStartEdit = (s: Supplier) => { setEditingId(s.id); setEditForm({ ...s }); };
-  const handleSaveEdit = (id: string) => { updateSupplier(id, editForm); setEditingId(null); toast.success("Changes saved"); };
-  const handleApprove = (id: string) => { updateSupplier(id, { status: "approved" }); toast.success("Supplier approved"); };
-  const handleReject  = (id: string) => { updateSupplier(id, { status: "rejected" }); toast.success("Supplier rejected", { description: "Marked for review." }); };
+  const handleStartEdit    = (s: Supplier) => { setEditingId(s.id); setEditForm({ ...s }); };
+  const handleSaveEdit     = (id: string) => { updateSupplier(id, editForm); setEditingId(null); toast.success("Changes saved"); };
+  const handleApprove      = (id: string) => { updateSupplier(id, { status: "approved" }); toast.success("Supplier approved"); };
+  const handleReject       = (id: string) => { updateSupplier(id, { status: "rejected" }); toast.success("Supplier rejected", { description: "Marked for review." }); };
+  const handleBiodiversity = (id: string) => navigate(`/biodiversity?supplier=${id}`);
 
   /* ── Filtered list ── */
   const filtered = suppliers.filter((s) => {
@@ -680,7 +651,7 @@ export function MapPage() {
         <div>
           <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Map &amp; Review</h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Addresses parsed by LLM · validated via ABR · geocoded via Nominatim OSM
+            Addresses parsed by LLM · validated via ABR · geocoded via G-NAF
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -736,7 +707,7 @@ export function MapPage() {
                 transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
                 className="w-7 h-7 border-[3px] border-emerald-500 border-t-transparent rounded-full"
               />
-              <p className="text-sm text-slate-600" style={{ fontWeight: 500 }}>Geocoding suppliers via OpenStreetMap…</p>
+              <p className="text-sm text-slate-600" style={{ fontWeight: 500 }}>Geocoding suppliers…</p>
               {geocodeProgress.total > 0 && (
                 <div className="flex flex-col items-center gap-1.5">
                   <p className="text-xs text-slate-400">{geocodeProgress.done} / {geocodeProgress.total} addresses resolved</p>
@@ -819,6 +790,7 @@ export function MapPage() {
                     onEditFormChange={(u) => setEditForm((prev) => ({ ...prev, ...u }))}
                     onApprove={() => handleApprove(s.id)}
                     onReject={() => handleReject(s.id)}
+                    onBiodiversity={() => handleBiodiversity(s.id)}
                     cardRef={(el) => { if (el) cardRefs.current.set(s.id, el); else cardRefs.current.delete(s.id); }}
                   />
                 </motion.div>
