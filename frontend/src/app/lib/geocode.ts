@@ -1,25 +1,20 @@
 /**
  * geocode.ts — G-NAF geocoder via backend /api/geocode
  *
- * Routes all geocoding through the FastAPI backend, which calls the
- * Geoscape Address API (backed by the official Australian G-NAF dataset)
- * with an automatic Nominatim OSM fallback when Geoscape is unavailable.
+ * ALL geocoding is server-side only, routed through the FastAPI backend
+ * which calls the Geoscape Address API (backed by the official Australian
+ * G-NAF dataset — Geocoded National Address File).
  *
- * G-NAF advantages over Nominatim for Australian addresses:
- *   • Official government dataset — every registered Australian address
- *   • Persistent G-NAF PID for each address — stable cross-reference
- *   • Property-level geocode types (PROPERTY_ACCESS, BUILDING_CENTROID, etc.)
- *   • No rate-limit issues (server-side, keyed API)
- *   • Structured suburb/state/postcode matching from LLM parser output
+ * There is NO client-side geocoding and NO Nominatim calls from the frontend.
+ * Nominatim is used only as a server-side fallback inside backend/routes/geocode.py
+ * when the GEOSCAPE_API_KEY is not set.
  *
- * The backend returns a GeocodeResponse with:
- *   { lat, lng, gnaf_pid, confidence, resolution_level, inference_method,
- *     display_address, source }
+ * This function is called EXCLUSIVELY from EnrichmentPage.
+ * MapPage is render-only and never calls this function.
  *
- * Callers (EnrichmentPage, MapPage) pass enrichedAddress as primary input
- * and the LLM-parsed components (street/suburb/state/postcode) for
- * structured matching — enabling G-NAF to use exact field matching rather
- * than fuzzy free-text search.
+ * Backend response shape (GeocodeResponse):
+ *   lat, lng, gnaf_pid, confidence, resolution_level,
+ *   inference_method, display_address, source
  */
 
 import { geocodeApi, type GeocodeResult } from './api';
@@ -36,18 +31,16 @@ export interface GeoResult {
 }
 
 function toGeoResult(r: GeocodeResult): GeoResult {
-  const level = (
-    r.resolution_level === 'facility' ? 'facility'
-    : r.resolution_level === 'regional' ? 'regional'
-    : r.resolution_level === 'state'    ? 'state'
-    : 'unknown'
-  ) as GeoResult['resolutionLevel'];
-
   return {
     lat:             r.lat,
     lng:             r.lng,
     gnafPid:         r.gnaf_pid || undefined,
-    resolutionLevel: level,
+    resolutionLevel: (
+      r.resolution_level === 'facility' ? 'facility'
+      : r.resolution_level === 'regional' ? 'regional'
+      : r.resolution_level === 'state'    ? 'state'
+      : 'unknown'
+    ) as GeoResult['resolutionLevel'],
     inferenceMethod: r.inference_method,
     displayName:     r.display_address,
     source:          r.source,
@@ -57,17 +50,19 @@ function toGeoResult(r: GeocodeResult): GeoResult {
 
 /**
  * Geocode a supplier address via the backend G-NAF (Geoscape) endpoint.
+ * Called only from EnrichmentPage — never from MapPage.
  *
- * @param enrichedAddress  ABR-validated address string (highest priority)
- * @param rawAddress       LLM-parsed formatted address OR raw CSV value
- * @param supplierName     Company name (unused in G-NAF mode, kept for API compat)
- * @param parsedComponents Optional structured fields from LLM parser — passed
- *                         directly to the backend for field-level G-NAF matching
+ * @param enrichedAddress  ABR-validated address (highest priority for G-NAF lookup)
+ * @param rawAddress       LLM-parsed formatted address, or raw CSV value as fallback
+ * @param supplierName     Company name (used only as last-resort fallback text)
+ * @param parsedComponents Structured fields from LLM parser — street/suburb/state/postcode.
+ *                         Passed directly to backend for field-level G-NAF structured matching,
+ *                         which is more accurate than free-text search.
  */
 export async function geocodeSupplier(
   enrichedAddress: string | undefined,
-  rawAddress: string,
-  supplierName: string,
+  rawAddress:      string,
+  supplierName:    string,
   parsedComponents?: {
     street?:   string;
     suburb?:   string;
@@ -75,8 +70,13 @@ export async function geocodeSupplier(
     postcode?: string;
   },
 ): Promise<GeoResult | null> {
-  // Prefer ABR-enriched address; fall back to LLM-parsed or raw CSV
-  const address = enrichedAddress?.trim() || rawAddress?.trim() || supplierName?.trim() || '';
+  // Priority: ABR-enriched → LLM-parsed formatted → raw CSV → supplier name
+  const address = (
+    enrichedAddress?.trim()  ||
+    rawAddress?.trim()        ||
+    supplierName?.trim()      ||
+    ''
+  );
 
   if (!address) return null;
 
@@ -84,7 +84,7 @@ export async function geocodeSupplier(
     const result = await geocodeApi.geocode(address, parsedComponents);
     return toGeoResult(result);
   } catch (err) {
-    console.error('[geocode] /api/geocode failed:', err);
+    console.error('[geocode] /api/geocode failed — G-NAF backend unreachable:', err);
     return null;
   }
 }
