@@ -7,6 +7,90 @@ from typing import Optional, List, Any
 from pydantic import BaseModel
 
 
+# ─── Supplier ─────────────────────────────────────────────────────────
+
+class SupplierOut(BaseModel):
+    """Full supplier row returned by GET /api/suppliers."""
+    id:                   str
+    name:                 str
+    abn:                  Optional[str]   = None
+    address:              Optional[str]   = None
+    commodity:            Optional[str]   = None
+    region:               Optional[str]   = None
+    confidence_score:     Optional[int]   = None
+    status:               str             = "pending"
+    is_validated:         bool            = False
+    enriched_name:        Optional[str]   = None
+    enriched_address:     Optional[str]   = None
+    abr_status:           Optional[str]   = None
+    abn_found:            Optional[bool]  = None
+    name_discrepancy:     Optional[bool]  = None
+    address_discrepancy:  Optional[bool]  = None
+    lat:                  Optional[float] = None
+    lng:                  Optional[float] = None
+    resolution_level:     Optional[str]   = None
+    inference_method:     Optional[str]   = None
+    file_name:            Optional[str]   = None
+    file_type:            Optional[str]   = None
+    warnings:             Optional[str]   = None
+
+    class Config:
+        from_attributes = True
+
+
+class SupplierCreate(BaseModel):
+    """Body for POST /api/suppliers."""
+    id:                   str
+    name:                 str
+    abn:                  Optional[str]   = None
+    address:              Optional[str]   = None
+    commodity:            Optional[str]   = None
+    region:               Optional[str]   = None
+    confidence_score:     Optional[int]   = None
+    status:               str             = "pending"
+    is_validated:         bool            = False
+    enriched_name:        Optional[str]   = None
+    enriched_address:     Optional[str]   = None
+    abr_status:           Optional[str]   = None
+    abn_found:            Optional[bool]  = None
+    name_discrepancy:     Optional[bool]  = None
+    address_discrepancy:  Optional[bool]  = None
+    lat:                  Optional[float] = None
+    lng:                  Optional[float] = None
+    resolution_level:     Optional[str]   = None
+    inference_method:     Optional[str]   = None
+    file_name:            Optional[str]   = None
+    file_type:            Optional[str]   = None
+    warnings:             Optional[str]   = None
+
+
+class SupplierPatch(BaseModel):
+    """Body for PATCH /api/suppliers/{id} — every field is optional."""
+    name:                 Optional[str]   = None
+    abn:                  Optional[str]   = None
+    address:              Optional[str]   = None
+    commodity:            Optional[str]   = None
+    region:               Optional[str]   = None
+    confidence_score:     Optional[int]   = None
+    status:               Optional[str]   = None
+    is_validated:         Optional[bool]  = None
+    enriched_name:        Optional[str]   = None
+    enriched_address:     Optional[str]   = None
+    abr_status:           Optional[str]   = None
+    abn_found:            Optional[bool]  = None
+    name_discrepancy:     Optional[bool]  = None
+    address_discrepancy:  Optional[bool]  = None
+    lat:                  Optional[float] = None
+    lng:                  Optional[float] = None
+    resolution_level:     Optional[str]   = None
+    inference_method:     Optional[str]   = None
+    file_name:            Optional[str]   = None
+    file_type:            Optional[str]   = None
+    warnings:             Optional[str]   = None
+
+
+# ─── Species ────────────────────────────────────────────────────────
+
 class SpeciesOut(BaseModel):
     occurrence_id:    Optional[str]   = None
     decimallatitude:  Optional[float] = None
@@ -29,6 +113,8 @@ class SpeciesOut(BaseModel):
         from_attributes = True
 
 
+# ─── KBA ──────────────────────────────────────────────────────────
+
 class KbaOut(BaseModel):
     id:           int
     sit_rec_id:   Optional[int]   = None
@@ -50,6 +136,8 @@ class KbaOut(BaseModel):
     class Config:
         from_attributes = True
 
+
+# ─── CAPAD ─────────────────────────────────────────────────────────
 
 class CapadOut(BaseModel):
     id:                int
@@ -78,6 +166,8 @@ class CapadOut(BaseModel):
         from_attributes = True
 
 
+# ─── IBRA ──────────────────────────────────────────────────────────
+
 class IbraOut(BaseModel):
     id:            int
     ibra_reg_name: Optional[str]   = None
@@ -92,6 +182,8 @@ class IbraOut(BaseModel):
     class Config:
         from_attributes = True
 
+
+# ─── Risk summary composites ─────────────────────────────────────
 
 class CapadNearby(BaseModel):
     name:       str
