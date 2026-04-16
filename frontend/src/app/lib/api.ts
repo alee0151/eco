@@ -112,6 +112,25 @@ export interface CapadRecord {
   geom_wkt:         string | null;
 }
 
+/**
+ * Lightweight CAPAD record returned by GET /api/biodiversity/capad/regions.
+ * Contains geom_wkt for polygon rendering — no centroid lat/lng needed.
+ */
+export interface CapadRegion {
+  id:           number;
+  pa_id:        string | null;
+  pa_name:      string | null;
+  pa_type:      string | null;
+  pa_type_abbr: string | null;
+  iucn_cat:     string | null;
+  state:        string | null;
+  gis_area_ha:  number | null;
+  governance:   string | null;
+  authority:    string | null;
+  epbc_trigger: string | null;
+  geom_wkt:     string | null;  // WKT MULTIPOLYGON — parsed by wellknown in MapView
+}
+
 export interface IbraRecord {
   id:            number;
   ibra_reg_name: string | null;
@@ -227,6 +246,14 @@ export const kbaApi = {
 export const capadApi = {
   list: (params?: { state?: string; pa_type?: string; is_active?: boolean; limit?: number; offset?: number }) =>
     request<CapadRecord[]>(`/api/biodiversity/capad${buildQuery(params ?? {})}`),
+
+  /**
+   * Fetch CAPAD protected areas with geom_wkt for polygon map rendering.
+   * Returns up to 5000 records per page — use limit/offset for pagination.
+   * Only active rows with a non-null geom_wkt are returned.
+   */
+  regions: (params?: { state?: string; limit?: number; offset?: number }) =>
+    request<CapadRegion[]>(`/api/biodiversity/capad/regions${buildQuery(params ?? {})}`),
 
   byState: (state: string, limit = 500) =>
     request<CapadRecord[]>(`/api/biodiversity/capad/by-state/${state}?limit=${limit}`),

@@ -12,8 +12,9 @@
  *   Reference regions              → faint blue dashed outline
  *
  * CAPAD layer:
- *   Fetches real records from /api/biodiversity/capad (capad_protected_areas)
- *   Colour-coded by IUCN category; each marker shows a rich popup.
+ *   Fetches real MULTIPOLYGON boundaries from /api/biodiversity/capad/regions
+ *   Renders filled polygons coloured by IUCN category (mirrors IBRA pattern).
+ *   Each polygon has a sticky tooltip and a rich click popup.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -22,7 +23,7 @@ import { Layers, X } from 'lucide-react';
 import clsx from 'clsx';
 import wellknown from 'wellknown';
 import { Supplier } from '../../context/SupplierContext';
-import { IbraRecord, CapadRecord, SupplierRiskSummary, speciesApi, ibraApi, capadApi } from '../../lib/api';
+import { IbraRecord, CapadRegion, SupplierRiskSummary, speciesApi, ibraApi, capadApi } from '../../lib/api';
 import 'leaflet/dist/leaflet.css';
 
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png';
@@ -46,19 +47,19 @@ const IBRA_SELECTED_COLOR = '#f59e0b';
 
 // ── CAPAD IUCN colours ────────────────────────────────────────────────────────
 /**
- * Colour each protected area marker by its IUCN management category.
+ * Colour each protected area polygon by its IUCN management category.
  * Categories Ia / Ib are strict nature reserves → darkest teal.
  * Not Reported / unknown → neutral slate.
  */
 const CAPAD_IUCN_COLORS: Record<string, string> = {
-  'Ia':           '#0f4c5c',   // Strict Nature Reserve
-  'Ib':           '#0d6e6e',   // Wilderness Area
-  'II':           '#0d9488',   // National Park
-  'III':          '#06b6d4',   // Natural Monument
-  'IV':           '#16a34a',   // Habitat/Species Management
-  'V':            '#84cc16',   // Protected Landscape/Seascape
-  'VI':           '#10b981',   // Protected Area with Sustainable Use
-  'Not Reported': '#94a3b8',
+  'Ia':             '#0f4c5c',   // Strict Nature Reserve
+  'Ib':             '#0d6e6e',   // Wilderness Area
+  'II':             '#0d9488',   // National Park
+  'III':            '#06b6d4',   // Natural Monument
+  'IV':             '#16a34a',   // Habitat/Species Management
+  'V':              '#84cc16',   // Protected Landscape/Seascape
+  'VI':             '#10b981',   // Protected Area with Sustainable Use
+  'Not Reported':   '#94a3b8',
   'Not Applicable': '#94a3b8',
 };
 
@@ -67,46 +68,17 @@ function capadIucnColor(cat: string | null): string {
   return CAPAD_IUCN_COLORS[cat] ?? CAPAD_IUCN_COLORS['Not Reported'];
 }
 
-// ── CAPAD marker HTML ─────────────────────────────────────────────────────────
-function capadIcon(color: string) {
-  return L.divIcon({
-    className: '',
-    html: `<div style="
-      width:10px;height:10px;
-      border-radius:3px;
-      background:${color};
-      border:2px solid white;
-      box-shadow:0 1px 4px rgba(0,0,0,0.3);
-    "></div>`,
-    iconSize: [10, 10],
-    iconAnchor: [5, 5],
-  });
-}
-
-// ── CAPAD popup content ───────────────────────────────────────────────────────
-function capadPopup(r: CapadRecord): string {
-  const color    = capadIucnColor(r.iucn_cat);
-  const area     = r.gis_area_ha != null ? `${Number(r.gis_area_ha).toLocaleString()} ha` : '—';
-  const epbc     = r.epbc_trigger || '—';
-  const authority = r.authority  || '—';
-  const governance = r.governance || '—';
-  return `
-    <div style="min-width:210px;font-family:sans-serif;">
-      <p style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:2px">${r.pa_name ?? 'Protected Area'}</p>
-      <span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;color:white;background:${color};margin-bottom:6px">
-        IUCN ${r.iucn_cat ?? 'Not Reported'}
-      </span>
-      <div style="font-size:11px;color:#334155;line-height:1.7">
-        <p><b>Type:</b> ${r.pa_type ?? '—'} (${r.pa_type_abbr ?? '—'})</p>
-        <p><b>State:</b> ${r.state ?? '—'}</p>
-        <p><b>Area:</b> ${area}</p>
-        <p><b>Governance:</b> ${governance}</p>
-        <p><b>Authority:</b> ${authority}</p>
-        <p><b>EPBC trigger:</b> ${epbc}</p>
-      </div>
-    </div>
-  `;
-}
+// ── CAPAD IUCN legend entries for the layer panel ─────────────────────────────
+const CAPAD_LEGEND: { cat: string; label: string }[] = [
+  { cat: 'Ia',           label: 'Ia — Strict Nature Reserve' },
+  { cat: 'Ib',           label: 'Ib — Wilderness Area' },
+  { cat: 'II',           label: 'II — National Park' },
+  { cat: 'III',          label: 'III — Natural Monument' },
+  { cat: 'IV',           label: 'IV — Habitat/Species Mgmt' },
+  { cat: 'V',            label: 'V — Protected Landscape' },
+  { cat: 'VI',           label: 'VI — Sustainable Use' },
+  { cat: 'Not Reported', label: 'Not Reported / N/A' },
+];
 
 // ── Risk scoring ──────────────────────────────────────────────────────────────
 function getRiskLevel(summary?: SupplierRiskSummary): string {
@@ -135,21 +107,9 @@ interface LayerDef { id: string; label: string; color: string; group: string; de
 
 const LAYER_DEFS: LayerDef[] = [
   { id: 'species', label: 'Species Occurrences',    color: '#8b5cf6', group: 'Biodiversity',     desc: 'ALA threatened species records near suppliers' },
-  { id: 'capad',   label: 'CAPAD Protected Areas',  color: '#0d9488', group: 'Protected Regions', desc: 'Real CAPAD 2024 protected areas — coloured by IUCN category' },
+  { id: 'capad',   label: 'CAPAD Protected Areas',  color: '#0d9488', group: 'Protected Regions', desc: 'Real CAPAD 2024 protected area polygons — coloured by IUCN category' },
   { id: 'kba',     label: 'Key Biodiversity Areas', color: '#16a34a', group: 'Protected Regions', desc: 'BirdLife KBA boundaries' },
   { id: 'ibra',    label: 'IBRA Bioregions',        color: IBRA_COLOR, group: 'Bioregions',       desc: 'IBRA 7 bioregion outlines (all 89 regions)' },
-];
-
-// ── CAPAD IUCN legend entries for the layer panel ─────────────────────────────
-const CAPAD_LEGEND: { cat: string; label: string }[] = [
-  { cat: 'Ia',           label: 'Ia — Strict Nature Reserve' },
-  { cat: 'Ib',           label: 'Ib — Wilderness Area' },
-  { cat: 'II',           label: 'II — National Park' },
-  { cat: 'III',          label: 'III — Natural Monument' },
-  { cat: 'IV',           label: 'IV — Habitat/Species Mgmt' },
-  { cat: 'V',            label: 'V — Protected Landscape' },
-  { cat: 'VI',           label: 'VI — Sustainable Use' },
-  { cat: 'Not Reported', label: 'Not Reported / N/A' },
 ];
 
 // ── Props ─────────────────────────────────────────────────────────────────────
@@ -163,18 +123,18 @@ interface MapViewProps {
 }
 
 export default function MapView({ suppliers, summaries, selectedId, onSelect, hoveredId, onHover }: MapViewProps) {
-  const containerRef   = useRef<HTMLDivElement>(null);
-  const mapRef         = useRef<L.Map | null>(null);
-  const markersRef     = useRef<Map<string, L.Marker>>(new Map());
-  const layerGroupRef  = useRef<Map<string, L.LayerGroup>>(new Map());
-  const ibraRecordsRef = useRef<IbraRecord[] | null>(null);
-  // Cache fetched CAPAD records so re-toggling doesn't re-fetch
-  const capadRecordsRef = useRef<CapadRecord[] | null>(null);
+  const containerRef    = useRef<HTMLDivElement>(null);
+  const mapRef          = useRef<L.Map | null>(null);
+  const markersRef      = useRef<Map<string, L.Marker>>(new Map());
+  const layerGroupRef   = useRef<Map<string, L.LayerGroup>>(new Map());
+  const ibraRecordsRef  = useRef<IbraRecord[] | null>(null);
+  // Cache fetched CAPAD polygon regions so re-toggling the layer doesn't re-fetch
+  const capadRegionsRef = useRef<CapadRegion[] | null>(null);
 
-  const [layerPanelOpen,   setLayerPanelOpen]   = useState(false);
-  const [activeLayers,     setActiveLayers]      = useState<Set<string>>(new Set(['species']));
-  const [layerLoading,     setLayerLoading]      = useState<Set<string>>(new Set());
-  const [capadLegendOpen,  setCapadLegendOpen]   = useState(false);
+  const [layerPanelOpen,  setLayerPanelOpen]  = useState(false);
+  const [activeLayers,    setActiveLayers]    = useState<Set<string>>(new Set(['species']));
+  const [layerLoading,    setLayerLoading]    = useState<Set<string>>(new Set());
+  const [capadLegendOpen, setCapadLegendOpen] = useState(false);
 
   // ── Init map ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -336,15 +296,19 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     drawIbraLayer(ibraRecordsRef.current);
   }, [summaries, selectedId, activeLayers, drawIbraLayer]);
 
-  // ── CAPAD draw helper — real records from DB ───────────────────────────────
+  // ── CAPAD polygon draw helper — real MULTIPOLYGON boundaries from DB ───────
   /**
-   * Render each CAPAD protected area as a small square marker coloured by
-   * its IUCN management category.  Each marker opens a rich popup with:
-   *   PA name, type, IUCN cat, area (ha), governance, authority, EPBC trigger.
+   * Render each CAPAD protected area as a filled polygon coloured by its
+   * IUCN management category.  Each polygon has:
+   *   - sticky tooltip: name, IUCN badge, state · type · area
+   *   - click popup:    full detail (type, area, governance, authority, EPBC)
    *
-   * Only records with valid lat/lon are rendered.
+   * Large areas are ordered last in the API response (desc by gis_area_ha)
+   * so smaller parks paint on top — correct z-ordering without JS sorting.
+   *
+   * Only records with a non-null geom_wkt are rendered (filtered server-side).
    */
-  const drawCapadLayer = useCallback((records: CapadRecord[]) => {
+  const drawCapadPolygonLayer = useCallback((regions: CapadRegion[]) => {
     const map = mapRef.current;
     if (!map) return;
 
@@ -353,22 +317,69 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     layerGroupRef.current.set('capad', group);
 
     let rendered = 0;
-    records.forEach(r => {
-      if (r.latitude == null || r.longitude == null) return;
-      const color = capadIucnColor(r.iucn_cat);
-      L.marker([r.latitude, r.longitude], { icon: capadIcon(color) })
-        .bindPopup(capadPopup(r), { maxWidth: 260 })
-        .addTo(group);
-      rendered++;
+    regions.forEach(r => {
+      if (!r.geom_wkt) return;
+      try {
+        const geojson = wellknown.parse(r.geom_wkt);
+        if (!geojson) return;
+
+        const color = capadIucnColor(r.iucn_cat);
+        const area  = r.gis_area_ha != null
+          ? `${Number(r.gis_area_ha).toLocaleString()} ha` : '—';
+
+        const tooltipContent =
+          `<b style="font-size:12px">${r.pa_name ?? 'Protected Area'}</b>` +
+          `<br/><span style="display:inline-block;padding:1px 5px;border-radius:3px;` +
+          `font-size:10px;font-weight:700;color:white;background:${color}">` +
+          `IUCN ${r.iucn_cat ?? 'Not Reported'}</span>` +
+          `<br/><span style="font-size:10px;color:#64748b">` +
+          `${r.state ?? ''} \u00b7 ${r.pa_type ?? ''} \u00b7 ${area}</span>`;
+
+        const popupContent = `
+          <div style="min-width:210px;font-family:sans-serif;">
+            <p style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:2px">
+              ${r.pa_name ?? 'Protected Area'}
+            </p>
+            <span style="display:inline-block;padding:2px 7px;border-radius:4px;
+              font-size:10px;font-weight:700;color:white;background:${color};margin-bottom:6px">
+              IUCN ${r.iucn_cat ?? 'Not Reported'}
+            </span>
+            <div style="font-size:11px;color:#334155;line-height:1.7">
+              <p><b>Type:</b> ${r.pa_type ?? '\u2014'} (${r.pa_type_abbr ?? '\u2014'})</p>
+              <p><b>State:</b> ${r.state ?? '\u2014'}</p>
+              <p><b>Area:</b> ${area}</p>
+              <p><b>Governance:</b> ${r.governance ?? '\u2014'}</p>
+              <p><b>Authority:</b> ${r.authority ?? '\u2014'}</p>
+              <p><b>EPBC trigger:</b> ${r.epbc_trigger ?? '\u2014'}</p>
+            </div>
+          </div>`;
+
+        L.geoJSON(geojson as any, {
+          style: {
+            color,
+            weight:      1.2,
+            opacity:     0.85,
+            fillColor:   color,
+            fillOpacity: 0.18,
+          },
+        })
+          .bindTooltip(tooltipContent, { sticky: true })
+          .bindPopup(popupContent, { maxWidth: 260 })
+          .addTo(group);
+
+        rendered++;
+      } catch (err) {
+        console.warn('[MapView] CAPAD polygon parse error for', r.pa_name, err);
+      }
     });
-    console.info(`[MapView] CAPAD layer: rendered ${rendered} / ${records.length} records`);
+    console.info(`[MapView] CAPAD polygons: rendered ${rendered} / ${regions.length}`);
   }, []);
 
-  // ── Re-draw CAPAD when summaries/selection changes ─────────────────────────
+  // ── Re-draw CAPAD polygons when selection/summaries change ────────────────
   useEffect(() => {
-    if (!activeLayers.has('capad') || !capadRecordsRef.current) return;
-    drawCapadLayer(capadRecordsRef.current);
-  }, [summaries, selectedId, activeLayers, drawCapadLayer]);
+    if (!activeLayers.has('capad') || !capadRegionsRef.current) return;
+    drawCapadPolygonLayer(capadRegionsRef.current);
+  }, [summaries, selectedId, activeLayers, drawCapadPolygonLayer]);
 
   // ── Toggle dataset layers ─────────────────────────────────────────────────
   const toggleLayer = async (layerId: string) => {
@@ -408,80 +419,29 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
         }
       }
 
-      // ── CAPAD — fetch real records from capad_protected_areas ─────────────
+      // ── CAPAD — fetch real MULTIPOLYGON boundaries from capad/regions ──────
       if (layerId === 'capad') {
-        if (!capadRecordsRef.current) {
+        if (!capadRegionsRef.current) {
           /**
-           * Fetch strategy:
-           *   1. Collect the unique state codes from supplier risk summaries.
-           *      The backend's capad/by-state endpoint returns active records
-           *      only, ordered by area desc, up to 500 per state.
-           *   2. If no supplier states are known yet, fall back to a general
-           *      list (limit 1500, active only) so the layer always renders.
-           *   3. Deduplicate by pa_id to avoid duplicate markers when states
-           *      overlap or when a supplier has no ibra_code yet.
+           * Fetch strategy: two parallel pages of 2000 each → up to 4000 regions.
+           * The endpoint orders by gis_area_ha DESC so the most significant
+           * protected areas are always in page 1 even if there are > 4000 total.
+           * Deduplicate by pa_id in case of any server-side overlap between pages.
            */
-          const supplierStates = [
-            ...new Set(
-              summaries
-                .map(sm => {
-                  // ibra_code is 3 chars; we need the state string from the
-                  // supplier's enrichedAddress / region or from CAPAD state.
-                  // Fall back to fetching for each state known from suppliers.
-                  return null; // resolved below via general list
-                })
-                .filter(Boolean) as string[]
-            ),
-          ];
-
-          // Determine states from the supplier objects directly.
-          const statesFromSuppliers = [
-            ...new Set(
-              suppliers
-                .map(s => {
-                  // Use the state code embedded in the enrichedAddress or region field.
-                  // Common patterns: "..., VIC" or "Victoria" etc.
-                  const r = s.region ?? '';
-                  const match = r.match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/i);
-                  return match ? match[1].toUpperCase() : null;
-                })
-                .filter(Boolean) as string[]
-            ),
-          ];
-
-          let records: CapadRecord[];
-          if (statesFromSuppliers.length > 0) {
-            // Fetch per-state (up to 500 each, active only)
-            const pages = await Promise.all(
-              statesFromSuppliers.map(st =>
-                capadApi.byState(st, 500).catch(() => [] as CapadRecord[])
-              )
-            );
-            // Also fetch a general page for any areas without a matched state
-            const general = await capadApi.list({ is_active: true, limit: 500 }).catch(() => [] as CapadRecord[]);
-            const all = [...pages.flat(), ...general];
-            // Deduplicate by pa_id
-            const seen = new Set<string>();
-            records = all.filter(r => {
-              const key = r.pa_id ?? String(r.id);
-              if (seen.has(key)) return false;
-              seen.add(key);
-              return true;
-            });
-          } else {
-            // No supplier state info — load a general batch
-            const [p1, p2, p3] = await Promise.all([
-              capadApi.list({ is_active: true, limit: 500, offset: 0    }).catch(() => [] as CapadRecord[]),
-              capadApi.list({ is_active: true, limit: 500, offset: 500  }).catch(() => [] as CapadRecord[]),
-              capadApi.list({ is_active: true, limit: 500, offset: 1000 }).catch(() => [] as CapadRecord[]),
-            ]);
-            records = [...p1, ...p2, ...p3];
-          }
-
-          capadRecordsRef.current = records;
-          console.info(`[MapView] CAPAD: fetched ${records.length} total records`);
+          const [p1, p2] = await Promise.all([
+            capadApi.regions({ limit: 2000, offset:    0 }).catch(() => [] as CapadRegion[]),
+            capadApi.regions({ limit: 2000, offset: 2000 }).catch(() => [] as CapadRegion[]),
+          ]);
+          const seen = new Set<string>();
+          capadRegionsRef.current = [...p1, ...p2].filter(r => {
+            const key = r.pa_id ?? String(r.id);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+          console.info(`[MapView] CAPAD: fetched ${capadRegionsRef.current.length} polygon regions`);
         }
-        drawCapadLayer(capadRecordsRef.current);
+        drawCapadPolygonLayer(capadRegionsRef.current);
       }
 
       // ── KBA ───────────────────────────────────────────────────────────────

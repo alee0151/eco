@@ -9,6 +9,7 @@ Endpoints:
   GET /api/biodiversity/species/by-bbox             — species within a bounding box
   GET /api/biodiversity/kba                         — Key Biodiversity Areas (paginated)
   GET /api/biodiversity/capad                       — Protected areas (paginated)
+  GET /api/biodiversity/capad/regions               — Protected area polygons (geom_wkt, for map rendering)
   GET /api/biodiversity/capad/by-state/{state}      — Protected areas filtered by state
   GET /api/biodiversity/ibra                        — IBRA bioregions
   GET /api/biodiversity/ibra/{code}                 — Single IBRA region by code
@@ -171,6 +172,40 @@ async def list_capad(
     return result.scalars().all()
 
 
+@router.get("/biodiversity/capad/regions")
+async def capad_regions(
+    state:    Optional[str] = Query(None, description="Filter by state e.g. VIC"),
+    limit:    int           = Query(2000, ge=1, le=5000),
+    offset:   int           = Query(0,   ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return CAPAD protected areas as a lightweight list for polygon rendering.
+    Only rows with a non-null geom_wkt are returned.
+
+    Fields: id, pa_id, pa_name, pa_type, pa_type_abbr, iucn_cat, state,
+            gis_area_ha, governance, authority, epbc_trigger, geom_wkt.
+
+    Ordered by area descending so the largest regions render first and smaller
+    regions paint on top (correct z-ordering without explicit z-index).
+    """
+    q = (
+        select(
+            Capad.id, Capad.pa_id, Capad.pa_name, Capad.pa_type,
+            Capad.pa_type_abbr, Capad.iucn_cat, Capad.state,
+            Capad.gis_area_ha, Capad.governance, Capad.authority,
+            Capad.epbc_trigger, Capad.geom_wkt,
+        )
+        .where(Capad.geom_wkt.isnot(None))
+        .where(Capad.is_active == True)  # noqa: E712
+    )
+    if state:
+        q = q.where(Capad.state.ilike(f"%{state}%"))
+    q = q.order_by(Capad.gis_area_ha.desc()).limit(limit).offset(offset)
+    rows = (await db.execute(q)).mappings().all()
+    return [dict(r) for r in rows]
+
+
 @router.get("/biodiversity/capad/by-state/{state}", response_model=List[CapadOut])
 async def capad_by_state(
     state: str,
@@ -310,23 +345,6 @@ async def risk_summary(
 
     # ──────────────────────────────────────────────────────────────────────────
     # 2. Threatened species — distinct count + names, both from the same CTE
-    #
-    # FIX: previously the count deduped on vernacularname (a display string),
-    # which:
-    #   (a) excluded species where vernacularname IS NULL
-    #   (b) double-counted species that appear with >1 name spelling in ALA
-    #   (c) used a separate GROUP BY query for the names list, so count and
-    #       list could diverge.
-    #
-    # Now we:
-    #   1. Build a CTE that selects DISTINCT taxonconceptid (stable ALA species
-    #      identifier) + one representative vernacularname per concept via
-    #      MIN(vernacularname) FILTER (WHERE vernacularname IS NOT NULL).
-    #   2. Derive species_count = COUNT(*) on the CTE  → distinct species only.
-    #   3. Derive species_names from the same CTE, alphabetical, limit 20.
-    #
-    # taxonconceptid NULLs are excluded — they cannot be reliably identified
-    # as threatened species (no stable identifier → could be anything).
     # ──────────────────────────────────────────────────────────────────────────
     threatened_cte = (
         select(
@@ -351,13 +369,11 @@ async def risk_summary(
         .cte("threatened_species")
     )
 
-    # Distinct species count — one row per taxonconceptid
     count_result = await db.execute(
         select(func.count()).select_from(threatened_cte)
     )
     species_count = count_result.scalar() or 0
 
-    # Representative names — same CTE, alphabetical, top 20
     names_result = await db.execute(
         select(threatened_cte.c.representative_name)
         .where(threatened_cte.c.representative_name.isnot(None))
