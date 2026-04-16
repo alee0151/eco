@@ -68,8 +68,6 @@ def _resolve_state(raw: str) -> str:
 # ---------------------------------------------------------------------------
 # Quality filters applied to all species proximity / risk queries
 # ---------------------------------------------------------------------------
-THREATENED_RESOURCE_FILTER = Species.dataresourcename.ilike("%threatened%")
-
 SPECIES_QUALITY_FILTERS = [
     Species.occurrencestatus.ilike("present"),
     Species.is_obscured.is_(False),
@@ -290,6 +288,7 @@ async def risk_summary(
 
     2. Species      — distinct threatened-species count + representative names,
                       both from the same CTE in a single DB round-trip.
+                      Threatened filter covers: threatened, sensitive, epbc resources.
 
     3. CAPAD count  — ST_DWithin on real polygon geometry so parks that *overlap*
                       the search radius are counted even if their centroid is outside
@@ -305,8 +304,6 @@ async def risk_summary(
     supplier_point = ST_SetSRID(ST_MakePoint(lng, lat), 4326)
 
     # ── 1. IBRA — single distance-ordered query ────────────────────────────
-    # ST_Distance returns 0 when the point is inside the polygon, so the
-    # containing region sorts first.  No separate fallback query needed.
     async def _ibra() -> tuple[str | None, str | None]:
         result = await db.execute(
             text("""
@@ -322,8 +319,11 @@ async def risk_summary(
         return (row[0] if row else None, row[1] if row else None)
 
     # ── 2. Species — count + names in one CTE round-trip ──────────────────
+    # Threatened filter widened to cover all ALA sensitive/threatened resources:
+    #   %%threatened%%  — ALA Threatened Species lists
+    #   %%sensitive%%   — ALA Sensitive Species List
+    #   %%epbc%%        — EPBC Act listed species
     async def _species() -> tuple[int, list[str]]:
-        # Single query: CTE groups by taxon concept → count rows + fetch names
         rows = (await db.execute(
             text("""
                 WITH threatened AS (
@@ -337,7 +337,11 @@ async def risk_summary(
                       AND  decimallongitude IS NOT NULL
                       AND  decimallatitude  BETWEEN :min_lat AND :max_lat
                       AND  decimallongitude BETWEEN :min_lng AND :max_lng
-                      AND  dataresourcename ILIKE '%%threatened%%'
+                      AND  (
+                               dataresourcename ILIKE '%%threatened%%'
+                            OR dataresourcename ILIKE '%%sensitive%%'
+                            OR dataresourcename ILIKE '%%epbc%%'
+                           )
                       AND  occurrencestatus ILIKE 'present'
                       AND  is_obscured IS NOT TRUE
                       AND  basisofrecord IN ('HUMAN_OBSERVATION', 'MACHINE_OBSERVATION')
@@ -357,10 +361,6 @@ async def risk_summary(
         return count, names
 
     # ── 3. CAPAD — ST_DWithin on real polygon geometry ────────────────────
-    # Counts protected areas whose polygon boundary comes within buffer_metres
-    # of the supplier point.  Parks are counted even when the supplier sits
-    # inside the park (distance = 0) or the park overlaps the radius without
-    # its centroid being inside the bbox.
     async def _capad() -> int:
         buffer_metres = buffer_deg * 111_000  # 1 deg ≈ 111 km
         try:
@@ -387,6 +387,7 @@ async def risk_summary(
                 .where(Capad.longitude.isnot(None))
                 .where(Capad.latitude.between(min_lat, max_lat))
                 .where(Capad.longitude.between(min_lng, max_lng))
+                .where(Capad.is_active == True)  # noqa: E712
             )
             return result.scalar() or 0
 
