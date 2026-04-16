@@ -1,7 +1,16 @@
 /**
  * types.ts — Canonical frontend Supplier type.
- * Matches SupplierRecord from the DB (via backend schemas.py).
  */
+
+export interface ParsedAddress {
+  unit:      string;
+  street:    string;
+  suburb:    string;
+  state:     string;
+  postcode:  string;
+  country:   string;
+  formatted: string;   // geocodable single-line string
+}
 
 export interface Supplier {
   id: string;
@@ -17,9 +26,12 @@ export interface Supplier {
   enrichedName?: string;
   enrichedAddress?: string;
   abrStatus?: string;
+  entityType?: string;
   abnFound?: boolean;
   nameDiscrepancy?: boolean;
   addressDiscrepancy?: boolean;
+  // LLM-parsed structured address (set after /api/parse-address)
+  parsedAddress?: ParsedAddress;
   // Location (set after geocoding)
   coordinates?: { lat: number; lng: number };
   resolutionLevel?: "facility" | "regional" | "state" | "unknown";

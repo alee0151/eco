@@ -26,9 +26,10 @@ import {
   Hash,
   Tag,
   Layers,
+  Building2,
 } from "lucide-react";
 
-/* ─── Leaflet icon fix ─────────────────────────────────────── */
+/* ─── Leaflet icon fix ─────────────────────────────────────────────── */
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 import markerIcon from "leaflet/dist/images/marker-icon.png";
 import markerShadow from "leaflet/dist/images/marker-shadow.png";
@@ -36,7 +37,7 @@ import markerShadow from "leaflet/dist/images/marker-shadow.png";
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({ iconUrl: markerIcon, iconRetinaUrl: markerIcon2x, shadowUrl: markerShadow });
 
-/* ─── State centroids (fallback when Nominatim finds nothing) ─ */
+/* ─── State centroids (fallback) ─────────────────────────────────────── */
 const STATE_CENTROIDS: Record<string, { lat: number; lng: number }> = {
   NSW: { lat: -32.1656, lng: 147.0000 },
   VIC: { lat: -37.0201, lng: 144.9646 },
@@ -47,28 +48,42 @@ const STATE_CENTROIDS: Record<string, { lat: number; lng: number }> = {
   ACT: { lat: -35.4735, lng: 149.0124 },
   NT:  { lat: -19.4914, lng: 132.5510 },
 };
-// Default centre-of-Australia fallback
 const AUS_CENTRE = { lat: -25.2744, lng: 133.7751 };
 
 /**
- * Geocode a free-text address using the Nominatim OSM public API.
- * Returns { lat, lng, level } where level is 'address' | 'state' | 'country'.
+ * Best geocoding address for a supplier.
  *
- * Fix (bug 1): The previous implementation had a silent catch{} that swallowed
- * ALL errors — including 429 rate-limit responses and CORS/network failures —
- * causing every supplier to fall through to the AUS_CENTRE country fallback
- * and appear on the same coordinates.
- *
- * Now:
- * - HTTP errors and empty results are distinguished from network failures.
- * - 429 Too Many Requests triggers a single 2-second back-off retry.
- * - All failures are logged to the console for visibility.
- * - Only after a genuine Nominatim failure does the function fall back to
- *   state centroid (detected from address string) or country centre.
- *
- * Rate limit: Nominatim allows 1 request/second.
- * The caller is responsible for staggering calls (see geocodeAll).
+ * Priority order:
+ *   1. enrichedAddress  (ABR-validated)          — most authoritative
+ *   2. parsedAddress.formatted  (LLM-structured) — clean, unambiguous
+ *   3. address  (raw CSV/OCR)                    — last resort
+ *   4. region                                    — absolute fallback
  */
+function bestGeoAddress(s: Supplier): string {
+  return (
+    s.enrichedAddress?.trim() ||
+    s.parsedAddress?.formatted?.trim() ||
+    s.address?.trim() ||
+    s.region?.trim() ||
+    ""
+  );
+}
+
+/**
+ * Best display address for UI (card subtitle, popup, export).
+ * Prefers the structured parsed address for human readability;
+ * falls back to enriched → raw → region.
+ */
+function bestDisplayAddress(s: Supplier): string {
+  return (
+    s.enrichedAddress?.trim() ||
+    s.parsedAddress?.formatted?.trim() ||
+    s.address?.trim() ||
+    s.region?.trim() ||
+    "No address"
+  );
+}
+
 async function geocodeAddress(
   address: string
 ): Promise<{ lat: number; lng: number; level: string }> {
@@ -94,54 +109,43 @@ async function geocodeAddress(
     });
 
     if (res.status === 429) {
-      // Rate limited — wait 2 s and retry once
-      console.warn("[geocodeAddress] 429 rate-limited, retrying in 2 s for:", address);
+      console.warn("[geocodeAddress] 429 rate-limited, retrying in 2s for:", address);
       await new Promise((r) => setTimeout(r, 2000));
       const retry = await fetch(url, {
         headers: { "Accept-Language": "en", "User-Agent": "eco-supply-chain-app" },
       });
       if (!retry.ok) {
-        console.error("[geocodeAddress] Retry failed:", retry.status, address);
         nominatimFailed = true;
       } else {
         const retryData = await retry.json();
         const result = parseResult(retryData);
         if (result) return result;
-        nominatimFailed = true; // empty result after retry
+        nominatimFailed = true;
       }
     } else if (!res.ok) {
-      console.error("[geocodeAddress] HTTP error:", res.status, address);
       nominatimFailed = true;
     } else {
       const data = await res.json();
       const result = parseResult(data);
       if (result) return result;
-      // Empty result — not an error, just no match
-      console.info("[geocodeAddress] No match found for:", address);
       nominatimFailed = true;
     }
   } catch (err) {
-    // Network error or Nominatim down
-    console.warn("[geocodeAddress] Network/fetch error for:", address, err);
+    console.warn("[geocodeAddress] Network error for:", address, err);
     nominatimFailed = true;
   }
 
-  // Fallback 1: detect state token in address string → use state centroid
-  if (nominatimFailed || true) {
+  if (nominatimFailed) {
     const stateMatch = address.toUpperCase().match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/);
     if (stateMatch) {
-      const c = STATE_CENTROIDS[stateMatch[1]];
-      console.info("[geocodeAddress] State centroid fallback →", stateMatch[1], c);
-      return { ...c, level: "state" };
+      return { ...STATE_CENTROIDS[stateMatch[1]], level: "state" };
     }
   }
 
-  // Fallback 2: centre of Australia
-  console.warn("[geocodeAddress] Country centroid fallback for:", address);
   return { ...AUS_CENTRE, level: "country" };
 }
 
-/* ─── Helpers ─────────────────────────────────────────────── */
+/* ─── Helpers ───────────────────────────────────────────────────── */
 type ConfidenceTier = "all" | "high" | "medium" | "low";
 
 const scoreTier = (score: number): "high" | "medium" | "low" =>
@@ -170,23 +174,18 @@ function createMarkerIcon(score: number, selected: boolean) {
   });
 }
 
-/* ─── Score badge ────────────────────────────────────────── */
+/* ─── Score badge ───────────────────────────────────────────────── */
 function ScoreBadge({ score }: { score: number }) {
   const t = TIER_COLORS[scoreTier(score)];
   return (
-    <div
-      className={clsx(
-        "w-11 h-11 rounded-xl border flex flex-col items-center justify-center flex-shrink-0",
-        t.bg, t.border, t.text
-      )}
-    >
+    <div className={clsx("w-11 h-11 rounded-xl border flex flex-col items-center justify-center flex-shrink-0", t.bg, t.border, t.text)}>
       <span className="text-base leading-none" style={{ fontWeight: 700 }}>{score}</span>
       <span className="text-[8px] uppercase tracking-wide" style={{ fontWeight: 700 }}>score</span>
     </div>
   );
 }
 
-/* ─── Supplier card ──────────────────────────────────────── */
+/* ─── Supplier card ─────────────────────────────────────────────── */
 interface CardProps {
   supplier: Supplier;
   selected: boolean;
@@ -213,18 +212,20 @@ function SupplierCard({
   const tc = TIER_COLORS[tier];
 
   const displayName = supplier.enrichedName || supplier.name || "Unknown";
-  const displayAddr = supplier.enrichedAddress || supplier.address || "No address";
+  const displayAddr = bestDisplayAddress(supplier);
+
+  // Structured address breakdown for expanded view
+  const pa = supplier.parsedAddress;
+  const hasStructured = pa && (pa.street || pa.suburb || pa.postcode);
 
   return (
     <div
       ref={cardRef}
       className={clsx(
         "rounded-xl border overflow-hidden transition-all duration-200",
-        selected
-          ? "border-emerald-300 shadow-md shadow-emerald-100/60"
-          : expanded
-          ? "border-slate-300 shadow-sm"
-          : "border-slate-200 hover:border-slate-300",
+        selected     ? "border-emerald-300 shadow-md shadow-emerald-100/60"
+        : expanded   ? "border-slate-300 shadow-sm"
+        : "border-slate-200 hover:border-slate-300",
         supplier.status === "approved" && "ring-1 ring-emerald-200",
         supplier.status === "rejected" && "ring-1 ring-red-100 opacity-60",
         "bg-white"
@@ -239,16 +240,13 @@ function SupplierCard({
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5">
-            <p className="text-sm text-slate-900 truncate" style={{ fontWeight: 600 }}>
-              {displayName}
-            </p>
+            <p className="text-sm text-slate-900 truncate" style={{ fontWeight: 600 }}>{displayName}</p>
             {supplier.status === "approved" && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 flex-shrink-0" />}
             {supplier.status === "rejected" && <X className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />}
           </div>
           <p className="text-[11px] text-slate-400 truncate mt-0.5">{displayAddr}</p>
         </div>
 
-        {/* Tier pill */}
         <span
           className={clsx("hidden sm:inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full flex-shrink-0", tc.bg, tc.text)}
           style={{ fontWeight: 600 }}
@@ -257,9 +255,7 @@ function SupplierCard({
           {tier.charAt(0).toUpperCase() + tier.slice(1)}
         </span>
 
-        {expanded
-          ? <ChevronUp className="w-4 h-4 text-slate-400 flex-shrink-0" />
-          : <ChevronDown className="w-4 h-4 text-slate-400 flex-shrink-0" />}
+        {expanded ? <ChevronUp className="w-4 h-4 text-slate-400 flex-shrink-0" /> : <ChevronDown className="w-4 h-4 text-slate-400 flex-shrink-0" />}
       </div>
 
       {/* Expanded detail */}
@@ -274,7 +270,6 @@ function SupplierCard({
           >
             <div className="p-4">
               {editing ? (
-                /* ── Edit mode ── */
                 <div className="space-y-3">
                   <div className="grid grid-cols-2 gap-3">
                     {[
@@ -294,22 +289,21 @@ function SupplierCard({
                     ))}
                   </div>
                   <div className="flex justify-end gap-2 pt-1">
-                    <button onClick={onCancelEdit} className="px-3 py-1.5 text-xs border border-slate-200 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors" style={{ fontWeight: 500 }}>
-                      Cancel
-                    </button>
+                    <button onClick={onCancelEdit} className="px-3 py-1.5 text-xs border border-slate-200 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors" style={{ fontWeight: 500 }}>Cancel</button>
                     <button onClick={onSaveEdit} className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors" style={{ fontWeight: 500 }}>
                       <Save className="w-3 h-3" /> Save
                     </button>
                   </div>
                 </div>
               ) : (
-                /* ── View mode ── */
                 <div className="space-y-4">
+
                   {/* Meta grid */}
                   <div className="grid grid-cols-2 gap-x-4 gap-y-2.5">
-                    <DataRow icon={Tag}     label="Commodity" value={supplier.commodity || "—"} />
-                    <DataRow icon={Hash}    label="ABN"       value={supplier.abn || "—"} />
-                    <DataRow icon={MapPin}  label="Coords"
+                    <DataRow icon={Tag}       label="Commodity"   value={supplier.commodity || "—"} />
+                    <DataRow icon={Hash}      label="ABN"         value={supplier.abn || "—"} />
+                    <DataRow icon={Building2} label="Entity Type" value={supplier.entityType || "—"} />
+                    <DataRow icon={MapPin}    label="Coords"
                       value={
                         supplier.coordinates
                           ? `${supplier.coordinates.lat.toFixed(4)}, ${supplier.coordinates.lng.toFixed(4)}${
@@ -318,10 +312,30 @@ function SupplierCard({
                           : "Unmapped"
                       }
                     />
-                    <DataRow icon={FileText} label="Source"   value={supplier.fileName || "Upload"} />
+                    <DataRow icon={FileText}  label="Source"      value={supplier.fileName || "Upload"} />
                   </div>
 
-                  {/* ABN status bar */}
+                  {/* Structured address breakdown (from LLM parser) */}
+                  {hasStructured && (
+                    <div className="bg-violet-50 border border-violet-100 rounded-lg px-3 py-2.5 space-y-1">
+                      <p className="text-[10px] text-violet-500 uppercase tracking-wide mb-1.5" style={{ fontWeight: 700 }}>
+                        📍 Parsed Address
+                      </p>
+                      <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px]">
+                        {pa!.unit     && <><span className="text-violet-400">Unit</span>     <span className="text-slate-700">{pa!.unit}</span></>}
+                        {pa!.street   && <><span className="text-violet-400">Street</span>   <span className="text-slate-700 col-span-1">{pa!.street}</span></>}
+                        {pa!.suburb   && <><span className="text-violet-400">Suburb</span>   <span className="text-slate-700">{pa!.suburb}</span></>}
+                        {pa!.state    && <><span className="text-violet-400">State</span>    <span className="text-slate-700">{pa!.state}</span></>}
+                        {pa!.postcode && <><span className="text-violet-400">Postcode</span> <span className="text-slate-700">{pa!.postcode}</span></>}
+                        {pa!.country  && <><span className="text-violet-400">Country</span>  <span className="text-slate-700">{pa!.country}</span></>}
+                      </div>
+                      <p className="text-[10px] text-violet-400 mt-1 truncate">
+                        Geocoded as: <span className="text-slate-600">{pa!.formatted}</span>
+                      </p>
+                    </div>
+                  )}
+
+                  {/* ABN status */}
                   <div className="flex items-center justify-between text-[11px] bg-slate-50 rounded-lg px-3 py-2">
                     <span className="text-slate-500">ABN Status</span>
                     <span
@@ -357,7 +371,7 @@ function SupplierCard({
                     </div>
                   </div>
 
-                  {/* Action buttons */}
+                  {/* Actions */}
                   <div className="flex gap-2 pt-0.5">
                     <button
                       onClick={(e) => { e.stopPropagation(); onStartEdit(); }}
@@ -370,9 +384,7 @@ function SupplierCard({
                       onClick={(e) => { e.stopPropagation(); onApprove(); }}
                       className={clsx(
                         "flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-xs rounded-lg transition-colors",
-                        supplier.status === "approved"
-                          ? "bg-emerald-700 text-white"
-                          : "bg-emerald-600 hover:bg-emerald-700 text-white"
+                        supplier.status === "approved" ? "bg-emerald-700 text-white" : "bg-emerald-600 hover:bg-emerald-700 text-white"
                       )}
                       style={{ fontWeight: 500 }}
                     >
@@ -383,9 +395,7 @@ function SupplierCard({
                       onClick={(e) => { e.stopPropagation(); onReject(); }}
                       className={clsx(
                         "flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-xs rounded-lg transition-colors",
-                        supplier.status === "rejected"
-                          ? "bg-red-600 text-white"
-                          : "border border-red-200 text-red-500 hover:bg-red-50"
+                        supplier.status === "rejected" ? "bg-red-600 text-white" : "border border-red-200 text-red-500 hover:bg-red-50"
                       )}
                       style={{ fontWeight: 500 }}
                     >
@@ -414,23 +424,18 @@ function DataRow({ icon: Icon, label, value }: { icon: React.ElementType; label:
   );
 }
 
-/* ─── Main page ──────────────────────────────────────────── */
+/* ─── Main page ───────────────────────────────────────────────── */
 export function MapPage() {
   const { suppliers, updateSupplier } = useSuppliers();
 
-  // Map state
   const [geocoding, setGeocoding] = useState(true);
   const [geocodeProgress, setGeocodeProgress] = useState({ done: 0, total: 0 });
   const mapRef = useRef<L.Map | null>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, L.Marker>>(new Map());
   const onMarkerClickRef = useRef<(id: string) => void>(() => {});
-
-  // Track which supplier IDs have already been geocoded this session
-  // so we never call Nominatim twice for the same supplier.
   const geocodedIds = useRef<Set<string>>(new Set());
 
-  // Review state
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -439,10 +444,8 @@ export function MapPage() {
   const [filter, setFilter] = useState<ConfidenceTier>("all");
   const [mobileTab, setMobileTab] = useState<"map" | "list">("list");
 
-  // Card scroll refs
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
-  // Keep marker click handler up to date
   onMarkerClickRef.current = useCallback((id: string) => {
     setSelectedId(id);
     setExpandedId(id);
@@ -461,39 +464,23 @@ export function MapPage() {
     return () => { map.remove(); mapRef.current = null; };
   }, []);
 
-  /* ── Geocode ─────────────────────────────────────────────────────────────
-   *
-   * For each supplier that doesn't yet have coordinates, call the Nominatim
-   * OSM API with their full address string.  Requests are staggered 1 second
-   * apart to stay within Nominatim's 1 req/s rate limit.
-   *
-   * Fix (bug 2): geocodedIds ref is now pruned at the start of each run to
-   * remove IDs that no longer exist in the current supplier list. This ensures
-   * reloaded suppliers (same IDs) are re-geocoded when coordinates are absent.
-   *
-   * Fix (bug 3): the effect previously depended only on suppliers.length,
-   * meaning reloading the same number of suppliers never triggered re-geocoding.
-   * Now it depends on a stable supplierKey (joined ID string) so any change
-   * in the supplier set — including same-count reloads — triggers a re-check.
+  /* ── Geocode loop ─────────────────────────────────────────────────────
+   * Uses bestGeoAddress() so parsedAddress.formatted is preferred
+   * over the raw CSV address when enrichedAddress is absent.
    */
   const supplierKey = suppliers.map((s) => s.id).join(",");
 
   useEffect(() => {
-    // Prune stale IDs from the geocoded cache (fix bug 2)
     const currentIds = new Set(suppliers.map((s) => s.id));
     for (const id of geocodedIds.current) {
       if (!currentIds.has(id)) geocodedIds.current.delete(id);
     }
 
-    // Suppliers that still need geocoding
     const needsGeocode = suppliers.filter(
       (s) => !s.coordinates && !geocodedIds.current.has(s.id)
     );
 
-    if (needsGeocode.length === 0) {
-      setGeocoding(false);
-      return;
-    }
+    if (needsGeocode.length === 0) { setGeocoding(false); return; }
 
     setGeocoding(true);
     setGeocodeProgress({ done: 0, total: needsGeocode.length });
@@ -504,23 +491,23 @@ export function MapPage() {
       for (let i = 0; i < needsGeocode.length; i++) {
         if (cancelled) break;
         const s = needsGeocode[i];
-        geocodedIds.current.add(s.id);  // mark before await to prevent double-calls
+        geocodedIds.current.add(s.id);
 
-        const address = s.enrichedAddress || s.address || s.region || "";
+        // ✓ Use bestGeoAddress() — prefers enriched → parsed → raw → region
+        const address = bestGeoAddress(s);
         const { lat, lng, level } = await geocodeAddress(address);
 
         updateSupplier(s.id, {
           coordinates:     { lat, lng },
-          resolutionLevel: level === "address" ? "facility" : level === "state" ? "state" : "country",
-          inferenceMethod: level === "address" ? "Nominatim OSM geocoding" : level === "state" ? "State centroid fallback" : "Country centroid fallback",
+          resolutionLevel: level === "address" ? "facility" : level === "state" ? "state" : "unknown",
+          inferenceMethod: level === "address"
+            ? (s.parsedAddress?.formatted ? "parsed+Nominatim" : "Nominatim OSM")
+            : level === "state" ? "state centroid fallback"
+            : "country centroid fallback",
         });
 
         setGeocodeProgress({ done: i + 1, total: needsGeocode.length });
-
-        // Respect Nominatim's 1 req/s rate limit
-        if (i < needsGeocode.length - 1) {
-          await new Promise((r) => setTimeout(r, 1100));
-        }
+        if (i < needsGeocode.length - 1) await new Promise((r) => setTimeout(r, 1100));
       }
       if (!cancelled) setGeocoding(false);
     };
@@ -528,13 +515,12 @@ export function MapPage() {
     geocodeAll();
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [supplierKey]);  // re-run whenever the set of supplier IDs changes (fix bug 3)
+  }, [supplierKey]);
 
   /* ── Render markers ── */
   useEffect(() => {
     if (geocoding || !mapRef.current) return;
 
-    // Remove stale markers
     markersRef.current.forEach((marker, id) => {
       if (!suppliers.find((s) => s.id === id)) {
         marker.remove();
@@ -552,19 +538,49 @@ export function MapPage() {
       const isSelected = s.id === selectedId;
       const icon = createMarkerIcon(s.confidenceScore || 0, isSelected);
 
+      const popupAddr = bestDisplayAddress(s);
+
+      // Show structured breakdown in popup if available
+      const pa = s.parsedAddress;
+      const structuredLine = pa?.suburb
+        ? `<p style="font-size:10px;color:#7c3aed;margin-top:2px">📍 ${[pa.street, pa.suburb, pa.state, pa.postcode].filter(Boolean).join(" · ")}</p>`
+        : "";
+
       const existing = markersRef.current.get(s.id);
       if (existing) {
         existing.setIcon(icon);
+        existing.setPopupContent(
+          `<div style="min-width:200px">
+            <p style="font-weight:700;font-size:13px;color:#0f172a">${s.enrichedName || s.name}</p>
+            <p style="font-size:11px;color:#64748b;margin-top:3px">${popupAddr}</p>
+            ${structuredLine}
+            <p style="font-size:11px;margin-top:6px;font-weight:600;color:${
+              (s.confidenceScore || 0) >= 80 ? "#059669" :
+              (s.confidenceScore || 0) >= 50 ? "#d97706" : "#dc2626"
+            }">Confidence: ${s.confidenceScore || 0}%</p>
+            <p style="font-size:10px;color:#94a3b8;margin-top:2px">${
+              s.resolutionLevel ? `Precision: ${s.resolutionLevel}` : ""
+            }${
+              s.inferenceMethod ? ` · ${s.inferenceMethod}` : ""
+            }</p>
+          </div>`
+        );
       } else {
         const marker = L.marker(pos, { icon }).addTo(mapRef.current!);
         marker.bindPopup(
-          `<div style="min-width:180px">
+          `<div style="min-width:200px">
             <p style="font-weight:700;font-size:13px;color:#0f172a">${s.enrichedName || s.name}</p>
-            <p style="font-size:11px;color:#64748b;margin-top:3px">${s.enrichedAddress || s.address || "No address"}</p>
-            <p style="font-size:11px;margin-top:6px;font-weight:600;color:${(s.confidenceScore || 0) >= 80 ? "#059669" : (s.confidenceScore || 0) >= 50 ? "#d97706" : "#dc2626"}">
-              Confidence: ${s.confidenceScore || 0}%
-            </p>
-            <p style="font-size:10px;color:#94a3b8;margin-top:2px">${s.resolutionLevel ? `Location precision: ${s.resolutionLevel}` : ""}</p>
+            <p style="font-size:11px;color:#64748b;margin-top:3px">${popupAddr}</p>
+            ${structuredLine}
+            <p style="font-size:11px;margin-top:6px;font-weight:600;color:${
+              (s.confidenceScore || 0) >= 80 ? "#059669" :
+              (s.confidenceScore || 0) >= 50 ? "#d97706" : "#dc2626"
+            }">Confidence: ${s.confidenceScore || 0}%</p>
+            <p style="font-size:10px;color:#94a3b8;margin-top:2px">${
+              s.resolutionLevel ? `Precision: ${s.resolutionLevel}` : ""
+            }${
+              s.inferenceMethod ? ` · ${s.inferenceMethod}` : ""
+            }</p>
           </div>`
         );
         marker.on("click", () => onMarkerClickRef.current(s.id));
@@ -582,7 +598,7 @@ export function MapPage() {
     if (!selectedId || !mapRef.current) return;
     const s = suppliers.find((s) => s.id === selectedId);
     if (s?.coordinates) {
-      mapRef.current.setView([s.coordinates.lat, s.coordinates.lng], 8, { animate: true });
+      mapRef.current.setView([s.coordinates.lat, s.coordinates.lng], 10, { animate: true });
       const marker = markersRef.current.get(s.id);
       setTimeout(() => marker?.openPopup(), 400);
     }
@@ -590,22 +606,30 @@ export function MapPage() {
 
   /* ── Export CSV ── */
   const handleExport = useCallback(() => {
-    if (suppliers.length === 0) {
-      toast.error("No suppliers to export.");
-      return;
-    }
-    const headers = ["Name", "ABN", "Address", "Commodity", "Region", "Latitude", "Longitude", "Confidence", "Status", "Resolution Level"];
+    if (suppliers.length === 0) { toast.error("No suppliers to export."); return; }
+    const headers = [
+      "Name", "ABN", "Entity Type",
+      "Parsed Street", "Parsed Suburb", "Parsed State", "Parsed Postcode",
+      "Formatted Address",
+      "Latitude", "Longitude", "Resolution", "Inference Method",
+      "Confidence", "Status", "Commodity",
+    ];
     const rows = suppliers.map((s) => [
       s.enrichedName || s.name || "",
       s.abn || "",
-      s.enrichedAddress || s.address || "",
-      s.commodity || "",
-      s.region || "",
+      s.entityType || "",
+      s.parsedAddress?.street   || "",
+      s.parsedAddress?.suburb   || "",
+      s.parsedAddress?.state    || "",
+      s.parsedAddress?.postcode || "",
+      bestDisplayAddress(s),
       s.coordinates?.lat?.toFixed(6) ?? "",
       s.coordinates?.lng?.toFixed(6) ?? "",
+      s.resolutionLevel || "",
+      s.inferenceMethod || "",
       s.confidenceScore ?? "",
       s.status || "",
-      s.resolutionLevel || "",
+      s.commodity || "",
     ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
     const csv = [headers.join(","), ...rows].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
@@ -619,35 +643,12 @@ export function MapPage() {
   }, [suppliers]);
 
   /* ── Handlers ── */
-  const handleSelect = (id: string) => {
-    setSelectedId((prev) => (prev === id ? null : id));
-    setMobileTab("map");
-  };
-
-  const handleToggleExpand = (id: string) => {
-    setExpandedId((prev) => (prev === id ? null : id));
-  };
-
-  const handleStartEdit = (s: Supplier) => {
-    setEditingId(s.id);
-    setEditForm({ ...s });
-  };
-
-  const handleSaveEdit = (id: string) => {
-    updateSupplier(id, editForm);
-    setEditingId(null);
-    toast.success("Changes saved");
-  };
-
-  const handleApprove = (id: string) => {
-    updateSupplier(id, { status: "approved" });
-    toast.success("Supplier approved");
-  };
-
-  const handleReject = (id: string) => {
-    updateSupplier(id, { status: "rejected" });
-    toast.success("Supplier rejected", { description: "Marked for review." });
-  };
+  const handleSelect = (id: string) => { setSelectedId((p) => p === id ? null : id); setMobileTab("map"); };
+  const handleToggleExpand = (id: string) => setExpandedId((p) => p === id ? null : id);
+  const handleStartEdit = (s: Supplier) => { setEditingId(s.id); setEditForm({ ...s }); };
+  const handleSaveEdit = (id: string) => { updateSupplier(id, editForm); setEditingId(null); toast.success("Changes saved"); };
+  const handleApprove = (id: string) => { updateSupplier(id, { status: "approved" }); toast.success("Supplier approved"); };
+  const handleReject  = (id: string) => { updateSupplier(id, { status: "rejected" }); toast.success("Supplier rejected", { description: "Marked for review." }); };
 
   /* ── Filtered list ── */
   const filtered = suppliers.filter((s) => {
@@ -656,6 +657,7 @@ export function MapPage() {
       (s.name || "").toLowerCase().includes(term) ||
       (s.enrichedName || "").toLowerCase().includes(term) ||
       (s.address || "").toLowerCase().includes(term) ||
+      (s.parsedAddress?.formatted || "").toLowerCase().includes(term) ||
       (s.commodity || "").toLowerCase().includes(term);
     const matchTier = filter === "all" || scoreTier(s.confidenceScore || 0) === filter;
     return matchText && matchTier;
@@ -664,25 +666,23 @@ export function MapPage() {
   /* ── Stats ── */
   const approvedCount = suppliers.filter((s) => s.status === "approved").length;
   const rejectedCount = suppliers.filter((s) => s.status === "rejected").length;
-  const pendingCount = suppliers.filter((s) => s.status !== "approved" && s.status !== "rejected").length;
-  const highCount    = suppliers.filter((s) => scoreTier(s.confidenceScore || 0) === "high").length;
-  const mediumCount  = suppliers.filter((s) => scoreTier(s.confidenceScore || 0) === "medium").length;
-  const lowCount     = suppliers.filter((s) => scoreTier(s.confidenceScore || 0) === "low").length;
+  const pendingCount  = suppliers.filter((s) => s.status !== "approved" && s.status !== "rejected").length;
+  const highCount     = suppliers.filter((s) => scoreTier(s.confidenceScore || 0) === "high").length;
+  const mediumCount   = suppliers.filter((s) => scoreTier(s.confidenceScore || 0) === "medium").length;
+  const lowCount      = suppliers.filter((s) => scoreTier(s.confidenceScore || 0) === "low").length;
 
   /* ─── Render ─── */
   return (
     <div className="flex flex-col h-[calc(100vh-7.5rem)] gap-4">
 
-      {/* ── Header ── */}
+      {/* Header */}
       <div className="flex items-start justify-between flex-shrink-0">
         <div>
-          <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Map & Review</h1>
+          <h1 className="text-2xl text-slate-900" style={{ fontWeight: 700 }}>Map &amp; Review</h1>
           <p className="text-sm text-slate-500 mt-0.5">
-            Supplier locations geocoded via OpenStreetMap Nominatim — review, edit and approve records.
+            Addresses parsed by LLM · validated via ABR · geocoded via Nominatim OSM
           </p>
         </div>
-
-        {/* Stats + export */}
         <div className="flex items-center gap-3">
           <div className="hidden md:flex items-center gap-2">
             {[
@@ -705,17 +705,13 @@ export function MapPage() {
         </div>
       </div>
 
-      {/* ── Mobile tab toggle ── */}
+      {/* Mobile tab */}
       <div className="flex md:hidden items-center gap-1 bg-slate-100 rounded-lg p-1 self-start flex-shrink-0">
-        {([
-          { key: "list", icon: List, label: "Review" },
-          { key: "map",  icon: MapIcon, label: "Map" },
-        ] as const).map((t) => (
+        {([{ key: "list", icon: List, label: "Review" }, { key: "map", icon: MapIcon, label: "Map" }] as const).map((t) => (
           <button
             key={t.key}
             onClick={() => setMobileTab(t.key)}
-            className={clsx(
-              "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs transition-all",
+            className={clsx("flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs transition-all",
               mobileTab === t.key ? "bg-white text-slate-800 shadow-sm" : "text-slate-500"
             )}
             style={{ fontWeight: mobileTab === t.key ? 600 : 500 }}
@@ -725,10 +721,10 @@ export function MapPage() {
         ))}
       </div>
 
-      {/* ── Split view ── */}
+      {/* Split view */}
       <div className="flex-1 flex gap-4 min-h-0">
 
-        {/* ── Map panel ── */}
+        {/* Map panel */}
         <div className={clsx(
           "md:flex flex-col rounded-2xl overflow-hidden border border-slate-200 shadow-sm flex-[55] min-h-0 relative",
           mobileTab === "map" ? "flex" : "hidden md:flex"
@@ -740,14 +736,10 @@ export function MapPage() {
                 transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
                 className="w-7 h-7 border-[3px] border-emerald-500 border-t-transparent rounded-full"
               />
-              <p className="text-sm text-slate-600" style={{ fontWeight: 500 }}>
-                Geocoding suppliers via OpenStreetMap…
-              </p>
+              <p className="text-sm text-slate-600" style={{ fontWeight: 500 }}>Geocoding suppliers via OpenStreetMap…</p>
               {geocodeProgress.total > 0 && (
                 <div className="flex flex-col items-center gap-1.5">
-                  <p className="text-xs text-slate-400">
-                    {geocodeProgress.done} / {geocodeProgress.total} addresses resolved
-                  </p>
+                  <p className="text-xs text-slate-400">{geocodeProgress.done} / {geocodeProgress.total} addresses resolved</p>
                   <div className="w-40 h-1.5 bg-slate-200 rounded-full overflow-hidden">
                     <motion.div
                       animate={{ width: `${(geocodeProgress.done / geocodeProgress.total) * 100}%` }}
@@ -761,43 +753,35 @@ export function MapPage() {
           <div ref={mapContainerRef} className="w-full h-full" />
         </div>
 
-        {/* ── Review panel ── */}
+        {/* Review panel */}
         <div className={clsx(
           "md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm flex-[45] min-h-0",
           mobileTab === "list" ? "flex" : "hidden md:flex"
         )}>
-
-          {/* Panel header */}
           <div className="px-4 pt-4 pb-3 border-b border-slate-100 flex-shrink-0 space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Layers className="w-4 h-4 text-emerald-600" />
                 <span className="text-sm text-slate-800" style={{ fontWeight: 600 }}>Suppliers</span>
-                <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>
-                  {suppliers.length}
-                </span>
+                <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full" style={{ fontWeight: 600 }}>{suppliers.length}</span>
               </div>
             </div>
-
-            {/* Search */}
             <div className="relative">
               <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
               <input
                 type="text"
-                placeholder="Search suppliers…"
+                placeholder="Search name, address, suburb…"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 className="w-full pl-8 pr-3 py-2 text-sm border border-slate-200 rounded-lg bg-slate-50 focus:bg-white focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-400 outline-none transition-all"
               />
             </div>
-
-            {/* Filter tabs */}
             <div className="flex items-center gap-1 bg-slate-100 rounded-lg p-0.5">
               {([
-                { key: "all",    label: "All",    count: suppliers.length },
-                { key: "high",   label: "High",   count: highCount   },
-                { key: "medium", label: "Med",    count: mediumCount },
-                { key: "low",    label: "Low",    count: lowCount    },
+                { key: "all",    label: "All",  count: suppliers.length },
+                { key: "high",   label: "High", count: highCount   },
+                { key: "medium", label: "Med",  count: mediumCount },
+                { key: "low",    label: "Low",  count: lowCount    },
               ] as { key: ConfidenceTier; label: string; count: number }[]).map((f) => (
                 <button
                   key={f.key}
@@ -809,10 +793,7 @@ export function MapPage() {
                   style={{ fontWeight: filter === f.key ? 600 : 500 }}
                 >
                   {f.label}
-                  <span className={clsx(
-                    "text-[9px] px-1 rounded",
-                    filter === f.key ? "bg-slate-100 text-slate-600" : "bg-transparent"
-                  )} style={{ fontWeight: 700 }}>
+                  <span className={clsx("text-[9px] px-1 rounded", filter === f.key ? "bg-slate-100 text-slate-600" : "bg-transparent")} style={{ fontWeight: 700 }}>
                     {f.count}
                   </span>
                 </button>
@@ -820,16 +801,10 @@ export function MapPage() {
             </div>
           </div>
 
-          {/* Scrollable card list */}
           <div className="flex-1 overflow-y-auto p-3 space-y-2">
             <AnimatePresence>
               {filtered.map((s, i) => (
-                <motion.div
-                  key={s.id}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * 0.04 }}
-                >
+                <motion.div key={s.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.04 }}>
                   <SupplierCard
                     supplier={s}
                     selected={selectedId === s.id}
@@ -844,15 +819,11 @@ export function MapPage() {
                     onEditFormChange={(u) => setEditForm((prev) => ({ ...prev, ...u }))}
                     onApprove={() => handleApprove(s.id)}
                     onReject={() => handleReject(s.id)}
-                    cardRef={(el) => {
-                      if (el) cardRefs.current.set(s.id, el);
-                      else cardRefs.current.delete(s.id);
-                    }}
+                    cardRef={(el) => { if (el) cardRefs.current.set(s.id, el); else cardRefs.current.delete(s.id); }}
                   />
                 </motion.div>
               ))}
             </AnimatePresence>
-
             {filtered.length === 0 && (
               <div className="text-center py-16">
                 <Search className="w-8 h-8 text-slate-200 mx-auto mb-3" />
@@ -861,24 +832,13 @@ export function MapPage() {
             )}
           </div>
 
-          {/* Panel footer — action summary */}
           {(approvedCount > 0 || rejectedCount > 0) && (
             <div className="border-t border-slate-100 px-4 py-3 flex-shrink-0 flex items-center justify-between">
               <div className="flex items-center gap-3">
-                {approvedCount > 0 && (
-                  <span className="flex items-center gap-1 text-[11px] text-emerald-600" style={{ fontWeight: 600 }}>
-                    <CheckCircle2 className="w-3.5 h-3.5" /> {approvedCount} approved
-                  </span>
-                )}
-                {rejectedCount > 0 && (
-                  <span className="flex items-center gap-1 text-[11px] text-red-500" style={{ fontWeight: 600 }}>
-                    <X className="w-3.5 h-3.5" /> {rejectedCount} rejected
-                  </span>
-                )}
+                {approvedCount > 0 && <span className="flex items-center gap-1 text-[11px] text-emerald-600" style={{ fontWeight: 600 }}><CheckCircle2 className="w-3.5 h-3.5" /> {approvedCount} approved</span>}
+                {rejectedCount > 0 && <span className="flex items-center gap-1 text-[11px] text-red-500" style={{ fontWeight: 600 }}><X className="w-3.5 h-3.5" /> {rejectedCount} rejected</span>}
               </div>
-              <span className="text-[11px] text-slate-400">
-                {pendingCount} remaining
-              </span>
+              <span className="text-[11px] text-slate-400">{pendingCount} remaining</span>
             </div>
           )}
         </div>
