@@ -29,3 +29,5 @@ huggingface_hub>=0.22.0
 
 # Pydantic (bundled with FastAPI but pinned for safety)
 pydantic>=2.7.0
+
+openai
