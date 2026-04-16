@@ -16,10 +16,12 @@ Pipeline
 
 Environment variables
 ---------------------
-OLLAMA_URL     Required. Full base URL of the Ollama server.
-               Example: https://my-ollama-server.example.com
-               Example: http://localhost:11434
-OLLAMA_MODEL   Model name to use (default: gpt-oss:20b)
+OLLAMA_URL          Required. Full base URL of the Ollama server.
+                    Example: https://my-ollama-server.example.com
+                    Example: http://localhost:11434
+OLLAMA_MODEL        Model name to use (default: gpt-oss:20b)
+OLLAMA_TIMEOUT      HTTP timeout in seconds (default: 600).
+                    Large models like gpt-oss:20b can take 3-5 min on first run.
 """
 
 import io
@@ -35,7 +37,8 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-DEFAULT_MODEL = "gpt-oss:20b"
+DEFAULT_MODEL   = "gpt-oss:20b"
+DEFAULT_TIMEOUT = 600  # seconds — large models need time
 
 
 # ── Response schema ───────────────────────────────────────────────────────────
@@ -182,23 +185,24 @@ OCR TEXT:
 """
 
 
-# ── Ollama LLM call ───────────────────────────────────────────────────────────
+# ── Ollama LLM call (async) ───────────────────────────────────────────────────
 
-def run_llm(ocr_text: str) -> dict:
+async def run_llm(ocr_text: str) -> dict:
     """
-    POST to {OLLAMA_URL}/api/generate and return parsed JSON.
+    Async POST to {OLLAMA_URL}/api/generate.
 
-    Request pattern (matches the application API exactly):
+    Uses httpx.AsyncClient so the FastAPI event loop is never blocked.
+    Timeout is read from OLLAMA_TIMEOUT env var (default 600 s) to
+    accommodate large models that need several minutes on first inference.
 
-        POST "$OLLAMA_URL/api/generate"
+    Request shape (matches the Ollama application API):
+        POST  $OLLAMA_URL/api/generate
         Content-Type: application/json
         {
             "model":  "gpt-oss:20b",
-            "prompt": "<extraction prompt with OCR text>",
+            "prompt": "<extraction prompt>",
             "stream": false
         }
-
-    The response JSON has a top-level "response" key containing the model output.
     """
     ollama_url = os.getenv("OLLAMA_URL", "").strip()
     if not ollama_url:
@@ -210,8 +214,9 @@ def run_llm(ocr_text: str) -> dict:
             ),
         )
 
-    model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
-    url   = f"{ollama_url.rstrip('/')}/api/generate"
+    model   = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
+    url     = f"{ollama_url.rstrip('/')}/api/generate"
+    timeout = float(os.getenv("OLLAMA_TIMEOUT", DEFAULT_TIMEOUT))
 
     payload = {
         "model":  model,
@@ -220,11 +225,28 @@ def run_llm(ocr_text: str) -> dict:
         "format": "json",
     }
 
-    logger.info("[extract] POST %s  model=%s", url, model)
+    logger.info("[extract] POST %s  model=%s  timeout=%.0fs", url, model, timeout)
+
+    # httpx.Timeout splits into connect / read / write / pool timeouts.
+    # The read timeout is the one that was firing (model inference time).
+    # We set all components to the same generous value.
+    http_timeout = httpx.Timeout(timeout, connect=30.0)
 
     try:
-        resp = httpx.post(url, json=payload, timeout=120)
-        resp.raise_for_status()
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+
+    except httpx.ReadTimeout:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Ollama did not respond within {timeout:.0f} seconds. "
+                f"Model '{model}' may still be loading or the document is very long. "
+                f"You can increase the limit by setting OLLAMA_TIMEOUT in backend/.env "
+                f"(e.g. OLLAMA_TIMEOUT=900)."
+            ),
+        )
     except httpx.ConnectError:
         raise HTTPException(
             status_code=503,
@@ -352,6 +374,7 @@ async def extract(
       2. Tesseract OCR  →  raw text.
       3. POST to {OLLAMA_URL}/api/generate  →  structured JSON.
          model = OLLAMA_MODEL env var (default: gpt-oss:20b)
+         timeout = OLLAMA_TIMEOUT env var in seconds (default: 600)
       4. Validate ABN checksum (ATO algorithm).
       5. Post-process address: strip unit/number, validate AU format.
       6. Return ExtractResult.
@@ -383,8 +406,8 @@ async def extract(
             ]
         )
 
-    # ── Step 2: Ollama LLM → structured JSON ───────────────────────────────────
-    raw = run_llm(ocr_text)
+    # ── Step 2: Ollama → structured JSON ──────────────────────────────────────────
+    raw = await run_llm(ocr_text)
 
     conf_raw  = raw.get("confidence", {})
     warnings  = list(raw.get("warnings", []))
