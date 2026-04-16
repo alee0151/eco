@@ -9,6 +9,10 @@
  *   capad    → /api/biodiversity/capad/regions/by-bbox  (bbox of suppliers + 2° buffer)
  *   kba      → /api/biodiversity/kba  (bbox centroid filter via region param)
  *   ibra     → /api/biodiversity/ibra  (two pages, all 89 regions)
+ *
+ * FIX (bug 5): supplierBbox() now emits a console.warn when it returns null
+ * (i.e. no suppliers have coordinates yet), surfacing the root cause in dev
+ * instead of silently bailing out of every layer fetch.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -104,12 +108,27 @@ interface MapViewProps {
   onHover:    (id: string | null) => void;
 }
 
-/** Build a bounding box that contains all geocoded supplier coordinates. */
+/**
+ * Build a bounding box that contains all geocoded supplier coordinates.
+ *
+ * FIX (bug 5): emits console.warn when no suppliers are geocoded yet, so
+ * developers can immediately see why layer fetches are being skipped rather
+ * than encountering a silent no-op.
+ */
 function supplierBbox(suppliers: Supplier[], bufferDeg = 1): {
   min_lat: number; max_lat: number; min_lng: number; max_lng: number;
 } | null {
   const coords = suppliers.filter(s => s.coordinates).map(s => s.coordinates!);
-  if (!coords.length) return null;
+  if (!coords.length) {
+    if (suppliers.length > 0) {
+      console.warn(
+        '[MapView] supplierBbox: no geocoded suppliers found. '
+        + `${suppliers.length} supplier(s) are present but none have coordinates set. `
+        + 'Ensure geocoding completes in EnrichmentPage before enabling map layers.'
+      );
+    }
+    return null;
+  }
   return {
     min_lat: Math.min(...coords.map(c => c.lat)) - bufferDeg,
     max_lat: Math.max(...coords.map(c => c.lat)) + bufferDeg,
@@ -186,10 +205,16 @@ export default function MapView({
         ? `${summary.ibra_region}${summary.ibra_code ? ` (${summary.ibra_code})` : ''}`
         : s.region ?? '';
 
+      // Show resolution level in popup so users can gauge geocode accuracy
+      const resolutionBadge = s.resolutionLevel
+        ? `<span style="display:inline-block;margin-top:4px;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:600;background:#f1f5f9;color:#64748b">📍 ${s.resolutionLevel}${ s.inferenceMethod ? ` · ${s.inferenceMethod}` : ''}</span>`
+        : '';
+
       marker.bindPopup(`
         <div style="min-width:200px;font-family:sans-serif">
           <p style="font-weight:700;font-size:13px;color:#0f172a">${s.enrichedName ?? s.name}</p>
           <p style="font-size:11px;color:#64748b;margin-top:2px">${ibraLabel}</p>
+          ${resolutionBadge}
           <div style="margin-top:8px;padding:6px 8px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0">
             <p style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">Risk Indicators</p>
             <p style="font-size:11px;color:#334155">🦎 <b>${summary?.species_nearby ?? 0}</b> species nearby</p>
@@ -338,7 +363,9 @@ export default function MapView({
       // ── Species ──────────────────────────────────────────────────────────
       if (layerId === 'species') {
         const bbox = supplierBbox(suppliers, 1);
-        if (bbox) {
+        if (!bbox) {
+          console.warn('[MapView] species layer: no geocoded suppliers — bbox is null, skipping fetch.');
+        } else {
           const records = await speciesApi.byBbox({ ...bbox, limit: 500 }).catch(() => []);
           const group = L.layerGroup().addTo(map);
           layerGroupRef.current.set(layerId, group);
@@ -356,14 +383,15 @@ export default function MapView({
       if (layerId === 'capad') {
         if (!capadRegionsRef.current) {
           const bbox = supplierBbox(suppliers, 2);
-          if (bbox) {
-            // Two pages to catch all areas within the bbox
+          if (!bbox) {
+            console.warn('[MapView] capad layer: no geocoded suppliers — bbox is null, skipping fetch.');
+            capadRegionsRef.current = [];
+          } else {
             const [p1, p2] = await Promise.all([
               capadApi.regionsByBbox({ ...bbox, limit: 2000 }).catch(() => [] as CapadRegion[]),
               capadApi.regionsByBbox({ ...bbox, limit: 2000 }).catch(() => [] as CapadRegion[]),
             ]);
             const seen = new Set<string>();
-            // p1 and p2 are the same page — deduplicate is enough
             capadRegionsRef.current = p1.filter(r => {
               const key = r.pa_id ?? String(r.id);
               if (seen.has(key)) return false;
@@ -371,8 +399,6 @@ export default function MapView({
               return true;
             });
             console.info(`[MapView] CAPAD fetched ${capadRegionsRef.current.length} regions for bbox`, bbox);
-          } else {
-            capadRegionsRef.current = [];
           }
         }
         drawCapadLayer(capadRegionsRef.current);
@@ -382,8 +408,10 @@ export default function MapView({
       if (layerId === 'kba') {
         if (!kbaRecordsRef.current) {
           const records = await kbaApi.list({ limit: 500 }).catch(() => [] as KbaRecord[]);
-          // Filter to supplier bbox client-side (kba list has no bbox param)
           const bbox = supplierBbox(suppliers, 3);
+          if (!bbox) {
+            console.warn('[MapView] kba layer: no geocoded suppliers — using full KBA list without bbox filter.');
+          }
           kbaRecordsRef.current = bbox
             ? records.filter(r =>
                 r.sit_lat != null && r.sit_long != null &&
