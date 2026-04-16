@@ -6,7 +6,7 @@ Accepts a multipart upload of a PDF or image file.
 OCR  : Tesseract (pytesseract) — free, runs 100 % locally.
 LLM  : OpenRouter  — cloud API, OpenAI-compatible.
         Set OPENROUTER_API_KEY in backend/.env
-        Set OPENROUTER_MODEL  in backend/.env  (default: openrouter/auto)
+        Set OPENROUTER_MODEL  in backend/.env  (default: meta-llama/llama-3.3-70b-instruct:free)
         Register at https://openrouter.ai
 
 Address extraction scope
@@ -18,10 +18,11 @@ No street name, no street number, no unit, no country.
 Environment variables
 ---------------------
 OPENROUTER_API_KEY   Required. Your OpenRouter API key.
-OPENROUTER_MODEL     Model slug (default: openrouter/auto)
-                     Examples: meta-llama/llama-3.2-11b-vision-instruct:free
-                               mistralai/mistral-7b-instruct:free
-                               openrouter/auto
+OPENROUTER_MODEL     Model slug (default: meta-llama/llama-3.3-70b-instruct:free)
+                     Other free options:
+                       mistralai/mistral-small-3.1-24b-instruct:free
+                       meta-llama/llama-4-maverick:free
+                       deepseek/deepseek-r1:free
 """
 
 import io
@@ -36,6 +37,9 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Default free model — no credits required on OpenRouter
+DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 
 # ── OpenRouter client ──────────────────────────────────────────────────────────────
@@ -266,7 +270,7 @@ WARNINGS — add a warning string for each of these situations:
 GENERAL RULES:
   • If a field cannot be found, use empty string "".
   • Do NOT invent or guess data that is not present in the text.
-  • Do NOT copy the buyer’s data into any field.
+  • Do NOT copy the buyer's data into any field.
 
 OCR TEXT:
 ---
@@ -283,10 +287,13 @@ def run_llm(ocr_text: str) -> dict:
 
     Uses the OpenAI-compatible chat completions endpoint.
     Model is configurable via OPENROUTER_MODEL env var.
+    Defaults to meta-llama/llama-3.3-70b-instruct:free — no credits required.
     temperature=0 for deterministic, structured output.
     """
-    model  = os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+    model  = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
     client = _get_openrouter_client()
+
+    logger.info("[extract] using model: %s", model)
 
     try:
         response = client.chat.completions.create(
@@ -300,8 +307,16 @@ def run_llm(ocr_text: str) -> dict:
             temperature=0,
         )
     except Exception as exc:
-        # Catch OpenAI SDK errors (AuthenticationError, RateLimitError, etc.)
         err = str(exc)
+        if "402" in err or "credits" in err.lower() or "insufficient" in err.lower():
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"OpenRouter insufficient credits for model '{model}'. "
+                    "Ensure your model slug ends with ':free', e.g. "
+                    "meta-llama/llama-3.3-70b-instruct:free"
+                ),
+            )
         if "401" in err or "authentication" in err.lower() or "api key" in err.lower():
             raise HTTPException(
                 status_code=401,
@@ -446,7 +461,7 @@ async def extract(
     Pipeline:
       1. Validate file type & size.
       2. Run Tesseract OCR  →  raw text.
-      3. Send raw text to OpenRouter  →  structured JSON.
+      3. Send raw text to OpenRouter (default: llama-3.3-70b-instruct:free)  →  structured JSON.
          address = "suburb state postcode" only.
       4. Validate ABN checksum.
       5. Sanitise address: strip any street/unit/country pollution, validate AU format.
