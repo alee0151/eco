@@ -18,24 +18,24 @@ Endpoints:
 
 Performance notes
 -----------------
-* /counts        — three COUNT queries run in parallel with asyncio.gather.
-* /risk-summary  — four independent sub-queries (IBRA, species count, CAPAD count,
-                   KBA count) all run in parallel with asyncio.gather.
-* IBRA lookup    — single query ordered by ST_Distance; returns the containing region
-                   first (distance = 0) and falls back to nearest without a second
+* /counts        — three COUNT queries run sequentially on the shared session.
+* /risk-summary  — four sub-queries run sequentially on the shared session.
+  A single AsyncSession is NOT safe to use concurrently (asyncio.gather on the
+  same session causes an InvalidRequestError / connection-provisioning race).
+* IBRA lookup    — single query ordered by ST_Distance; returns the containing
+                   region first (distance=0) and falls back to nearest without
+                   a second round-trip.
+* CAPAD count    — uses ST_DWithin on the real polygon geometry (geom) rather
+                   than a bounding-box centroid filter.  Falls back to bbox
+                   centroid filter when PostGIS is unavailable.
+* Species count  — count and names derived from the same CTE in a single
                    round-trip.
-* CAPAD count    — uses ST_DWithin on the real polygon geometry (geom) rather than a
-                   bounding-box centroid filter.  This correctly counts parks that
-                   *overlap* the search radius even when their centroid is outside it.
-                   Falls back to bbox centroid filter when PostGIS is unavailable.
-* Species count  — count and names derived from the same CTE in a single round-trip.
 """
 
-import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text
-from geoalchemy2.functions import ST_Within, ST_SetSRID, ST_MakePoint, ST_DWithin
+from geoalchemy2.functions import ST_SetSRID, ST_MakePoint, ST_DWithin
 from typing import Optional, List
 
 from database import get_db
@@ -75,7 +75,7 @@ SPECIES_QUALITY_FILTERS = [
 ]
 
 
-# ── Species ───────────────────────────────────────────────────────────────────
+# ── Species ────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/species", response_model=List[SpeciesOut])
 async def list_species(
@@ -118,7 +118,7 @@ async def species_by_bbox(
     return result.scalars().all()
 
 
-# ── KBA ───────────────────────────────────────────────────────────────────────
+# ── KBA ──────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/kba", response_model=List[KbaOut])
 async def list_kba(
@@ -143,7 +143,7 @@ async def get_kba(kba_id: int, db: AsyncSession = Depends(get_db)):
     return kba
 
 
-# ── CAPAD ─────────────────────────────────────────────────────────────────────
+# ── CAPAD ──────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/capad", response_model=List[CapadOut])
 async def list_capad(
@@ -218,7 +218,7 @@ async def get_capad(capad_id: int, db: AsyncSession = Depends(get_db)):
     return capad
 
 
-# ── IBRA ──────────────────────────────────────────────────────────────────────
+# ── IBRA ──────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/ibra", response_model=List[IbraOut])
 async def list_ibra(
@@ -246,19 +246,24 @@ async def get_ibra_by_code(code: str, db: AsyncSession = Depends(get_db)):
     return ibra
 
 
-# ── DB Counts ─────────────────────────────────────────────────────────────────
+# ── DB Counts ─────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/counts")
 async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
     """
     Return live row counts for stat cards.
-    All three COUNT queries run in parallel via asyncio.gather — no serial waiting.
+    Queries run sequentially on a single AsyncSession.
+    (asyncio.gather on one session causes an InvalidRequestError race.)
     """
-    capad_q   = db.execute(select(func.count()).select_from(Capad).where(Capad.is_active == True))   # noqa: E712
-    kba_q     = db.execute(select(func.count()).select_from(Kba))
-    species_q = db.execute(select(func.count()).select_from(Species))
-
-    capad_res, kba_res, species_res = await asyncio.gather(capad_q, kba_q, species_q)
+    capad_res   = await db.execute(
+        select(func.count()).select_from(Capad).where(Capad.is_active == True)  # noqa: E712
+    )
+    kba_res     = await db.execute(
+        select(func.count()).select_from(Kba)
+    )
+    species_res = await db.execute(
+        select(func.count()).select_from(Species)
+    )
 
     return {
         "capad_active":  capad_res.scalar()   or 0,
@@ -267,7 +272,7 @@ async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
     }
 
 
-# ── Supplier Risk Summary ─────────────────────────────────────────────────────
+# ── Supplier Risk Summary ──────────────────────────────────────────────
 
 @router.get("/biodiversity/risk-summary", response_model=SupplierRiskSummary)
 async def risk_summary(
@@ -281,31 +286,26 @@ async def risk_summary(
     """
     Compute a biodiversity risk summary for a supplier location.
 
-    All four sub-queries run in **parallel** with asyncio.gather:
+    Sub-queries run sequentially on a single AsyncSession to avoid the
+    InvalidRequestError that asyncio.gather causes when coroutines share
+    one session.
 
-    1. IBRA region  — single query ordered by ST_Distance (0 = containing polygon,
-                      > 0 = nearest fallback).  No second round-trip needed.
-
-    2. Species      — distinct threatened-species count + representative names,
-                      both from the same CTE in a single DB round-trip.
-                      Threatened filter covers: threatened, sensitive, epbc resources.
-
-    3. CAPAD count  — ST_DWithin on real polygon geometry so parks that *overlap*
-                      the search radius are counted even if their centroid is outside
-                      it.  Falls back to bbox centroid filter if PostGIS unavailable.
-
-    4. KBA count    — bounding-box centroid filter (KBA table has no polygon geom).
+    1. IBRA region  — single query ordered by ST_Distance (0 = containing
+                      polygon, > 0 = nearest fallback).
+    2. Species      — distinct threatened-species count + representative
+                      names from one CTE round-trip.
+    3. CAPAD count  — ST_DWithin on real polygon geometry; falls back to
+                      bbox centroid filter when PostGIS unavailable.
+    4. KBA count    — bbox centroid filter (KBA table has no polygon geom).
     """
     min_lat = lat - buffer_deg
     max_lat = lat + buffer_deg
     min_lng = lng - buffer_deg
     max_lng = lng + buffer_deg
 
-    supplier_point = ST_SetSRID(ST_MakePoint(lng, lat), 4326)
-
-    # ── 1. IBRA — single distance-ordered query ────────────────────────────
-    async def _ibra() -> tuple[str | None, str | None]:
-        result = await db.execute(
+    # ── 1. IBRA ───────────────────────────────────────────────
+    ibra_row = (
+        await db.execute(
             text("""
                 SELECT ibra_reg_name, ibra_reg_code
                 FROM   ibra
@@ -315,16 +315,13 @@ async def risk_summary(
             """),
             {"lng": lng, "lat": lat},
         )
-        row = result.first()
-        return (row[0] if row else None, row[1] if row else None)
+    ).first()
+    ibra_name = ibra_row[0] if ibra_row else None
+    ibra_code = ibra_row[1] if ibra_row else None
 
-    # ── 2. Species — count + names in one CTE round-trip ──────────────────
-    # Threatened filter widened to cover all ALA sensitive/threatened resources:
-    #   %%threatened%%  — ALA Threatened Species lists
-    #   %%sensitive%%   — ALA Sensitive Species List
-    #   %%epbc%%        — EPBC Act listed species
-    async def _species() -> tuple[int, list[str]]:
-        rows = (await db.execute(
+    # ── 2. Species ────────────────────────────────────────────
+    species_row = (
+        await db.execute(
             text("""
                 WITH threatened AS (
                     SELECT
@@ -355,57 +352,50 @@ async def risk_summary(
             """),
             {"min_lat": min_lat, "max_lat": max_lat,
              "min_lng": min_lng, "max_lng": max_lng},
-        )).first()
-        count = int(rows[0] or 0) if rows else 0
-        names = list((rows[1] or [])[:20]) if rows else []
-        return count, names
+        )
+    ).first()
+    species_count = int(species_row[0] or 0) if species_row else 0
+    species_names = list((species_row[1] or [])[:20]) if species_row else []
 
-    # ── 3. CAPAD — ST_DWithin on real polygon geometry ────────────────────
-    async def _capad() -> int:
-        buffer_metres = buffer_deg * 111_000  # 1 deg ≈ 111 km
-        try:
-            result = await db.execute(
-                select(func.count()).select_from(Capad)
-                .where(Capad.geom.isnot(None))
-                .where(Capad.is_active == True)  # noqa: E712
-                .where(
-                    ST_DWithin(
-                        Capad.geom.cast(text("geography")),
-                        func.ST_SetSRID(
-                            func.ST_MakePoint(lng, lat), 4326
-                        ).cast(text("geography")),
-                        buffer_metres,
-                    )
+    # ── 3. CAPAD ────────────────────────────────────────────
+    buffer_metres = buffer_deg * 111_000
+    try:
+        capad_res = await db.execute(
+            select(func.count()).select_from(Capad)
+            .where(Capad.geom.isnot(None))
+            .where(Capad.is_active == True)  # noqa: E712
+            .where(
+                ST_DWithin(
+                    Capad.geom.cast(text("geography")),
+                    func.ST_SetSRID(
+                        func.ST_MakePoint(lng, lat), 4326
+                    ).cast(text("geography")),
+                    buffer_metres,
                 )
             )
-            return result.scalar() or 0
-        except Exception:
-            # Fallback: centroid bbox filter if PostGIS geography cast unavailable
-            result = await db.execute(
-                select(func.count()).select_from(Capad)
-                .where(Capad.latitude.isnot(None))
-                .where(Capad.longitude.isnot(None))
-                .where(Capad.latitude.between(min_lat, max_lat))
-                .where(Capad.longitude.between(min_lng, max_lng))
-                .where(Capad.is_active == True)  # noqa: E712
-            )
-            return result.scalar() or 0
-
-    # ── 4. KBA — bbox centroid (no polygon geom in KBA table) ─────────────
-    async def _kba() -> int:
-        result = await db.execute(
-            select(func.count()).select_from(Kba)
-            .where(Kba.sit_lat.isnot(None))
-            .where(Kba.sit_long.isnot(None))
-            .where(Kba.sit_lat.between(min_lat, max_lat))
-            .where(Kba.sit_long.between(min_lng, max_lng))
         )
-        return result.scalar() or 0
+        capad_count = capad_res.scalar() or 0
+    except Exception:
+        # Fallback: centroid bbox when PostGIS geography cast is unavailable
+        capad_res = await db.execute(
+            select(func.count()).select_from(Capad)
+            .where(Capad.latitude.isnot(None))
+            .where(Capad.longitude.isnot(None))
+            .where(Capad.latitude.between(min_lat, max_lat))
+            .where(Capad.longitude.between(min_lng, max_lng))
+            .where(Capad.is_active == True)  # noqa: E712
+        )
+        capad_count = capad_res.scalar() or 0
 
-    # ── Run all four sub-queries in parallel ───────────────────────────────
-    (ibra_name, ibra_code), (species_count, species_names), capad_count, kba_count = (
-        await asyncio.gather(_ibra(), _species(), _capad(), _kba())
+    # ── 4. KBA ───────────────────────────────────────────────
+    kba_res = await db.execute(
+        select(func.count()).select_from(Kba)
+        .where(Kba.sit_lat.isnot(None))
+        .where(Kba.sit_long.isnot(None))
+        .where(Kba.sit_lat.between(min_lat, max_lat))
+        .where(Kba.sit_long.between(min_lng, max_lng))
     )
+    kba_count = kba_res.scalar() or 0
 
     return SupplierRiskSummary(
         supplier_id=supplier_id,
