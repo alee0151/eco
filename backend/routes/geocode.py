@@ -24,10 +24,10 @@ Query priority inside the endpoint:
   1. Full formatted string   (street + suburb + state + postcode + country)
   2. Structured components   (street, suburb state postcode)
   3. Suburb + state + postcode  (coarse fallback)
-  4. State centroid / Australia centre  (last resort)
+  4. Australia centre  (last resort — no state centroid)
 
 Fallback chain:
-  Geoscape G-NAF v2  →  Nominatim OSM  →  state centroid  →  Australia centre
+  Geoscape G-NAF v2  →  Nominatim OSM  →  Australia centre
 
 Environment variables
 ---------------------
@@ -76,16 +76,6 @@ router = APIRouter()
 
 GEOSCAPE_BASE_V2 = "https://api.psma.com.au/v2/addresses/geocoder"
 
-STATE_CENTROIDS = {
-    "NSW": (-32.1656, 147.0000),
-    "VIC": (-37.0201, 144.9646),
-    "QLD": (-22.5750, 144.0850),
-    "WA":  (-25.0419, 121.8989),
-    "SA":  (-30.0002, 136.2092),
-    "TAS": (-42.0409, 146.5978),
-    "ACT": (-35.4735, 149.0124),
-    "NT":  (-19.4914, 132.5510),
-}
 AUS_CENTRE = (-25.2744, 133.7751)
 
 # geoFeature values that indicate property-level precision
@@ -114,7 +104,7 @@ class GeocodeResponse(BaseModel):
     lng:              float
     gnaf_pid:         str  = ""
     confidence:       int  = 0
-    resolution_level: str  = "unknown"   # facility | regional | state | unknown
+    resolution_level: str  = "unknown"   # facility | regional | unknown
     inference_method: str  = "unknown"
     display_address:  str  = ""
     source:           str  = "unknown"   # geoscape | nominatim | centroid
@@ -185,15 +175,12 @@ def _resolution_from_geo_feature(geo_feature: str) -> str:
 
     facility  → property / building / frontage precision
     regional  → street / suburb / postcode precision
-    state     → state-level
     """
     gf = geo_feature.upper()
     if any(k in gf for k in ("PROPERTY", "BUILDING", "FRONTAGE", "PARCEL", "UNIT", "LOCALITY")):
         return "facility"
     if any(k in gf for k in ("STREET", "ROAD", "SUBURB", "POSTCODE", "TOWN")):
         return "regional"
-    if "STATE" in gf:
-        return "state"
     # Default to facility for any unrecognised feature type (GNAF is address-level)
     return "facility"
 
@@ -323,7 +310,6 @@ async def _nominatim_fallback(
     level = (
         "facility" if osm_type in {"building", "office", "commercial", "house", "industrial"}
         else "regional" if osm_type in {"suburb", "town", "village", "postcode", "neighbourhood"}
-        else "state"    if osm_type in {"state", "county"}
         else "unknown"
     )
 
@@ -349,7 +335,10 @@ async def _nominatim_fallback(
 async def geocode(body: GeocodeRequest) -> GeocodeResponse:
     """
     Geocode a supplier address via G-NAF v2 (primary) → Nominatim (fallback)
-    → state centroid → Australia centre.
+    → Australia centre (last resort).
+
+    State centroid fallback is intentionally excluded — callers should treat
+    a country-centroid response (source="centroid") as an unresolved address.
 
     All query strings are built in canonical form:
       "street, suburb state postcode, Australia"
@@ -390,19 +379,7 @@ async def geocode(body: GeocodeRequest) -> GeocodeResponse:
             if result and result.resolution_level != "unknown":
                 return result
 
-    # ─ Last resort: state centroid or Australia centre ───────────────────
-    state_upper = body.state.upper().strip()
-    if state_upper in STATE_CENTROIDS:
-        lat, lng = STATE_CENTROIDS[state_upper]
-        logger.info("[geocode] state centroid fallback → %s", state_upper)
-        return GeocodeResponse(
-            lat=lat, lng=lng,
-            resolution_level="state",
-            inference_method="state-centroid",
-            display_address=state_upper,
-            source="centroid",
-        )
-
+    # ─ Last resort: Australia centre ─────────────────────────────────────
     lat, lng = AUS_CENTRE
     logger.warning("[geocode] all geocoding failed — returning Australia centre")
     return GeocodeResponse(
