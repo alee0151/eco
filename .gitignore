@@ -3,3 +3,7 @@ backend/__pycache__
 backend/routes/__pycache__
 frontend/node_modules
 frontend/package-lock.json
+backend/dataset
+log.txt
+.env
+Collaborative_Australian_Protected_Areas_Database_(CAPAD)_2024_-_Terrestrial__.csv
