@@ -1,5 +1,5 @@
 import { useNavigate } from "react-router";
-import { MapPin } from "lucide-react";
+ import { Upload } from "lucide-react";
 import BiodiversityDashboard from "../components/epic2/BiodiversityDashboard";
 import { useSuppliers } from "../context/SupplierContext";
 
@@ -7,40 +7,35 @@ export function BiodiversityPage() {
   const { suppliers, loading } = useSuppliers();
   const navigate = useNavigate();
 
-  // Show a clear empty state if no supplier has geocoded coordinates yet.
-  // Coordinates are only set after the user visits Map & Review (MapPage),
-  // so navigating directly to /biodiversity would silently show nothing.
-  const hasCoords = !loading && suppliers.some(s => s.coordinates);
-  const hasSuppliers = !loading && suppliers.length > 0;
+  // Still initialising context (rare — context is synchronous, but guard anyway)
+  if (loading) return null;
 
-  if (!loading && hasSuppliers && !hasCoords) {
+  // No suppliers uploaded yet — guide user to upload
+  if (!loading && suppliers.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center">
         <div className="w-12 h-12 rounded-2xl bg-emerald-50 flex items-center justify-center">
-          <MapPin className="w-6 h-6 text-emerald-600" />
+          <Upload className="w-6 h-6 text-emerald-600" />
         </div>
         <div>
-          <h2 className="text-base font-semibold text-slate-800">Geocoding required</h2>
+          <h2 className="text-base font-semibold text-slate-800">No suppliers uploaded</h2>
           <p className="text-sm text-slate-500 mt-1 max-w-xs">
-            Supplier locations haven't been resolved yet. Visit{" "}
-            <strong>Map &amp; Review</strong> to geocode your suppliers, then
-            return here for biodiversity risk analysis.
+            Upload a supplier file first to begin biodiversity risk assessment.
           </p>
         </div>
         <button
-          onClick={() => navigate("/review")}
+          onClick={() => navigate("/upload")}
           className="px-4 py-2 bg-emerald-600 text-white text-sm font-medium rounded-lg hover:bg-emerald-700 transition-colors"
         >
-          Go to Map &amp; Review
+          Go to Upload
         </button>
       </div>
     );
   }
 
-  // Outer wrapper uses flex-1 flex flex-col min-h-0 instead of the old
-  // h-[calc(100vh-7.5rem)]. Layout.tsx now makes <main> height-constrained
-  // (flex-1 flex-col overflow-hidden), so flex-1 here resolves correctly
-  // and the three-panel row inside BiodiversityDashboard gets a real height.
+  // Suppliers are present — show the dashboard immediately.
+  // Supplier cards render right away; risk details (geocoding, DB queries)
+  // load in the background with skeleton / loading states inside the panels.
   return (
     <div className="flex-1 flex flex-col min-h-0 gap-4">
       <BiodiversityDashboard />
