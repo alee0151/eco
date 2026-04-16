@@ -1,13 +1,25 @@
 # .watchfilesignore
 # Tell WatchFiles (used by uvicorn --reload) which paths to ignore.
-# Without this, numpy/shapely importing their own .py files inside .venv
-# triggers an infinite reload loop on every server start.
+# Without this, newly installed packages inside .venv trigger unnecessary reloads.
 
+# Virtual environment — covers ALL installed packages
 .venv/
+
+# Python bytecode
 __pycache__/
 *.pyc
 *.pyo
+
+# Version control
 .git/
+
+# Build artefacts
 *.egg-info/
 dist/
 build/
+
+# Specific packages that trigger false-positive reloads on install
+# huggingface_hub pulls in markdown-it-py which watchfiles picks up
+.venv/lib/python3.12/site-packages/markdown_it/
+.venv/lib/python3.12/site-packages/huggingface_hub/
+.venv/lib/python3.12/site-packages/
