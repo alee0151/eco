@@ -1,6 +1,13 @@
 /**
  * MapView.tsx — centre panel of the Biodiversity split layout.
  *
+ * Performance changes
+ * -------------------
+ * - Accepts `prefetchedIbra` and `prefetchedCapad` props from BiodiversityDashboard.
+ *   When these are provided (background fetch already done), first layer toggle is
+ *   instant — no fetch needed on click.
+ * - Still fetches independently if props are null (standalone usage / race condition).
+ *
  * Layout of bottom-left controls (bottom → top):
  *   [Risk Legend]  ← always visible
  *   [Layers btn]   ← always visible, sits directly above legend
@@ -12,9 +19,8 @@
  *   Reference regions              → faint blue dashed outline
  *
  * CAPAD layer:
- *   Fetches real MULTIPOLYGON boundaries from /api/biodiversity/capad/regions
- *   Renders filled polygons coloured by IUCN category (mirrors IBRA pattern).
- *   Each polygon has a sticky tooltip and a rich click popup.
+ *   Renders filled polygons coloured by IUCN category.
+ *   Polygon data is provided via prefetchedCapad prop (no on-demand fetch needed).
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -46,19 +52,14 @@ const IBRA_COLOR          = '#2563eb';
 const IBRA_SELECTED_COLOR = '#f59e0b';
 
 // ── CAPAD IUCN colours ────────────────────────────────────────────────────────
-/**
- * Colour each protected area polygon by its IUCN management category.
- * Categories Ia / Ib are strict nature reserves → darkest teal.
- * Not Reported / unknown → neutral slate.
- */
 const CAPAD_IUCN_COLORS: Record<string, string> = {
-  'Ia':             '#0f4c5c',   // Strict Nature Reserve
-  'Ib':             '#0d6e6e',   // Wilderness Area
-  'II':             '#0d9488',   // National Park
-  'III':            '#06b6d4',   // Natural Monument
-  'IV':             '#16a34a',   // Habitat/Species Management
-  'V':              '#84cc16',   // Protected Landscape/Seascape
-  'VI':             '#10b981',   // Protected Area with Sustainable Use
+  'Ia':             '#0f4c5c',
+  'Ib':             '#0d6e6e',
+  'II':             '#0d9488',
+  'III':            '#06b6d4',
+  'IV':             '#16a34a',
+  'V':              '#84cc16',
+  'VI':             '#10b981',
   'Not Reported':   '#94a3b8',
   'Not Applicable': '#94a3b8',
 };
@@ -68,7 +69,6 @@ function capadIucnColor(cat: string | null): string {
   return CAPAD_IUCN_COLORS[cat] ?? CAPAD_IUCN_COLORS['Not Reported'];
 }
 
-// ── CAPAD IUCN legend entries for the layer panel ─────────────────────────────
 const CAPAD_LEGEND: { cat: string; label: string }[] = [
   { cat: 'Ia',           label: 'Ia — Strict Nature Reserve' },
   { cat: 'Ib',           label: 'Ib — Wilderness Area' },
@@ -114,27 +114,41 @@ const LAYER_DEFS: LayerDef[] = [
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 interface MapViewProps {
-  suppliers:  Supplier[];
-  summaries:  SupplierRiskSummary[];
-  selectedId: string | null;
-  onSelect:   (id: string) => void;
-  hoveredId:  string | null;
-  onHover:    (id: string | null) => void;
+  suppliers:       Supplier[];
+  summaries:       SupplierRiskSummary[];
+  selectedId:      string | null;
+  onSelect:        (id: string) => void;
+  hoveredId:       string | null;
+  onHover:         (id: string | null) => void;
+  /** Pre-fetched by BiodiversityDashboard — avoids fetch on first toggle */
+  prefetchedIbra:  IbraRecord[] | null;
+  prefetchedCapad: CapadRegion[] | null;
 }
 
-export default function MapView({ suppliers, summaries, selectedId, onSelect, hoveredId, onHover }: MapViewProps) {
+export default function MapView({
+  suppliers, summaries, selectedId, onSelect, hoveredId, onHover,
+  prefetchedIbra, prefetchedCapad,
+}: MapViewProps) {
   const containerRef    = useRef<HTMLDivElement>(null);
   const mapRef          = useRef<L.Map | null>(null);
   const markersRef      = useRef<Map<string, L.Marker>>(new Map());
   const layerGroupRef   = useRef<Map<string, L.LayerGroup>>(new Map());
   const ibraRecordsRef  = useRef<IbraRecord[] | null>(null);
-  // Cache fetched CAPAD polygon regions so re-toggling the layer doesn't re-fetch
   const capadRegionsRef = useRef<CapadRegion[] | null>(null);
 
   const [layerPanelOpen,  setLayerPanelOpen]  = useState(false);
   const [activeLayers,    setActiveLayers]    = useState<Set<string>>(new Set(['species']));
   const [layerLoading,    setLayerLoading]    = useState<Set<string>>(new Set());
   const [capadLegendOpen, setCapadLegendOpen] = useState(false);
+
+  // Sync prefetched data into the local refs so toggleLayer finds it immediately
+  useEffect(() => {
+    if (prefetchedIbra  && !ibraRecordsRef.current)  ibraRecordsRef.current  = prefetchedIbra;
+  }, [prefetchedIbra]);
+
+  useEffect(() => {
+    if (prefetchedCapad && !capadRegionsRef.current) capadRegionsRef.current = prefetchedCapad;
+  }, [prefetchedCapad]);
 
   // ── Init map ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -296,18 +310,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
     drawIbraLayer(ibraRecordsRef.current);
   }, [summaries, selectedId, activeLayers, drawIbraLayer]);
 
-  // ── CAPAD polygon draw helper — real MULTIPOLYGON boundaries from DB ───────
-  /**
-   * Render each CAPAD protected area as a filled polygon coloured by its
-   * IUCN management category.  Each polygon has:
-   *   - sticky tooltip: name, IUCN badge, state · type · area
-   *   - click popup:    full detail (type, area, governance, authority, EPBC)
-   *
-   * Large areas are ordered last in the API response (desc by gis_area_ha)
-   * so smaller parks paint on top — correct z-ordering without JS sorting.
-   *
-   * Only records with a non-null geom_wkt are rendered (filtered server-side).
-   */
+  // ── CAPAD polygon draw helper ─────────────────────────────────────────────
   const drawCapadPolygonLayer = useCallback((regions: CapadRegion[]) => {
     const map = mapRef.current;
     if (!map) return;
@@ -355,13 +358,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           </div>`;
 
         L.geoJSON(geojson as any, {
-          style: {
-            color,
-            weight:      1.2,
-            opacity:     0.85,
-            fillColor:   color,
-            fillOpacity: 0.18,
-          },
+          style: { color, weight: 1.2, opacity: 0.85, fillColor: color, fillOpacity: 0.18 },
         })
           .bindTooltip(tooltipContent, { sticky: true })
           .bindPopup(popupContent, { maxWidth: 260 })
@@ -419,15 +416,9 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
         }
       }
 
-      // ── CAPAD — fetch real MULTIPOLYGON boundaries from capad/regions ──────
+      // ── CAPAD — use prefetched data if available, otherwise fetch ──────────
       if (layerId === 'capad') {
         if (!capadRegionsRef.current) {
-          /**
-           * Fetch strategy: two parallel pages of 2000 each → up to 4000 regions.
-           * The endpoint orders by gis_area_ha DESC so the most significant
-           * protected areas are always in page 1 even if there are > 4000 total.
-           * Deduplicate by pa_id in case of any server-side overlap between pages.
-           */
           const [p1, p2] = await Promise.all([
             capadApi.regions({ limit: 2000, offset:    0 }).catch(() => [] as CapadRegion[]),
             capadApi.regions({ limit: 2000, offset: 2000 }).catch(() => [] as CapadRegion[]),
@@ -439,7 +430,6 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
             seen.add(key);
             return true;
           });
-          console.info(`[MapView] CAPAD: fetched ${capadRegionsRef.current.length} polygon regions`);
         }
         drawCapadPolygonLayer(capadRegionsRef.current);
       }
@@ -458,11 +448,11 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
         });
       }
 
-      // ── IBRA ──────────────────────────────────────────────────────────────
+      // ── IBRA — use prefetched data if available, otherwise fetch ──────────
       if (layerId === 'ibra') {
         if (!ibraRecordsRef.current) {
           const [page1, page2] = await Promise.all([
-            ibraApi.list({ limit: 100, offset: 0   }).catch(() => []),
+            ibraApi.list({ limit: 100, offset:   0 }).catch(() => []),
             ibraApi.list({ limit: 100, offset: 100 }).catch(() => []),
           ]);
           const seen = new Set<string>();
@@ -509,16 +499,8 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
         ))}
       </div>
 
-      {/*
-        ── Bottom-left control stack ──
-        Flex column rendered bottom-up:
-          [Risk legend]   ← always at the bottom
-          [Layers btn]    ← directly above legend
-          [Layer panel]   ← expands upward above the Layers btn
-      */}
       <div className="absolute bottom-4 left-4 z-[1000] flex flex-col items-start gap-2">
 
-        {/* Layer panel — renders above the button when open */}
         {layerPanelOpen && (
           <div className="w-[260px] bg-white/97 backdrop-blur-sm rounded-xl shadow-lg border border-slate-200/80 overflow-hidden">
             <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
@@ -537,6 +519,11 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
                 {LAYER_DEFS.filter(l => l.group === group).map(layer => {
                   const isActive  = activeLayers.has(layer.id);
                   const isLoading = layerLoading.has(layer.id);
+                  // Show a subtle "ready" indicator when data is prefetched
+                  const isPrefetched = (
+                    (layer.id === 'ibra'  && !!ibraRecordsRef.current) ||
+                    (layer.id === 'capad' && !!capadRegionsRef.current)
+                  );
                   return (
                     <div key={layer.id}>
                       <div
@@ -554,14 +541,15 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
                         </div>
                         <div className="flex-1 min-w-0">
                           <p className="text-[12px] text-slate-700" style={{ fontWeight: isActive ? 600 : 500 }}>{layer.label}</p>
-                          <p className="text-[10px] text-slate-400 leading-tight">{layer.desc}</p>
+                          <p className="text-[10px] text-slate-400 leading-tight">
+                            {isPrefetched && !isActive ? '⚡ Ready to display · ' : ''}{layer.desc}
+                          </p>
                         </div>
                         {isLoading && (
                           <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full animate-spin" />
                         )}
                       </div>
 
-                      {/* CAPAD IUCN colour legend — shown when layer is active */}
                       {layer.id === 'capad' && isActive && (
                         <div className="px-4 pb-2">
                           <button
@@ -595,7 +583,6 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           </div>
         )}
 
-        {/* Layers toggle button */}
         <button
           onClick={() => setLayerPanelOpen(v => !v)}
           className={clsx(
@@ -615,7 +602,6 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           )}
         </button>
 
-        {/* Risk legend — always at the bottom of the stack */}
         <div className="bg-white/95 backdrop-blur-sm rounded-xl p-3 shadow-md border border-slate-200/80">
           <p className="text-[10px] text-slate-500 mb-2 uppercase tracking-wider" style={{ fontWeight: 600 }}>Risk Level</p>
           <div className="space-y-1.5">
@@ -628,7 +614,7 @@ export default function MapView({ suppliers, summaries, selectedId, onSelect, ho
           </div>
         </div>
 
-      </div>{/* end bottom-left stack */}
+      </div>
     </div>
   );
 }

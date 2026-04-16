@@ -6,17 +6,24 @@
  *   CENTRE — MapView       (real geocoded coords, layer toggles)
  *   RIGHT  — RiskProfile   (live risk summary for selected supplier)
  *
- * Design principle: supplier cards are ALWAYS visible.
- * DB fetches (risk summaries, counts) happen in the background.
- * A slim banner on the left panel indicates loading without blocking the UI.
+ * Performance design
+ * ------------------
+ * 1. DB counts + IBRA/CAPAD layer data are prefetched in the background as
+ *    soon as the component mounts — no user action required.
+ * 2. Risk summaries are computed in a CONCURRENCY-LIMITED queue (3 at a time)
+ *    so the backend is not hammered with N simultaneous requests.
+ * 3. Supplier cards are ALWAYS visible.  A slim banner indicates loading
+ *    without replacing the supplier list.
+ * 4. Prefetched layer data is passed into MapView so the first layer toggle
+ *    is instant — no fetch needed on click.
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Download, List, Map as MapIcon, RefreshCw, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import clsx from 'clsx';
 import { useSuppliers } from '../../context/SupplierContext';
-import { riskApi, SupplierRiskSummary } from '../../lib/api';
+import { riskApi, ibraApi, capadApi, SupplierRiskSummary, IbraRecord, CapadRegion } from '../../lib/api';
 import SupplierList from './SupplierList';
 import MapView from './MapView';
 import RiskProfile from './RiskProfile';
@@ -33,6 +40,27 @@ function riskLevel(s: SupplierRiskSummary): 'critical' | 'high' | 'medium' | 'lo
   return 'low';
 }
 
+/**
+ * Run async tasks with a maximum concurrency of `limit`.
+ * Prevents slamming the backend with N simultaneous risk-summary requests.
+ */
+async function pMap<T, R>(
+  items: T[],
+  fn: (item: T) => Promise<R>,
+  limit: number,
+): Promise<R[]> {
+  const results: R[] = [];
+  let idx = 0;
+  async function worker() {
+    while (idx < items.length) {
+      const i = idx++;
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 export default function BiodiversityDashboard() {
   const { suppliers } = useSuppliers();
 
@@ -41,21 +69,60 @@ export default function BiodiversityDashboard() {
   const [countsLoading, setCountsLoading] = useState(true);
   const [riskLoading, setRiskLoading]     = useState(false);
 
+  // Prefetched layer data — passed to MapView so first toggle is instant
+  const [prefetchedIbra,  setPrefetchedIbra]  = useState<IbraRecord[] | null>(null);
+  const [prefetchedCapad, setPrefetchedCapad] = useState<CapadRegion[] | null>(null);
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hoveredId,  setHoveredId]  = useState<string | null>(null);
   const [mobileTab,  setMobileTab]  = useState<'map' | 'list'>('list');
 
-  // ── Load real DB counts (background) ──────────────────────────────────
+  // Track whether a prefetch has started so we don't double-fire
+  const prefetchStarted = useRef(false);
+
+  // ── Background prefetch: counts + layer datasets ──────────────────────
   useEffect(() => {
+    if (prefetchStarted.current) return;
+    prefetchStarted.current = true;
+
+    // Counts — small, fetch immediately
     setCountsLoading(true);
     fetch(`${BASE}/api/biodiversity/counts`)
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then((d: DbCounts) => setDbCounts(d))
       .catch(() => setDbCounts(null))
       .finally(() => setCountsLoading(false));
-  }, []);
 
-  // ── Compute risk summaries (background) ───────────────────────────────
+    // IBRA regions — all 89 regions, two pages of 100
+    Promise.all([
+      ibraApi.list({ limit: 100, offset:   0 }).catch(() => [] as IbraRecord[]),
+      ibraApi.list({ limit: 100, offset: 100 }).catch(() => [] as IbraRecord[]),
+    ]).then(([p1, p2]) => {
+      const seen = new Set<string>();
+      setPrefetchedIbra([...p1, ...p2].filter(r => {
+        const key = r.ibra_reg_code ?? r.ibra_reg_name ?? String(r.id);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }));
+    }).catch(() => {/* non-fatal */});
+
+    // CAPAD regions — two pages of 2000 each
+    Promise.all([
+      capadApi.regions({ limit: 2000, offset:    0 }).catch(() => [] as CapadRegion[]),
+      capadApi.regions({ limit: 2000, offset: 2000 }).catch(() => [] as CapadRegion[]),
+    ]).then(([p1, p2]) => {
+      const seen = new Set<string>();
+      setPrefetchedCapad([...p1, ...p2].filter(r => {
+        const key = r.pa_id ?? String(r.id);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }));
+    }).catch(() => {/* non-fatal */});
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Compute risk summaries (concurrency-limited, background) ──────────
   const computeRisk = async () => {
     setRiskLoading(true);
     const candidates = suppliers.filter(
@@ -66,21 +133,22 @@ export default function BiodiversityDashboard() {
     );
     if (!candidates.length) { setRiskLoading(false); return; }
 
-    const results = await Promise.all(
-      candidates.map(s =>
-        riskApi.summary({
-          supplier_id:   s.id,
-          supplier_name: s.enrichedName ?? s.name,
-          lat:           s.coordinates!.lat,
-          lng:           s.coordinates!.lng,
-        }).catch(() => null)
-      )
+    // Run at most 3 risk-summary requests at a time to avoid DB overload
+    const results = await pMap(
+      candidates,
+      s => riskApi.summary({
+        supplier_id:   s.id,
+        supplier_name: s.enrichedName ?? s.name,
+        lat:           s.coordinates!.lat,
+        lng:           s.coordinates!.lng,
+      }).catch(() => null),
+      3,
     );
     setSummaries(results.filter(Boolean) as SupplierRiskSummary[]);
     setRiskLoading(false);
   };
 
-  // Trigger risk computation when suppliers change — never blocks rendering
+  // Trigger once when suppliers are ready — never blocks rendering
   useEffect(() => {
     if (suppliers.length > 0) computeRisk();
   }, [suppliers.length]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -190,7 +258,7 @@ export default function BiodiversityDashboard() {
           'md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm w-[280px] shrink-0 min-h-0 overflow-hidden',
           mobileTab === 'list' ? 'flex' : 'hidden md:flex'
         )}>
-          {/* Slim loading banner — sits above cards, doesn't replace them */}
+          {/* Slim loading banner — above cards, doesn't replace them */}
           <AnimatePresence>
             {riskLoading && (
               <motion.div
@@ -202,7 +270,7 @@ export default function BiodiversityDashboard() {
               >
                 <Loader2 className="w-3 h-3 text-emerald-500 animate-spin flex-shrink-0" />
                 <span className="text-[11px] text-emerald-700" style={{ fontWeight: 500 }}>
-                  Computing biodiversity risk from database…
+                  Computing biodiversity risk…
                 </span>
               </motion.div>
             )}
@@ -220,7 +288,7 @@ export default function BiodiversityDashboard() {
           />
         </div>
 
-        {/* CENTRE — Map */}
+        {/* CENTRE — Map (receives prefetched layer data) */}
         <div className={clsx(
           'md:flex flex-col rounded-2xl overflow-hidden border border-slate-200 shadow-sm flex-1 min-h-0',
           mobileTab === 'map' ? 'flex' : 'hidden md:flex'
@@ -232,6 +300,8 @@ export default function BiodiversityDashboard() {
             onSelect={setSelectedId}
             hoveredId={hoveredId}
             onHover={setHoveredId}
+            prefetchedIbra={prefetchedIbra}
+            prefetchedCapad={prefetchedCapad}
           />
         </div>
 

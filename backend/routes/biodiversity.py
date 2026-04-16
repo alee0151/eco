@@ -15,12 +15,27 @@ Endpoints:
   GET /api/biodiversity/ibra/{code}                 — Single IBRA region by code
   GET /api/biodiversity/counts                      — Real DB row counts for stat cards
   GET /api/biodiversity/risk-summary                — Risk summary for a supplier lat/lng
+
+Performance notes
+-----------------
+* /counts        — three COUNT queries run in parallel with asyncio.gather.
+* /risk-summary  — four independent sub-queries (IBRA, species count, CAPAD count,
+                   KBA count) all run in parallel with asyncio.gather.
+* IBRA lookup    — single query ordered by ST_Distance; returns the containing region
+                   first (distance = 0) and falls back to nearest without a second
+                   round-trip.
+* CAPAD count    — uses ST_DWithin on the real polygon geometry (geom) rather than a
+                   bounding-box centroid filter.  This correctly counts parks that
+                   *overlap* the search radius even when their centroid is outside it.
+                   Falls back to bbox centroid filter when PostGIS is unavailable.
+* Species count  — count and names derived from the same CTE in a single round-trip.
 """
 
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text
-from geoalchemy2.functions import ST_Within, ST_SetSRID, ST_MakePoint
+from geoalchemy2.functions import ST_Within, ST_SetSRID, ST_MakePoint, ST_DWithin
 from typing import Optional, List
 
 from database import get_db
@@ -29,14 +44,11 @@ from schemas import SpeciesOut, KbaOut, CapadOut, IbraOut, SupplierRiskSummary
 
 router = APIRouter()
 
-# Default spatial buffer in degrees (~50 km at Australian latitudes)
+# Default spatial buffer: ~50 km at Australian latitudes
 DEFAULT_BUFFER_DEG = 0.5
+# 0.5 degrees ≈ 55 km — used as the ST_DWithin metre radius too
+DEFAULT_BUFFER_METRES = 55_000
 
-# ---------------------------------------------------------------------------
-# State abbreviation → full stateprovince name
-# The ALA dataset stores full names (e.g. "Queensland") in stateprovince.
-# Frontend callers typically pass abbreviated codes ("QLD", "NSW" etc.).
-# ---------------------------------------------------------------------------
 STATE_ABBREV_MAP: dict[str, str] = {
     "NSW": "New South Wales",
     "VIC": "Victoria",
@@ -50,30 +62,18 @@ STATE_ABBREV_MAP: dict[str, str] = {
 
 
 def _resolve_state(raw: str) -> str:
-    """Return the full stateprovince string for an abbreviated or full state name."""
     return STATE_ABBREV_MAP.get(raw.upper().strip(), raw)
 
 
 # ---------------------------------------------------------------------------
-# Threatened-species dataset filter
-# Only count species from ALA threatened-species data resources.
+# Quality filters applied to all species proximity / risk queries
 # ---------------------------------------------------------------------------
 THREATENED_RESOURCE_FILTER = Species.dataresourcename.ilike("%threatened%")
 
-# ---------------------------------------------------------------------------
-# Species quality filters
-# Applied to all proximity / risk queries to exclude:
-#   - absent records (occurrencestatus != 'present')
-#   - obscured records (ALA fuzzes coordinates ±10 km for sensitive species)
-#   - unreliable basis of record (museum specimens, literature refs with bad coords)
-# ---------------------------------------------------------------------------
 SPECIES_QUALITY_FILTERS = [
     Species.occurrencestatus.ilike("present"),
     Species.is_obscured.is_(False),
-    Species.basisofrecord.in_([
-        "HUMAN_OBSERVATION",
-        "MACHINE_OBSERVATION",
-    ]),
+    Species.basisofrecord.in_(["HUMAN_OBSERVATION", "MACHINE_OBSERVATION"]),
 ]
 
 
@@ -81,13 +81,12 @@ SPECIES_QUALITY_FILTERS = [
 
 @router.get("/biodiversity/species", response_model=List[SpeciesOut])
 async def list_species(
-    limit:   int  = Query(100, ge=1, le=1000, description="Max records to return"),
-    offset:  int  = Query(0,   ge=0,          description="Pagination offset"),
-    state:   Optional[str] = Query(None, description="Filter by state — accepts abbreviation (QLD) or full name"),
-    kingdom: Optional[str] = Query(None, description="Filter by kingdom e.g. Animalia"),
+    limit:   int  = Query(100, ge=1, le=1000),
+    offset:  int  = Query(0,   ge=0),
+    state:   Optional[str] = Query(None),
+    kingdom: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return species occurrence records, optionally filtered."""
     q = select(Species)
     if state:
         resolved = _resolve_state(state)
@@ -101,14 +100,13 @@ async def list_species(
 
 @router.get("/biodiversity/species/by-bbox", response_model=List[SpeciesOut])
 async def species_by_bbox(
-    min_lat:  float = Query(..., description="South boundary latitude"),
-    max_lat:  float = Query(..., description="North boundary latitude"),
-    min_lng:  float = Query(..., description="West boundary longitude"),
-    max_lng:  float = Query(..., description="East boundary longitude"),
-    limit:    int   = Query(500, ge=1, le=2000),
+    min_lat: float = Query(...),
+    max_lat: float = Query(...),
+    min_lng: float = Query(...),
+    max_lng: float = Query(...),
+    limit:   int   = Query(500, ge=1, le=2000),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return species occurrences within a lat/lng bounding box."""
     q = (
         select(Species)
         .where(Species.decimallatitude.isnot(None))
@@ -122,16 +120,15 @@ async def species_by_bbox(
     return result.scalars().all()
 
 
-# ── KBA ──────────────────────────────────────────────────────────────────────
+# ── KBA ───────────────────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/kba", response_model=List[KbaOut])
 async def list_kba(
     limit:  int           = Query(200, ge=1, le=2000),
     offset: int           = Query(0,   ge=0),
-    region: Optional[str] = Query(None, description="Filter by region name"),
+    region: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return Key Biodiversity Areas, optionally filtered by region."""
     q = select(Kba)
     if region:
         q = q.where(Kba.region.ilike(f"%{region}%"))
@@ -148,18 +145,17 @@ async def get_kba(kba_id: int, db: AsyncSession = Depends(get_db)):
     return kba
 
 
-# ── CAPAD ────────────────────────────────────────────────────────────────────
+# ── CAPAD ─────────────────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/capad", response_model=List[CapadOut])
 async def list_capad(
-    limit:    int           = Query(200, ge=1, le=2000),
-    offset:   int           = Query(0,   ge=0),
-    state:    Optional[str] = Query(None, description="Filter by state e.g. VIC"),
-    pa_type:  Optional[str] = Query(None, description="Filter by type e.g. 'National Park'"),
-    is_active: Optional[bool] = Query(None, description="Filter by active status"),
+    limit:     int           = Query(200, ge=1, le=2000),
+    offset:    int           = Query(0,   ge=0),
+    state:     Optional[str] = Query(None),
+    pa_type:   Optional[str] = Query(None),
+    is_active: Optional[bool] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return protected areas from CAPAD, with optional filters."""
     q = select(Capad)
     if state:
         q = q.where(Capad.state.ilike(f"%{state}%"))
@@ -174,20 +170,14 @@ async def list_capad(
 
 @router.get("/biodiversity/capad/regions")
 async def capad_regions(
-    state:    Optional[str] = Query(None, description="Filter by state e.g. VIC"),
-    limit:    int           = Query(2000, ge=1, le=5000),
-    offset:   int           = Query(0,   ge=0),
+    state:  Optional[str] = Query(None),
+    limit:  int           = Query(2000, ge=1, le=5000),
+    offset: int           = Query(0,   ge=0),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Return CAPAD protected areas as a lightweight list for polygon rendering.
-    Only rows with a non-null geom_wkt are returned.
-
-    Fields: id, pa_id, pa_name, pa_type, pa_type_abbr, iucn_cat, state,
-            gis_area_ha, governance, authority, epbc_trigger, geom_wkt.
-
-    Ordered by area descending so the largest regions render first and smaller
-    regions paint on top (correct z-ordering without explicit z-index).
+    Lightweight CAPAD polygon list for map rendering.
+    Ordered by area DESC so large regions paint first and smaller parks sit on top.
     """
     q = (
         select(
@@ -212,7 +202,6 @@ async def capad_by_state(
     limit: int = Query(500, ge=1, le=2000),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return all protected areas for a given Australian state."""
     result = await db.execute(
         select(Capad)
         .where(Capad.state.ilike(f"%{state}%"))
@@ -237,10 +226,9 @@ async def get_capad(capad_id: int, db: AsyncSession = Depends(get_db)):
 async def list_ibra(
     limit:  int           = Query(200, ge=1, le=500),
     offset: int           = Query(0,   ge=0),
-    state:  Optional[str] = Query(None, description="Filter by state e.g. NSW"),
+    state:  Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return IBRA bioregions."""
     q = select(Ibra)
     if state:
         q = q.where(Ibra.state.ilike(f"%{state}%"))
@@ -251,7 +239,6 @@ async def list_ibra(
 
 @router.get("/biodiversity/ibra/{code}", response_model=IbraOut)
 async def get_ibra_by_code(code: str, db: AsyncSession = Depends(get_db)):
-    """Return a single IBRA bioregion by its 3-letter code (e.g. BBS)."""
     result = await db.execute(
         select(Ibra).where(Ibra.ibra_reg_code.ilike(code))
     )
@@ -261,22 +248,24 @@ async def get_ibra_by_code(code: str, db: AsyncSession = Depends(get_db)):
     return ibra
 
 
-# ── DB Counts (real row totals for stat cards) ────────────────────────────────
+# ── DB Counts ─────────────────────────────────────────────────────────────────
 
 @router.get("/biodiversity/counts")
 async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
     """
-    Return real row counts for CAPAD (active), KBA, and Species tables.
-    Used by the frontend stat cards so they show live numbers, not hardcoded strings.
+    Return live row counts for stat cards.
+    All three COUNT queries run in parallel via asyncio.gather — no serial waiting.
     """
-    capad_result   = await db.execute(select(func.count()).select_from(Capad).where(Capad.is_active == True))  # noqa: E712
-    kba_result     = await db.execute(select(func.count()).select_from(Kba))
-    species_result = await db.execute(select(func.count()).select_from(Species))
+    capad_q   = db.execute(select(func.count()).select_from(Capad).where(Capad.is_active == True))   # noqa: E712
+    kba_q     = db.execute(select(func.count()).select_from(Kba))
+    species_q = db.execute(select(func.count()).select_from(Species))
+
+    capad_res, kba_res, species_res = await asyncio.gather(capad_q, kba_q, species_q)
 
     return {
-        "capad_active":  capad_result.scalar() or 0,
-        "kba_total":     kba_result.scalar()   or 0,
-        "species_total": species_result.scalar() or 0,
+        "capad_active":  capad_res.scalar()   or 0,
+        "kba_total":     kba_res.scalar()     or 0,
+        "species_total": species_res.scalar() or 0,
     }
 
 
@@ -284,127 +273,138 @@ async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
 
 @router.get("/biodiversity/risk-summary", response_model=SupplierRiskSummary)
 async def risk_summary(
-    supplier_id:   str   = Query(..., description="Supplier ID e.g. SUP-001"),
-    supplier_name: str   = Query(..., description="Supplier name"),
-    lat:           float = Query(..., description="Supplier latitude"),
-    lng:           float = Query(..., description="Supplier longitude"),
-    buffer_deg:    float = Query(DEFAULT_BUFFER_DEG, description="Search radius in degrees (~0.5 ≈ 50 km)"),
+    supplier_id:   str   = Query(...),
+    supplier_name: str   = Query(...),
+    lat:           float = Query(...),
+    lng:           float = Query(...),
+    buffer_deg:    float = Query(DEFAULT_BUFFER_DEG),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Given a supplier lat/lng, compute a biodiversity risk summary by:
+    Compute a biodiversity risk summary for a supplier location.
 
-    1. IBRA lookup  — ST_Within(supplier_point, ibra.geom) against the real
-                      MULTIPOLYGON boundaries.  No approximation, no guessing.
-                      Falls back to ST_DWithin (nearest region) if the point
-                      sits exactly on a boundary or in a gap between regions.
+    All four sub-queries run in **parallel** with asyncio.gather:
 
-    2. Species      — Count distinct threatened species (by taxonconceptid) whose
-                      confirmed occurrences (present, non-obscured, reliable basis)
-                      fall within the bounding box around the supplier.
-                      The names list is derived from the SAME CTE so count and
-                      list are always consistent.
+    1. IBRA region  — single query ordered by ST_Distance (0 = containing polygon,
+                      > 0 = nearest fallback).  No second round-trip needed.
 
-    3. CAPAD        — Count protected area centroids within the buffer.
+    2. Species      — distinct threatened-species count + representative names,
+                      both from the same CTE in a single DB round-trip.
 
-    4. KBA          — Count Key Biodiversity Area centroids within the buffer.
+    3. CAPAD count  — ST_DWithin on real polygon geometry so parks that *overlap*
+                      the search radius are counted even if their centroid is outside
+                      it.  Falls back to bbox centroid filter if PostGIS unavailable.
+
+    4. KBA count    — bounding-box centroid filter (KBA table has no polygon geom).
     """
     min_lat = lat - buffer_deg
     max_lat = lat + buffer_deg
     min_lng = lng - buffer_deg
     max_lng = lng + buffer_deg
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # 1. IBRA region — exact ST_Within against MULTIPOLYGON boundaries
-    # ──────────────────────────────────────────────────────────────────────────
     supplier_point = ST_SetSRID(ST_MakePoint(lng, lat), 4326)
 
-    ibra_exact_result = await db.execute(
-        select(Ibra.ibra_reg_name, Ibra.ibra_reg_code)
-        .where(Ibra.geom.isnot(None))
-        .where(ST_Within(supplier_point, Ibra.geom))
-        .limit(1)
-    )
-    ibra_row = ibra_exact_result.first()
-
-    if not ibra_row:
-        ibra_near_result = await db.execute(
+    # ── 1. IBRA — single distance-ordered query ────────────────────────────
+    # ST_Distance returns 0 when the point is inside the polygon, so the
+    # containing region sorts first.  No separate fallback query needed.
+    async def _ibra() -> tuple[str | None, str | None]:
+        result = await db.execute(
             text("""
                 SELECT ibra_reg_name, ibra_reg_code
-                FROM ibra
-                WHERE geom IS NOT NULL
-                ORDER BY geom <-> ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
-                LIMIT 1
+                FROM   ibra
+                WHERE  geom IS NOT NULL
+                ORDER  BY geom <-> ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
+                LIMIT  1
             """),
             {"lng": lng, "lat": lat},
         )
-        ibra_row = ibra_near_result.first()
+        row = result.first()
+        return (row[0] if row else None, row[1] if row else None)
 
-    ibra_name = ibra_row[0] if ibra_row else None
-    ibra_code = ibra_row[1] if ibra_row else None
+    # ── 2. Species — count + names in one CTE round-trip ──────────────────
+    async def _species() -> tuple[int, list[str]]:
+        # Single query: CTE groups by taxon concept → count rows + fetch names
+        rows = (await db.execute(
+            text("""
+                WITH threatened AS (
+                    SELECT
+                        taxonconceptid,
+                        MIN(vernacularname) FILTER (WHERE vernacularname IS NOT NULL)
+                            AS representative_name
+                    FROM   species
+                    WHERE  taxonconceptid IS NOT NULL
+                      AND  decimallatitude  IS NOT NULL
+                      AND  decimallongitude IS NOT NULL
+                      AND  decimallatitude  BETWEEN :min_lat AND :max_lat
+                      AND  decimallongitude BETWEEN :min_lng AND :max_lng
+                      AND  dataresourcename ILIKE '%%threatened%%'
+                      AND  occurrencestatus ILIKE 'present'
+                      AND  is_obscured IS NOT TRUE
+                      AND  basisofrecord IN ('HUMAN_OBSERVATION', 'MACHINE_OBSERVATION')
+                    GROUP BY taxonconceptid
+                )
+                SELECT
+                    COUNT(*)                                          AS species_count,
+                    ARRAY_AGG(representative_name ORDER BY representative_name)
+                        FILTER (WHERE representative_name IS NOT NULL) AS names
+                FROM threatened
+            """),
+            {"min_lat": min_lat, "max_lat": max_lat,
+             "min_lng": min_lng, "max_lng": max_lng},
+        )).first()
+        count = int(rows[0] or 0) if rows else 0
+        names = list((rows[1] or [])[:20]) if rows else []
+        return count, names
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # 2. Threatened species — distinct count + names, both from the same CTE
-    # ──────────────────────────────────────────────────────────────────────────
-    threatened_cte = (
-        select(
-            Species.taxonconceptid,
-            func.min(Species.vernacularname).filter(
-                Species.vernacularname.isnot(None)
-            ).label("representative_name"),
+    # ── 3. CAPAD — ST_DWithin on real polygon geometry ────────────────────
+    # Counts protected areas whose polygon boundary comes within buffer_metres
+    # of the supplier point.  Parks are counted even when the supplier sits
+    # inside the park (distance = 0) or the park overlaps the radius without
+    # its centroid being inside the bbox.
+    async def _capad() -> int:
+        buffer_metres = buffer_deg * 111_000  # 1 deg ≈ 111 km
+        try:
+            result = await db.execute(
+                select(func.count()).select_from(Capad)
+                .where(Capad.geom.isnot(None))
+                .where(Capad.is_active == True)  # noqa: E712
+                .where(
+                    ST_DWithin(
+                        Capad.geom.cast(text("geography")),
+                        func.ST_SetSRID(
+                            func.ST_MakePoint(lng, lat), 4326
+                        ).cast(text("geography")),
+                        buffer_metres,
+                    )
+                )
+            )
+            return result.scalar() or 0
+        except Exception:
+            # Fallback: centroid bbox filter if PostGIS geography cast unavailable
+            result = await db.execute(
+                select(func.count()).select_from(Capad)
+                .where(Capad.latitude.isnot(None))
+                .where(Capad.longitude.isnot(None))
+                .where(Capad.latitude.between(min_lat, max_lat))
+                .where(Capad.longitude.between(min_lng, max_lng))
+            )
+            return result.scalar() or 0
+
+    # ── 4. KBA — bbox centroid (no polygon geom in KBA table) ─────────────
+    async def _kba() -> int:
+        result = await db.execute(
+            select(func.count()).select_from(Kba)
+            .where(Kba.sit_lat.isnot(None))
+            .where(Kba.sit_long.isnot(None))
+            .where(Kba.sit_lat.between(min_lat, max_lat))
+            .where(Kba.sit_long.between(min_lng, max_lng))
         )
-        .where(Species.taxonconceptid.isnot(None))
-        .where(Species.decimallatitude.isnot(None))
-        .where(Species.decimallongitude.isnot(None))
-        .where(Species.decimallatitude.between(min_lat, max_lat))
-        .where(Species.decimallongitude.between(min_lng, max_lng))
-        .where(THREATENED_RESOURCE_FILTER)
-        .where(Species.occurrencestatus.ilike("present"))
-        .where(Species.is_obscured.is_(False))
-        .where(Species.basisofrecord.in_([
-            "HUMAN_OBSERVATION",
-            "MACHINE_OBSERVATION",
-        ]))
-        .group_by(Species.taxonconceptid)
-        .cte("threatened_species")
-    )
+        return result.scalar() or 0
 
-    count_result = await db.execute(
-        select(func.count()).select_from(threatened_cte)
+    # ── Run all four sub-queries in parallel ───────────────────────────────
+    (ibra_name, ibra_code), (species_count, species_names), capad_count, kba_count = (
+        await asyncio.gather(_ibra(), _species(), _capad(), _kba())
     )
-    species_count = count_result.scalar() or 0
-
-    names_result = await db.execute(
-        select(threatened_cte.c.representative_name)
-        .where(threatened_cte.c.representative_name.isnot(None))
-        .order_by(threatened_cte.c.representative_name)
-        .limit(20)
-    )
-    species_names = [row[0] for row in names_result.fetchall()]
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 3. CAPAD — protected area centroids within the buffer
-    # ──────────────────────────────────────────────────────────────────────────
-    capad_count_result = await db.execute(
-        select(func.count()).select_from(Capad)
-        .where(Capad.latitude.isnot(None))
-        .where(Capad.longitude.isnot(None))
-        .where(Capad.latitude.between(min_lat, max_lat))
-        .where(Capad.longitude.between(min_lng, max_lng))
-    )
-    capad_count = capad_count_result.scalar() or 0
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 4. KBA — Key Biodiversity Area centroids within the buffer
-    # ──────────────────────────────────────────────────────────────────────────
-    kba_count_result = await db.execute(
-        select(func.count()).select_from(Kba)
-        .where(Kba.sit_lat.isnot(None))
-        .where(Kba.sit_long.isnot(None))
-        .where(Kba.sit_lat.between(min_lat, max_lat))
-        .where(Kba.sit_long.between(min_lng, max_lng))
-    )
-    kba_count = kba_count_result.scalar() or 0
 
     return SupplierRiskSummary(
         supplier_id=supplier_id,
