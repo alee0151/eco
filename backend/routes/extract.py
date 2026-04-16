@@ -4,10 +4,9 @@ POST /api/extract
 Accepts a multipart upload of a PDF or image file.
 
 OCR  : Tesseract (pytesseract) — free, runs 100 % locally.
-LLM  : OpenRouter  — cloud API, OpenAI-compatible.
-        Set OPENROUTER_API_KEY in backend/.env
-        Set OPENROUTER_MODEL  in backend/.env  (default: meta-llama/llama-3.3-70b-instruct:free)
-        Register at https://openrouter.ai
+LLM  : HuggingFace Inference API — free tier, no credits required.
+        Set HF_API_KEY in backend/.env  (get one at https://huggingface.co/settings/tokens)
+        Set HF_MODEL   in backend/.env  (default: mistralai/Mistral-7B-Instruct-v0.3)
 
 Address extraction scope
 ------------------------
@@ -17,12 +16,13 @@ No street name, no street number, no unit, no country.
 
 Environment variables
 ---------------------
-OPENROUTER_API_KEY   Required. Your OpenRouter API key.
-OPENROUTER_MODEL     Model slug (default: meta-llama/llama-3.3-70b-instruct:free)
-                     Other free options:
-                       mistralai/mistral-small-3.1-24b-instruct:free
-                       meta-llama/llama-4-maverick:free
-                       deepseek/deepseek-r1:free
+HF_API_KEY   Required. HuggingFace token (read access is enough).
+             Free tier: https://huggingface.co/settings/tokens
+HF_MODEL     Model repo (default: mistralai/Mistral-7B-Instruct-v0.3)
+             Other free options:
+               Qwen/Qwen2.5-7B-Instruct
+               microsoft/Phi-3-mini-4k-instruct
+               HuggingFaceH4/zephyr-7b-beta
 """
 
 import io
@@ -31,38 +31,16 @@ import logging
 import os
 import re
 
-from openai import OpenAI
+import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Default free model — no credits required on OpenRouter
-DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
-
-
-# ── OpenRouter client ──────────────────────────────────────────────────────────────
-
-def _get_openrouter_client() -> OpenAI:
-    """
-    Build and return an OpenAI-compatible client pointed at OpenRouter.
-    Raises HTTP 503 immediately if OPENROUTER_API_KEY is not set.
-    """
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "OPENROUTER_API_KEY is not configured. "
-                "Register at https://openrouter.ai and add "
-                "OPENROUTER_API_KEY=<your-key> to backend/.env"
-            ),
-        )
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-    )
+# Default free model on HuggingFace Inference API
+DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
+HF_API_BASE   = "https://api-inference.huggingface.co/models"
 
 
 # ── Response schema ───────────────────────────────────────────────────────────
@@ -270,7 +248,7 @@ WARNINGS — add a warning string for each of these situations:
 GENERAL RULES:
   • If a field cannot be found, use empty string "".
   • Do NOT invent or guess data that is not present in the text.
-  • Do NOT copy the buyer's data into any field.
+  • Do NOT copy the buyer’s data into any field.
 
 OCR TEXT:
 ---
@@ -279,72 +257,104 @@ OCR TEXT:
 """
 
 
-# ── LLM call — OpenRouter ───────────────────────────────────────────────────────
+# ── LLM call — HuggingFace Inference API ───────────────────────────────────────
 
 def run_llm(ocr_text: str) -> dict:
     """
-    Send OCR text to OpenRouter and return parsed JSON dict.
+    Send OCR text to the HuggingFace free Inference API and return parsed JSON.
 
-    Uses the OpenAI-compatible chat completions endpoint.
-    Model is configurable via OPENROUTER_MODEL env var.
-    Defaults to meta-llama/llama-3.3-70b-instruct:free — no credits required.
-    temperature=0 for deterministic, structured output.
+    Uses the /v1/chat/completions endpoint (OpenAI-compatible, available on
+    most instruction-tuned models on HF).
+    Authenticated with a free HF read token — no payment required.
     """
-    model  = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-    client = _get_openrouter_client()
+    api_key = os.getenv("HF_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "HF_API_KEY is not configured. "
+                "Create a free token at https://huggingface.co/settings/tokens "
+                "and add HF_API_KEY=hf_... to backend/.env"
+            ),
+        )
 
-    logger.info("[extract] using model: %s", model)
+    model   = os.getenv("HF_MODEL", DEFAULT_MODEL)
+    url     = f"{HF_API_BASE}/{model}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "model":       model,
+        "messages":    [{"role": "user", "content": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000])}],
+        "temperature": 0.0,
+        "max_tokens":  1024,
+    }
+
+    logger.info("[extract] HF model: %s", model)
 
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role":    "user",
-                    "content": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
-                }
-            ],
-            temperature=0,
+        resp = httpx.post(url, headers=headers, json=payload, timeout=60)
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=503, detail=f"Cannot reach HuggingFace API: {exc}")
+
+    if resp.status_code == 401:
+        raise HTTPException(
+            status_code=401,
+            detail="HuggingFace authentication failed — check HF_API_KEY in backend/.env",
         )
-    except Exception as exc:
-        err = str(exc)
-        if "402" in err or "credits" in err.lower() or "insufficient" in err.lower():
-            raise HTTPException(
-                status_code=402,
-                detail=(
-                    f"OpenRouter insufficient credits for model '{model}'. "
-                    "Ensure your model slug ends with ':free', e.g. "
-                    "meta-llama/llama-3.3-70b-instruct:free"
-                ),
-            )
-        if "401" in err or "authentication" in err.lower() or "api key" in err.lower():
-            raise HTTPException(
-                status_code=401,
-                detail=f"OpenRouter authentication failed — check OPENROUTER_API_KEY: {err}",
-            )
-        if "429" in err or "rate" in err.lower():
-            raise HTTPException(
-                status_code=429,
-                detail=f"OpenRouter rate limit exceeded: {err}",
-            )
+    if resp.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Model '{model}' not found on HuggingFace or does not support "
+                "the /v1/chat/completions endpoint. Try a different HF_MODEL."
+            ),
+        )
+    if resp.status_code == 429:
+        raise HTTPException(
+            status_code=429,
+            detail="HuggingFace free tier rate limit hit — please retry in a moment.",
+        )
+    if resp.status_code == 503:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Model '{model}' is loading on HuggingFace (cold start). "
+                "Wait 20–60 seconds and retry, or set HF_MODEL to a smaller model."
+            ),
+        )
+    if resp.status_code != 200:
         raise HTTPException(
             status_code=502,
-            detail=f"OpenRouter request failed: {err}",
+            detail=f"HuggingFace API error {resp.status_code}: {resp.text[:300]}",
         )
 
-    raw = (response.choices[0].message.content or "").strip()
+    try:
+        data = resp.json()
+        raw  = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unexpected HuggingFace response shape: {exc} — {resp.text[:300]}",
+        )
 
-    # Strip markdown code fences if the model wraps its output
+    # Strip markdown code fences if model wraps output
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$",       "", raw).strip()
+
+    # Some models echo the prompt before the JSON — extract the first { ... } block
+    json_match = re.search(r"(\{.*\})", raw, re.DOTALL)
+    if json_match:
+        raw = json_match.group(1)
 
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        logger.error("OpenRouter non-JSON response: %s", raw[:500])
+        logger.error("HF non-JSON response: %s", raw[:500])
         raise HTTPException(
             status_code=502,
-            detail=f"OpenRouter returned unparseable JSON: {exc}",
+            detail=f"HuggingFace model returned unparseable JSON: {exc}",
         )
 
 
@@ -461,7 +471,7 @@ async def extract(
     Pipeline:
       1. Validate file type & size.
       2. Run Tesseract OCR  →  raw text.
-      3. Send raw text to OpenRouter (default: llama-3.3-70b-instruct:free)  →  structured JSON.
+      3. Send raw text to HuggingFace Inference API  →  structured JSON.
          address = "suburb state postcode" only.
       4. Validate ABN checksum.
       5. Sanitise address: strip any street/unit/country pollution, validate AU format.
