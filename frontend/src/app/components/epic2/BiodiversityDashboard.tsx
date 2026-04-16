@@ -18,6 +18,8 @@
  *    RiskProfile while geocoding / risk computation is still pending.
  * 5. computeRisk watches geocodedCount (not suppliers.length) so it
  *    re-fires whenever coordinates land on an existing supplier.
+ * 6. Risk summaries are UPSERTED into state one-by-one as each API call
+ *    resolves — never batch-replaced — so cards never disappear mid-run.
  */
 
 import { useState, useEffect, useRef } from 'react';
@@ -63,6 +65,25 @@ async function pMap<T, R>(
   return results;
 }
 
+/**
+ * Upsert a single risk summary into the summaries array.
+ * Updates in-place if supplier_id already exists, otherwise appends.
+ * Used by computeRisk to stream results in one-by-one so cards are
+ * never removed while the batch is still resolving.
+ */
+function upsertSummary(
+  prev: SupplierRiskSummary[],
+  result: SupplierRiskSummary,
+): SupplierRiskSummary[] {
+  const idx = prev.findIndex(s => s.supplier_id === result.supplier_id);
+  if (idx >= 0) {
+    const next = [...prev];
+    next[idx] = result;
+    return next;
+  }
+  return [...prev, result];
+}
+
 export default function BiodiversityDashboard() {
   const { suppliers } = useSuppliers();
 
@@ -81,6 +102,10 @@ export default function BiodiversityDashboard() {
 
   // Track whether a prefetch has started so we don't double-fire
   const prefetchStarted = useRef(false);
+
+  // Monotonically-incrementing run ID — lets us discard results from a
+  // stale run if a newer computeRisk() fires before the old one finishes.
+  const currentRunId = useRef(0);
 
   // ── Background prefetch: counts + layer datasets ──────────────────────
   useEffect(() => {
@@ -124,30 +149,48 @@ export default function BiodiversityDashboard() {
     }).catch(() => {/* non-fatal */});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Compute risk summaries (concurrency-limited, background) ──────────
+  // ── Compute risk summaries (concurrency-limited, streaming upsert) ────
+  //
+  // KEY FIX: results are upserted into state one-by-one as each individual
+  // API call resolves, rather than batch-replacing the entire summaries array
+  // at the end. This means existing cards are NEVER removed — they are only
+  // updated in place — so there is no 1-second disappearance window between
+  // the start of a new run and the final setSummaries() call.
   const computeRisk = async () => {
+    const runId = ++currentRunId.current;
     setRiskLoading(true);
+
     const candidates = suppliers.filter(
       s => s.coordinates && (
         s.status === 'approved' || s.status === 'validated' ||
         s.isValidated || s.status === 'pending'
       )
     );
+
     if (!candidates.length) { setRiskLoading(false); return; }
 
-    // Run at most 3 risk-summary requests at a time to avoid DB overload
-    const results = await pMap(
+    await pMap(
       candidates,
-      s => riskApi.summary({
-        supplier_id:   s.id,
-        supplier_name: s.enrichedName ?? s.name,
-        lat:           s.coordinates!.lat,
-        lng:           s.coordinates!.lng,
-      }).catch(() => null),
+      async s => {
+        const result = await riskApi.summary({
+          supplier_id:   s.id,
+          supplier_name: s.enrichedName ?? s.name,
+          lat:           s.coordinates!.lat,
+          lng:           s.coordinates!.lng,
+        }).catch(() => null);
+
+        // Discard result if a newer run has already started
+        if (result && runId === currentRunId.current) {
+          setSummaries(prev => upsertSummary(prev, result));
+        }
+
+        return result;
+      },
       3,
     );
-    setSummaries(results.filter(Boolean) as SupplierRiskSummary[]);
-    setRiskLoading(false);
+
+    // Only clear the loading flag if this run is still the current one
+    if (runId === currentRunId.current) setRiskLoading(false);
   };
 
   // Re-fire computeRisk whenever:
