@@ -2,48 +2,38 @@
 routes/geocode.py  —  POST /api/geocode
 
 Geocodes a supplier address using the Geoscape Address Lookup API,
-which is backed by the official Australian G-NAF (Geocoded National
-Address File) — the most authoritative address dataset in Australia.
+backed by the official Australian G-NAF (Geocoded National Address File).
 
 API docs: https://docs.geoscape.com.au/docs/address-lookup
 
-Request:
-  { "address": "<free-text address string>" }
-  or with structured fields from the LLM parser:
-  {
-    "address":  "<free-text>",
-    "street":   "42 Wallaby Way",
-    "suburb":   "Cooma",
-    "state":    "NSW",
-    "postcode": "2630"
-  }
+Request body
+------------
+{
+  "address":  "441 St Kilda Road, Melbourne VIC 3004, Australia",  # formatted string
+  "street":   "441 St Kilda Road",   # from LLM parser
+  "suburb":   "Melbourne",
+  "state":    "VIC",
+  "postcode": "3004"
+}
 
-Response:
-  {
-    "lat":              -36.2345,
-    "lng":              149.1234,
-    "gnaf_pid":         "GANSW123456789",
-    "confidence":       90,
-    "resolution_level": "facility",    # facility | regional | state | unknown
-    "inference_method": "gnaf",
-    "display_address":  "42 Wallaby Way, Cooma NSW 2630",
-    "source":           "geoscape"
-  }
+Formatted address canonical form (used for all geocoding queries):
+  "[unit ]street, suburb state postcode, Australia"
+  e.g. "441 St Kilda Road, Melbourne VIC 3004, Australia"
 
-Fallback chain (if G-NAF returns no result):
-  structured → free-text → suburb+state → state centroid → Australia centre
+Query priority inside the endpoint:
+  1. Full formatted string   (street + suburb + state + postcode + country)
+  2. Structured components   (street, suburb state postcode)
+  3. Suburb + state + postcode  (coarse fallback)
+  4. State centroid / Australia centre  (last resort)
+
+Fallback chain:
+  Geoscape G-NAF  →  Nominatim OSM  →  state centroid  →  Australia centre
 
 Environment variables
 ---------------------
-GEOSCAPE_API_KEY   Geoscape API key (required for G-NAF lookups).
+GEOSCAPE_API_KEY   Geoscape API key.  Free tier: 1,000 calls/month.
                    Register at https://geoscape.com.au/geoscape-developer-centre/
-                   Free tier: 1,000 calls/month. Paid plans available.
-
-Fallback behaviour
-------------------
-If GEOSCAPE_API_KEY is not set or the API returns no result, the endpoint
-falls back to Nominatim OSM so the pipeline never returns empty coordinates.
-This lets the app work in development without a Geoscape key.
+                   If unset, falls back to Nominatim automatically.
 """
 
 import logging
@@ -78,22 +68,79 @@ AUS_CENTRE = (-25.2744, 133.7751)
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class GeocodeRequest(BaseModel):
-    address:  str = ""     # free-text (formatted) address
-    street:   str = ""     # from LLM parser: house number + street
-    suburb:   str = ""     # from LLM parser
-    state:    str = ""     # from LLM parser: NSW / VIC / ...
-    postcode: str = ""     # from LLM parser
+    address:  str = ""   # canonical formatted string: street, suburb state postcode, Australia
+    street:   str = ""   # from LLM parser
+    suburb:   str = ""   # from LLM parser
+    state:    str = ""   # from LLM parser: NSW / VIC / ...
+    postcode: str = ""   # from LLM parser
 
 
 class GeocodeResponse(BaseModel):
     lat:              float
     lng:              float
-    gnaf_pid:         str   = ""          # G-NAF persistent identifier
-    confidence:       int   = 0           # 0–100
-    resolution_level: str   = "unknown"   # facility | regional | state | unknown
-    inference_method: str   = "unknown"
-    display_address:  str   = ""
-    source:           str   = "unknown"   # geoscape | nominatim | centroid
+    gnaf_pid:         str  = ""
+    confidence:       int  = 0
+    resolution_level: str  = "unknown"   # facility | regional | state | unknown
+    inference_method: str  = "unknown"
+    display_address:  str  = ""
+    source:           str  = "unknown"   # geoscape | nominatim | centroid
+
+
+# ── Address query builder ─────────────────────────────────────────────────────
+
+def _build_structured_query(street: str, suburb: str, state: str, postcode: str) -> str:
+    """
+    Build a clean structured geocoding query from LLM-parsed components.
+
+    Format: "street, suburb state postcode, Australia"
+
+    Examples:
+      street="441 St Kilda Road", suburb="Melbourne", state="VIC", postcode="3004"
+        → "441 St Kilda Road, Melbourne VIC 3004, Australia"
+
+      suburb="Cooma", state="NSW", postcode="2630"  (no street)
+        → "Cooma NSW 2630, Australia"
+
+      state="VIC"  (only state)
+        → "VIC, Australia"
+    """
+    street_part   = street.strip()
+    locality_part = " ".join(p for p in [suburb.strip(), state.strip(), postcode.strip()] if p)
+
+    parts = [p for p in [street_part, locality_part, "Australia"] if p]
+    return ", ".join(parts)
+
+
+def _build_queries(body: GeocodeRequest) -> list[str]:
+    """
+    Return ordered list of query strings to try (most → least specific).
+    All queries use the canonical format: street, suburb state postcode, Australia
+    """
+    queries: list[str] = []
+
+    addr = body.address.strip()
+    street   = body.street.strip()
+    suburb   = body.suburb.strip()
+    state    = body.state.strip().upper()
+    postcode = body.postcode.strip()
+
+    # 1. Full formatted address (already in canonical form from parse_address endpoint)
+    if addr:
+        queries.append(addr)
+
+    # 2. Structured query from LLM components
+    if street or suburb:
+        structured = _build_structured_query(street, suburb, state, postcode)
+        if structured not in queries:
+            queries.append(structured)
+
+    # 3. Suburb + state + postcode (coarse, no street)
+    if suburb and state:
+        coarse = _build_structured_query("", suburb, state, postcode)
+        if coarse not in queries:
+            queries.append(coarse)
+
+    return queries
 
 
 # ── Geoscape G-NAF lookup ─────────────────────────────────────────────────
@@ -104,12 +151,8 @@ async def _geoscape_lookup(
     query: str,
 ) -> Optional[GeocodeResponse]:
     """
-    Call the Geoscape /v1/addresses/bulk-geocode endpoint.
-    Returns a GeocodeResponse on success, None on no-match or error.
-
-    Geoscape API reference:
-      GET /v1/addresses?query=<address>&maxResults=1
-      Authorization: apikey <key>
+    POST /v1/addresses?query=<canonical address>&maxResults=1
+    Authorization: apikey <key>
     """
     try:
         resp = await client.get(
@@ -137,11 +180,9 @@ async def _geoscape_lookup(
     except Exception:
         return None
 
-    # Geoscape response shape:
-    # { "addressResults": [ { "address": {...}, "geocode": {"latitude": x, "longitude": y, ...} } ] }
     results = data.get("addressResults") or data.get("candidates") or []
     if not results:
-        logger.info("[geocode] Geoscape no result for %r", query)
+        logger.info("[geocode] Geoscape: no result for %r", query)
         return None
 
     hit     = results[0]
@@ -154,7 +195,6 @@ async def _geoscape_lookup(
     if lat is None or lng is None:
         return None
 
-    # G-NAF geocode types → resolution level
     geocode_type = (geocode.get("geocodeType") or geocode.get("type") or "").upper()
     if any(k in geocode_type for k in ("PROPERTY", "BUILDING", "PARCEL", "FRONTAGE", "LOCALITY")):
         level = "facility"
@@ -165,11 +205,11 @@ async def _geoscape_lookup(
     elif any(k in geocode_type for k in ("STATE",)):
         level = "state"
     else:
-        level = "facility"  # default for matched G-NAF records
+        level = "facility"
 
-    display = addr.get("formattedAddress") or addr.get("addressLine") or query
+    display  = addr.get("formattedAddress") or addr.get("addressLine") or query
     gnaf_pid = addr.get("gnafAddressDetailPid") or addr.get("gnafId") or ""
-    score    = hit.get("score") or hit.get("matchScore") or 95
+    score    = int(min(hit.get("score") or hit.get("matchScore") or 95, 100))
 
     logger.info(
         "[geocode] G-NAF hit: %r → (%.5f, %.5f) type=%s pid=%s",
@@ -180,7 +220,7 @@ async def _geoscape_lookup(
         lat              = float(lat),
         lng              = float(lng),
         gnaf_pid         = str(gnaf_pid),
-        confidence       = int(min(score, 100)),
+        confidence       = score,
         resolution_level = level,
         inference_method = "gnaf",
         display_address  = display,
@@ -195,14 +235,23 @@ async def _nominatim_fallback(
     query: str,
 ) -> Optional[GeocodeResponse]:
     """
-    Nominatim OSM fallback — used when Geoscape API key is absent or
-    the G-NAF lookup returns no result.
+    Nominatim OSM fallback — query must be in canonical form:
+    "street, suburb state postcode, Australia"
     """
     try:
         resp = await client.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": query, "format": "jsonv2", "countrycodes": "au", "addressdetails": "1", "limit": "1"},
-            headers={"Accept-Language": "en-AU", "User-Agent": "eco-supply-chain-risk/1.0"},
+            params={
+                "q":             query,
+                "format":        "jsonv2",
+                "countrycodes":  "au",
+                "addressdetails": "1",
+                "limit":         "1",
+            },
+            headers={
+                "Accept-Language": "en-AU",
+                "User-Agent":      "eco-supply-chain-risk/1.0",
+            },
             timeout=10,
         )
         resp.raise_for_status()
@@ -214,14 +263,20 @@ async def _nominatim_fallback(
     if not data:
         return None
 
-    hit = data[0]
+    hit      = data[0]
     osm_type = hit.get("type", "")
     level = (
         "facility" if osm_type in {"building", "office", "commercial", "house", "industrial"}
         else "regional" if osm_type in {"suburb", "town", "village", "postcode", "neighbourhood"}
-        else "state"   if osm_type in {"state", "county"}
+        else "state"    if osm_type in {"state", "county"}
         else "unknown"
     )
+
+    logger.info(
+        "[geocode] Nominatim hit: %r → (%.5f, %.5f) type=%s",
+        query, float(hit["lat"]), float(hit["lon"]), osm_type,
+    )
+
     return GeocodeResponse(
         lat              = float(hit["lat"]),
         lng              = float(hit["lon"]),
@@ -233,75 +288,58 @@ async def _nominatim_fallback(
     )
 
 
-# ── Endpoint ─────────────────────────────────────────────────────────────────────
+# ── Endpoint ───────────────────────────────────────────────────────────────────
 
 @router.post("/geocode", response_model=GeocodeResponse)
 async def geocode(body: GeocodeRequest) -> GeocodeResponse:
     """
-    Geocode a supplier address using G-NAF (Geoscape) as primary source
-    with Nominatim OSM as fallback, and state/country centroids as last resort.
+    Geocode a supplier address via G-NAF (primary) → Nominatim (fallback)
+    → state centroid → Australia centre.
 
-    Query construction priority:
-      1. Full formatted address (most specific)
-      2. street + suburb + state + postcode (structured from LLM parser)
-      3. suburb + state + postcode
-      4. state centroid
+    All query strings are built in canonical form:
+      "street, suburb state postcode, Australia"
     """
     api_key = os.getenv("GEOSCAPE_API_KEY", "").strip()
-
-    # Build candidate query strings from most → least specific
-    queries: list[str] = []
-
-    if body.address.strip():
-        queries.append(body.address.strip())
-
-    # Structured query from LLM-parsed components
-    if body.suburb and body.state:
-        parts = [p for p in [body.street, body.suburb, body.state, body.postcode] if p.strip()]
-        structured = ", ".join(parts)
-        if structured not in queries:
-            queries.append(structured)
-
-    # Suburb + state fallback
-    if body.suburb and body.state:
-        coarse = f"{body.suburb} {body.state} {body.postcode}".strip()
-        if coarse not in queries:
-            queries.append(coarse)
+    queries = _build_queries(body)
 
     if not queries:
-        # No address at all — return Australia centre
+        lat, lng = AUS_CENTRE
         return GeocodeResponse(
-            lat=AUS_CENTRE[0], lng=AUS_CENTRE[1],
-            resolution_level="unknown", inference_method="no-address",
-            display_address="Australia", source="centroid",
+            lat=lat, lng=lng,
+            resolution_level="unknown",
+            inference_method="no-address",
+            display_address="Australia",
+            source="centroid",
         )
+
+    logger.info("[geocode] queries to try: %s", queries)
 
     async with httpx.AsyncClient() as client:
 
-        # ── Primary: Geoscape G-NAF ────────────────────────────────────────
+        # ─ Primary: Geoscape G-NAF ────────────────────────────────────────
         if api_key:
             for q in queries:
                 result = await _geoscape_lookup(client, api_key, q)
                 if result:
                     return result
-            logger.info("[geocode] G-NAF returned no result for all queries — falling back to Nominatim")
+            logger.info("[geocode] G-NAF exhausted all queries — falling back to Nominatim")
         else:
             logger.warning(
-                "[geocode] GEOSCAPE_API_KEY not set — using Nominatim fallback. "
-                "Register at https://geoscape.com.au/geoscape-developer-centre/"
+                "[geocode] GEOSCAPE_API_KEY not set — Nominatim fallback active. "
+                "Register free at https://geoscape.com.au/geoscape-developer-centre/"
             )
 
-        # ── Fallback: Nominatim OSM ─────────────────────────────────────────
+        # ─ Fallback: Nominatim OSM ────────────────────────────────────────
         for q in queries:
             result = await _nominatim_fallback(client, q)
             if result and result.resolution_level != "unknown":
                 return result
 
-    # ── Last resort: state centroid or Australia centre ─────────────────────
+    # ─ Last resort: state centroid or Australia centre ───────────────────
     state_upper = body.state.upper().strip()
     if state_upper in STATE_CENTROIDS:
         lat, lng = STATE_CENTROIDS[state_upper]
-        logger.info("[geocode] State centroid fallback → %s", state_upper)
+        logger.info("[geocode] state centroid fallback → %s", state_upper)
         return GeocodeResponse(
             lat=lat, lng=lng,
             resolution_level="state",
@@ -311,7 +349,7 @@ async def geocode(body: GeocodeRequest) -> GeocodeResponse:
         )
 
     lat, lng = AUS_CENTRE
-    logger.warning("[geocode] All geocoding failed — returning Australia centre")
+    logger.warning("[geocode] all geocoding failed — returning Australia centre")
     return GeocodeResponse(
         lat=lat, lng=lng,
         resolution_level="unknown",
