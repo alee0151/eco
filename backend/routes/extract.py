@@ -10,18 +10,18 @@ Pipeline
   3. POST the OCR text to Ollama /api/generate  →  structured JSON.
      Endpoint : {OLLAMA_URL}/api/generate
      Payload  : { "model": "...", "prompt": "...", "stream": false }
-  4. Validate ABN checksum (ATO algorithm).
-  5. Post-process address  →  strip unit/number, validate AU format.
-  6. Return ExtractResult.
+  4. Regex fallback: if LLM returns empty strings for any field,
+     extract them directly from the OCR text using deterministic patterns.
+  5. Validate ABN checksum (ATO algorithm).
+  6. Post-process address  →  strip unit/number, validate AU format.
+  7. Return ExtractResult  (includes ocr_text + llm_raw for debugging).
 
 Environment variables
 ---------------------
 OLLAMA_URL          Required. Full base URL of the Ollama server.
                     Example: https://my-ollama-server.example.com
-                    Example: http://localhost:11434
 OLLAMA_MODEL        Model name to use (default: gpt-oss:20b)
 OLLAMA_TIMEOUT      HTTP timeout in seconds (default: 600).
-                    Large models like gpt-oss:20b can take 3-5 min on first run.
 """
 
 import io
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 DEFAULT_MODEL   = "gpt-oss:20b"
-DEFAULT_TIMEOUT = 600  # seconds — large models need time
+DEFAULT_TIMEOUT = 600
 
 
 # ── Response schema ───────────────────────────────────────────────────────────
@@ -51,13 +51,14 @@ class FieldConfidence(BaseModel):
 
 
 class ExtractResult(BaseModel):
-    name:      str = ""
-    abn:       str = ""
-    # address = "street_name suburb state postcode"  (no unit, no street number)
-    address:   str = ""
-    commodity: str = ""
+    name:       str = ""
+    abn:        str = ""
+    address:    str = ""   # "street_name suburb state postcode"
+    commodity:  str = ""
     confidence: FieldConfidence = FieldConfidence()
-    warnings:  list[str] = []
+    warnings:   list[str] = []
+    ocr_text:   str = ""   # full OCR output — inspect to debug empty fields
+    llm_raw:    str = ""   # raw JSON string returned by Ollama
 
 
 # ── OCR — Tesseract ───────────────────────────────────────────────────────────
@@ -67,38 +68,23 @@ def run_ocr(file_bytes: bytes, content_type: str) -> str:
         import pytesseract
         from PIL import Image
     except ImportError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"pytesseract or Pillow not installed. Run: pip install pytesseract Pillow pdf2image  ({exc})",
-        )
+        raise HTTPException(status_code=500,
+            detail=f"pytesseract or Pillow not installed: {exc}")
 
     if "pdf" in content_type:
         try:
             from pdf2image import convert_from_bytes
         except ImportError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"pdf2image not installed. Run: pip install pdf2image  ({exc})",
-            )
+            raise HTTPException(status_code=500,
+                detail=f"pdf2image not installed: {exc}")
         pages = convert_from_bytes(file_bytes, dpi=200)
-        texts = [pytesseract.image_to_string(p) for p in pages[:2]]
-        return "\n".join(texts)
+        return "\n".join(pytesseract.image_to_string(p) for p in pages[:2])
     else:
         img = Image.open(io.BytesIO(file_bytes))
         return pytesseract.image_to_string(img)
 
 
 # ── Prompt ───────────────────────────────────────────────────────────────────
-#
-# Designed to be maximally explicit about JSON-only output.
-# Three separate reinforcements of the JSON rule:
-#   1. System identity line ("You output ONLY JSON")
-#   2. Explicit FORBIDDEN list before the output section
-#   3. FINAL REMINDER at the very bottom of the prompt
-#
-# This addresses the "unparseable JSON" error where the model wraps
-# its output in prose, explanation, or markdown code fences.
-# ───────────────────────────────────────────────────────────────────
 
 EXTRACT_PROMPT = """\
 You are a JSON-only data-extraction engine for an Australian supply-chain risk platform.
@@ -229,80 +215,116 @@ Do not write anything before {{ or after }}.
 
 # ── JSON extraction helper ───────────────────────────────────────────────────────
 
-def _extract_json(raw: str) -> dict:
+def _extract_json(raw: str) -> tuple[dict, str]:
     """
-    Robustly extract a JSON object from the model's raw response string.
+    Robustly extract a JSON object from the model's raw response.
+    Returns (parsed_dict, cleaned_raw_string).
 
-    Handles the most common model output quirks in this order:
-      1. Strip markdown code fences (```json ... ``` or ``` ... ```).
-      2. Try to parse the whole string directly.
-      3. Regex-extract the first { ... } block and parse that.
-      4. If all attempts fail, log the raw output and raise HTTP 502.
+    Attempt order:
+      1. Strip markdown fences, try direct parse.
+      2. Regex-extract first {...} block.
+      3. Log and raise HTTP 502.
     """
-    # Step 1: strip markdown fences
     cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", raw.strip(), flags=re.MULTILINE)
     cleaned = re.sub(r"\s*```$",           "", cleaned.strip(), flags=re.MULTILINE)
     cleaned = cleaned.strip()
 
-    # Step 2: direct parse
     try:
-        return json.loads(cleaned)
+        return json.loads(cleaned), cleaned
     except json.JSONDecodeError:
         pass
 
-    # Step 3: pull out first {...} block (handles prose before/after JSON)
     match = re.search(r"(\{[\s\S]*\})", cleaned)
     if match:
         try:
-            return json.loads(match.group(1))
+            return json.loads(match.group(1)), match.group(1)
         except json.JSONDecodeError:
             pass
 
-    # Step 4: give up — log full raw output to help debugging
     logger.error(
-        "[extract] Could not parse JSON from Ollama response.\n"
-        "--- RAW RESPONSE (first 1000 chars) ---\n%s\n--- END ---",
-        raw[:1000],
+        "[extract] Could not parse JSON from Ollama.\n"
+        "--- RAW (first 1000 chars) ---\n%s\n--- END ---", raw[:1000]
     )
     raise HTTPException(
         status_code=502,
-        detail=(
-            "Ollama returned unparseable JSON. "
-            "Check backend logs for the raw model output. "
-            "Try a larger model or increase OLLAMA_TIMEOUT."
-        ),
+        detail="Ollama returned unparseable JSON. Check backend logs for raw output.",
     )
+
+
+# ── Regex fallback — runs when LLM returns empty strings ──────────────────────────
+#
+# Deterministic patterns applied directly to the OCR text.
+# These are fast, reliable, and do not require a model.
+# Used ONLY to fill fields that the LLM left blank.
+# ───────────────────────────────────────────────────────────────────
+
+# ABN: "ABN" or "A.B.N" followed by optional colon/space then 11 digits
+_RE_ABN = re.compile(
+    r"\bA\.?B\.?N\.?\s*:?\s*([\d]{2}\s?[\d]{3}\s?[\d]{3}\s?[\d]{3})",
+    re.IGNORECASE,
+)
+
+# AU state + 4-digit postcode (used to anchor address detection)
+_RE_STATE_PC = re.compile(
+    r"([\w\s,./]+?)\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+
+
+def _regex_fallback(ocr_text: str, llm: dict, warnings: list[str]) -> tuple[dict, list[str]]:
+    """
+    For every field that the LLM returned as empty string,
+    attempt to fill it using deterministic regex on the raw OCR text.
+    Appends a warning for each field recovered this way.
+    """
+    result = dict(llm)
+
+    # ── ABN ─────────────────────────────────────────────────────────────────
+    if not result.get("abn", "").strip():
+        m = _RE_ABN.search(ocr_text)
+        if m:
+            result["abn"] = m.group(1).strip()
+            warnings.append("ABN extracted via regex fallback — LLM returned empty.")
+            logger.info("[extract] regex ABN fallback: %r", result["abn"])
+
+    # ── Address ─────────────────────────────────────────────────────────────
+    if not result.get("address", "").strip():
+        m = _RE_STATE_PC.search(ocr_text)
+        if m:
+            prefix  = m.group(1).strip().strip(",").split("\n")[-1].strip()
+            state   = m.group(2).upper()
+            postcode = m.group(3)
+            addr = f"{prefix} {state} {postcode}".strip() if prefix else f"{state} {postcode}"
+            result["address"] = addr
+            warnings.append("Address extracted via regex fallback — LLM returned empty.")
+            logger.info("[extract] regex address fallback: %r", addr)
+
+    # ── Name ─────────────────────────────────────────────────────────────────
+    if not result.get("name", "").strip():
+        # Look for lines following common supplier labels
+        m = re.search(
+            r"(?:supplier|from|sold\s+by|issued\s+by|vendor)[:\s]+([^\n]{3,80})",
+            ocr_text, re.IGNORECASE,
+        )
+        if m:
+            result["name"] = m.group(1).strip()
+            warnings.append("Supplier name extracted via regex fallback — LLM returned empty.")
+            logger.info("[extract] regex name fallback: %r", result["name"])
+
+    return result, warnings
 
 
 # ── Ollama LLM call (async) ───────────────────────────────────────────────────
 
-async def run_llm(ocr_text: str) -> dict:
+async def run_llm(ocr_text: str) -> tuple[dict, str]:
     """
-    Async POST to {OLLAMA_URL}/api/generate.
-
-    Uses httpx.AsyncClient so the FastAPI event loop is never blocked.
-    Timeout is read from OLLAMA_TIMEOUT env var (default 600 s) to
-    accommodate large models that need several minutes on first inference.
-
-    Request shape:
-        POST  $OLLAMA_URL/api/generate
-        Content-Type: application/json
-        {
-            "model":  "gpt-oss:20b",
-            "prompt": "<extraction prompt>",
-            "stream": false,
-            "format": "json"
-        }
+    POST to {OLLAMA_URL}/api/generate.
+    Returns (parsed_dict, raw_response_string).
     """
     ollama_url = os.getenv("OLLAMA_URL", "").strip()
     if not ollama_url:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "OLLAMA_URL is not configured. "
-                "Add OLLAMA_URL=https://your-ollama-server to backend/.env"
-            ),
-        )
+        raise HTTPException(status_code=503,
+            detail="OLLAMA_URL is not configured. Add it to backend/.env")
 
     model   = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
     url     = f"{ollama_url.rstrip('/')}/api/generate"
@@ -312,10 +334,11 @@ async def run_llm(ocr_text: str) -> dict:
         "model":  model,
         "prompt": EXTRACT_PROMPT.format(ocr_text=ocr_text[:8000]),
         "stream": False,
-        "format": "json",   # tells Ollama to enforce JSON output at the token level
+        "format": "json",
     }
 
     logger.info("[extract] POST %s  model=%s  timeout=%.0fs", url, model, timeout)
+    logger.info("[extract] OCR text sent to Ollama (first 500 chars):\n%s", ocr_text[:500])
 
     http_timeout = httpx.Timeout(timeout, connect=30.0)
 
@@ -323,34 +346,25 @@ async def run_llm(ocr_text: str) -> dict:
         async with httpx.AsyncClient(timeout=http_timeout) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
-
     except httpx.ReadTimeout:
-        raise HTTPException(
-            status_code=504,
-            detail=(
-                f"Ollama did not respond within {timeout:.0f} seconds. "
-                f"Model '{model}' may still be loading or the document is very long. "
-                f"Increase the limit: set OLLAMA_TIMEOUT=900 in backend/.env"
-            ),
-        )
+        raise HTTPException(status_code=504,
+            detail=f"Ollama timed out after {timeout:.0f}s. Set OLLAMA_TIMEOUT=900 in .env")
     except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Cannot reach Ollama at '{ollama_url}'. "
-                "Check OLLAMA_URL and that the server is reachable."
-            ),
-        )
+        raise HTTPException(status_code=503,
+            detail=f"Cannot reach Ollama at '{ollama_url}'. Check OLLAMA_URL.")
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama returned HTTP {exc.response.status_code}: {exc.response.text[:300]}",
-        )
+        raise HTTPException(status_code=502,
+            detail=f"Ollama HTTP {exc.response.status_code}: {exc.response.text[:300]}")
 
     raw = resp.json().get("response", "")
-    logger.debug("[extract] raw Ollama response: %s", raw[:500])
+    logger.info("[extract] raw Ollama response (first 800 chars):\n%s", raw[:800])
 
-    return _extract_json(raw)
+    parsed, cleaned = _extract_json(raw)
+    logger.info("[extract] parsed LLM fields: name=%r  abn=%r  address=%r  commodity=%r",
+        parsed.get("name"), parsed.get("abn"),
+        parsed.get("address"), parsed.get("commodity"))
+
+    return parsed, cleaned
 
 
 # ── ABN validation (ATO checksum) ────────────────────────────────────────────
@@ -375,27 +389,21 @@ def _validate_abn(abn: str) -> list[str]:
 # ── Address post-processing & validation ─────────────────────────────────────
 
 _AU_STATES = {"NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"}
-
 _STATE_POSTCODE_RE = re.compile(
-    r"(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\s+(\d{4})\b",
-    re.IGNORECASE,
-)
-_PO_BOX_RE      = re.compile(r"\bP\.?\s*O\.?\s*Box\b", re.IGNORECASE)
-_BUYER_LABEL_RE = re.compile(
+    r"(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\s+(\d{4})\b", re.IGNORECASE)
+_PO_BOX_RE         = re.compile(r"\bP\.?\s*O\.?\s*Box\b", re.IGNORECASE)
+_BUYER_LABEL_RE    = re.compile(
     r"^(bill\s+to|ship\s+to|deliver\s+to|delivery\s+address|remittance|customer|attention|attn)",
-    re.IGNORECASE,
-)
+    re.IGNORECASE)
 _LEADING_NUMBER_RE = re.compile(r"^\d+[A-Za-z]?[\s,/\\-]+")
 _UNIT_PREFIX_RE    = re.compile(
     r"^(unit|u|suite|ste|level|lvl|floor|fl|apt|apartment|lot)\s+[\w/]+[\s,]+",
-    re.IGNORECASE,
-)
+    re.IGNORECASE)
 
 
 def _strip_number_and_unit(address: str) -> str:
     cleaned = _UNIT_PREFIX_RE.sub("", address.strip()).strip()
-    cleaned = _LEADING_NUMBER_RE.sub("", cleaned).strip()
-    return cleaned
+    return _LEADING_NUMBER_RE.sub("", cleaned).strip()
 
 
 def _validate_address(address: str, existing_warnings: list[str]) -> tuple[str, list[str], float]:
@@ -414,31 +422,22 @@ def _validate_address(address: str, existing_warnings: list[str]) -> tuple[str, 
 
     state_match = _STATE_POSTCODE_RE.search(cleaned)
     if not state_match:
-        warnings.append(
-            "Address missing recognised Australian state abbreviation and/or 4-digit postcode."
-        )
+        warnings.append("Address missing AU state abbreviation and/or 4-digit postcode.")
         return cleaned, warnings, 0.3
 
     state_found = state_match.group(1).upper()
     if state_found not in _AU_STATES:
-        warnings.append(f"Address state abbreviation '{state_found}' not recognised.")
+        warnings.append(f"Address state '{state_found}' not recognised.")
 
-    text_before_state = cleaned[: state_match.start()].strip().rstrip(",")
-    has_street_name   = bool(text_before_state)
-    confidence_floor  = 0.9 if has_street_name else 0.7
-
-    return cleaned, warnings, confidence_floor
+    has_street = bool(cleaned[: state_match.start()].strip().rstrip(","))
+    return cleaned, warnings, 0.9 if has_street else 0.7
 
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 ALLOWED_TYPES = {
-    "application/pdf",
-    "image/png",
-    "image/jpeg",
-    "image/jpg",
-    "image/webp",
-    "image/tiff",
+    "application/pdf", "image/png", "image/jpeg",
+    "image/jpg", "image/webp", "image/tiff",
 }
 
 
@@ -446,78 +445,79 @@ ALLOWED_TYPES = {
 async def extract(
     file: UploadFile = File(..., description="PDF or image of a supplier document"),
 ) -> ExtractResult:
-    """
-    Pipeline:
-      1. Validate file type & size.
-      2. Tesseract OCR  →  raw text.
-      3. POST to {OLLAMA_URL}/api/generate  →  structured JSON.
-         model = OLLAMA_MODEL env var (default: gpt-oss:20b)
-         timeout = OLLAMA_TIMEOUT env var in seconds (default: 600)
-      4. Validate ABN checksum (ATO algorithm).
-      5. Post-process address: strip unit/number, validate AU format.
-      6. Return ExtractResult.
-    """
     ct = (file.content_type or "").lower()
     if file.filename and file.filename.lower().endswith(".pdf"):
         ct = "application/pdf"
     if ct not in ALLOWED_TYPES and not ct.startswith("image/"):
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{ct}'. Please upload a PDF or image.",
-        )
+        raise HTTPException(status_code=415,
+            detail=f"Unsupported file type '{ct}'. Upload a PDF or image.")
 
     file_bytes = await file.read()
     if len(file_bytes) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
     if len(file_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit.")
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
 
-    # ── Step 1: OCR ────────────────────────────────────────────────────────────
+    # ── Step 1: Tesseract OCR ───────────────────────────────────────────────
     ocr_text = run_ocr(file_bytes, ct)
-    logger.debug("[extract] OCR produced %d chars for '%s'", len(ocr_text), file.filename)
+    logger.info("[extract] OCR: %d chars for '%s'", len(ocr_text), file.filename)
+    logger.info("[extract] OCR full text:\n%s", ocr_text[:2000])
 
     if not ocr_text.strip():
         return ExtractResult(
-            warnings=[
-                "OCR returned no text. The document may be blank, "
-                "encrypted, or a scanned image with very low resolution."
-            ]
+            warnings=["OCR returned no text. Document may be blank or low-resolution."],
+            ocr_text=ocr_text,
         )
 
-    # ── Step 2: Ollama → structured JSON ──────────────────────────────────────────
-    raw = await run_llm(ocr_text)
+    # ── Step 2: Ollama LLM ───────────────────────────────────────────────────
+    raw_dict, llm_raw_str = await run_llm(ocr_text)
 
-    conf_raw  = raw.get("confidence", {})
-    warnings  = list(raw.get("warnings", []))
-    abn_value = str(raw.get("abn", "")).strip()
-    llm_addr  = str(raw.get("address", "")).strip()
+    conf_raw  = raw_dict.get("confidence", {})
+    warnings  = list(raw_dict.get("warnings", []))
+    abn_value = str(raw_dict.get("abn",       "")).strip()
+    llm_addr  = str(raw_dict.get("address",   "")).strip()
+    name_val  = str(raw_dict.get("name",      "")).strip()
+    comm_val  = str(raw_dict.get("commodity", "")).strip()
 
-    # ── Step 3: ABN checksum ───────────────────────────────────────────────────
+    # ── Step 3: Regex fallback for any blank LLM fields ───────────────────────
+    blanks = [f for f, v in [("name", name_val), ("abn", abn_value),
+                              ("address", llm_addr), ("commodity", comm_val)] if not v]
+    if blanks:
+        logger.info("[extract] LLM returned empty for: %s — running regex fallback", blanks)
+        raw_dict, warnings = _regex_fallback(ocr_text, raw_dict, warnings)
+        abn_value = str(raw_dict.get("abn",       "")).strip()
+        llm_addr  = str(raw_dict.get("address",   "")).strip()
+        name_val  = str(raw_dict.get("name",      "")).strip()
+        comm_val  = str(raw_dict.get("commodity", "")).strip()
+
+    # ── Step 4: ABN checksum ───────────────────────────────────────────────────
     if abn_value:
         warnings.extend(_validate_abn(abn_value))
 
-    # ── Step 4: Address sanitisation ────────────────────────────────────────────
+    # ── Step 5: Address sanitisation ────────────────────────────────────────────
     llm_addr_conf = float(conf_raw.get("address", 0))
     cleaned_addr, warnings, addr_conf_floor = _validate_address(llm_addr, warnings)
     final_addr_conf = max(llm_addr_conf, addr_conf_floor) if cleaned_addr else 0.0
 
     result = ExtractResult(
-        name      = str(raw.get("name",      "")).strip(),
+        name      = name_val,
         abn       = abn_value,
         address   = cleaned_addr,
-        commodity = str(raw.get("commodity", "")).strip(),
+        commodity = comm_val,
         confidence = FieldConfidence(
             name      = float(conf_raw.get("name",      0)),
             abn       = float(conf_raw.get("abn",       0)),
             address   = round(final_addr_conf, 2),
             commodity = float(conf_raw.get("commodity", 0)),
         ),
-        warnings = warnings,
+        warnings  = warnings,
+        ocr_text  = ocr_text,
+        llm_raw   = llm_raw_str,
     )
 
     logger.info(
-        "[extract] file=%s  name=%r  abn=%r  address=%r  addr_conf=%.2f  warnings=%d",
+        "[extract] FINAL  file=%s  name=%r  abn=%r  address=%r  commodity=%r  warnings=%d",
         file.filename, result.name, result.abn,
-        result.address, result.confidence.address, len(warnings),
+        result.address, result.commodity, len(warnings),
     )
     return result
