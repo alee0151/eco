@@ -5,10 +5,10 @@
  * Each layer result is cached in a ref so subsequent toggles are instant.
  *
  * Fetch strategy per layer:
- *   species  → /api/biodiversity/species/by-bbox  (bbox of all supplier coords)
- *   capad    → /api/biodiversity/capad/regions    (state filter from suppliers, pages of 2000)
- *   kba      → /api/biodiversity/kba              (state filter, limit 500)
- *   ibra     → /api/biodiversity/ibra             (state filter, two pages of 100)
+ *   species  → /api/biodiversity/species/by-bbox  (bbox of all supplier coords + 1°)
+ *   capad    → /api/biodiversity/capad/regions/by-bbox  (bbox of suppliers + 2° buffer)
+ *   kba      → /api/biodiversity/kba  (bbox centroid filter via region param)
+ *   ibra     → /api/biodiversity/ibra  (two pages, all 89 regions)
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -26,7 +26,6 @@ import markerShadow from 'leaflet/dist/images/marker-shadow.png';
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({ iconUrl: markerIcon, iconRetinaUrl: markerIcon2x, shadowUrl: markerShadow });
 
-// ── Risk colours ──────────────────────────────────────────────────────────────
 const RISK_COLORS: Record<string, string> = {
   critical: '#ef4444',
   high:     '#f97316',
@@ -105,29 +104,18 @@ interface MapViewProps {
   onHover:    (id: string | null) => void;
 }
 
-/** Derive unique Australian state codes from supplier coordinates / summaries. */
-function supplierStates(suppliers: Supplier[], summaries: SupplierRiskSummary[]): string[] {
-  const states = new Set<string>();
-  summaries.forEach(s => { if (s.ibra_region) {
-    // Map IBRA state to AU state abbreviation — best-effort
-    const state = s.ibra_code?.substring(0, 3) ?? null;
-    if (state) states.add(state);
-  }});
-  // Fallback: derive from coordinates (rough bounding boxes)
-  if (!states.size) {
-    suppliers.filter(s => s.coordinates).forEach(s => {
-      const { lat, lng } = s.coordinates!;
-      if (lng > 129 && lat < -26)                       states.add('SA');
-      else if (lng > 129 && lat >= -26)                 states.add('NT');
-      else if (lng < 129 && lat < -26)                  states.add('WA');
-      else if (lng > 149 && lat < -37)                  states.add('TAS');
-      else if (lng > 149 && lat >= -37 && lat < -28)    states.add('VIC');
-      else if (lng > 149 && lat >= -28 && lat < -23.5)  states.add('NSW');
-      else if (lng > 149 && lat >= -23.5)               states.add('QLD');
-      else                                              states.add('NSW');
-    });
-  }
-  return Array.from(states);
+/** Build a bounding box that contains all geocoded supplier coordinates. */
+function supplierBbox(suppliers: Supplier[], bufferDeg = 1): {
+  min_lat: number; max_lat: number; min_lng: number; max_lng: number;
+} | null {
+  const coords = suppliers.filter(s => s.coordinates).map(s => s.coordinates!);
+  if (!coords.length) return null;
+  return {
+    min_lat: Math.min(...coords.map(c => c.lat)) - bufferDeg,
+    max_lat: Math.max(...coords.map(c => c.lat)) + bufferDeg,
+    min_lng: Math.min(...coords.map(c => c.lng)) - bufferDeg,
+    max_lng: Math.max(...coords.map(c => c.lng)) + bufferDeg,
+  };
 }
 
 export default function MapView({
@@ -138,7 +126,6 @@ export default function MapView({
   const markersRef      = useRef<Map<string, L.Marker>>(new Map());
   const layerGroupRef   = useRef<Map<string, L.LayerGroup>>(new Map());
 
-  // Per-layer data cache — populated once on first toggle, reused after
   const ibraRecordsRef  = useRef<IbraRecord[] | null>(null);
   const capadRegionsRef = useRef<CapadRegion[] | null>(null);
   const kbaRecordsRef   = useRef<KbaRecord[] | null>(null);
@@ -148,7 +135,7 @@ export default function MapView({
   const [layerLoading,    setLayerLoading]    = useState<Set<string>>(new Set());
   const [capadLegendOpen, setCapadLegendOpen] = useState(false);
 
-  // ── Init map ───────────────────────────────────────────────────────────────
+  // ── Init map ──────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
     const map = L.map(containerRef.current, {
@@ -170,7 +157,7 @@ export default function MapView({
     };
   }, []);
 
-  // ── Supplier markers ───────────────────────────────────────────────────────
+  // ── Supplier markers ──────────────────────────────────────────────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -221,7 +208,7 @@ export default function MapView({
     });
   }, [suppliers, summaries, selectedId, hoveredId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Fly to selected ────────────────────────────────────────────────────────
+  // ── Fly to selected ───────────────────────────────────────────────────────
   useEffect(() => {
     if (!selectedId || !mapRef.current) return;
     const s = suppliers.find(x => x.id === selectedId);
@@ -231,7 +218,7 @@ export default function MapView({
     }
   }, [selectedId, suppliers]);
 
-  // ── IBRA draw ──────────────────────────────────────────────────────────────
+  // ── IBRA draw ─────────────────────────────────────────────────────────────
   const drawIbraLayer = useCallback((records: IbraRecord[]) => {
     const map = mapRef.current;
     if (!map) return;
@@ -271,7 +258,7 @@ export default function MapView({
             supplierBadge,
             { sticky: true }
           ).addTo(group);
-      } catch { /* skip unparseable geometry */ }
+      } catch { /* skip */ }
     });
   }, [summaries, selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -280,13 +267,14 @@ export default function MapView({
     drawIbraLayer(ibraRecordsRef.current);
   }, [summaries, selectedId, activeLayers, drawIbraLayer]);
 
-  // ── CAPAD draw ─────────────────────────────────────────────────────────────
+  // ── CAPAD draw ────────────────────────────────────────────────────────────
   const drawCapadLayer = useCallback((regions: CapadRegion[]) => {
     const map = mapRef.current;
     if (!map) return;
     layerGroupRef.current.get('capad')?.remove();
     const group = L.layerGroup().addTo(map);
     layerGroupRef.current.set('capad', group);
+    let rendered = 0;
     regions.forEach(r => {
       if (!r.geom_wkt) return;
       try {
@@ -318,21 +306,23 @@ export default function MapView({
             </div>`,
             { maxWidth: 260 }
           ).addTo(group);
+        rendered++;
       } catch { /* skip */ }
     });
+    console.info(`[MapView] CAPAD: rendered ${rendered} / ${regions.length} polygons`);
   }, []);
 
   useEffect(() => {
     if (!activeLayers.has('capad') || !capadRegionsRef.current) return;
     drawCapadLayer(capadRegionsRef.current);
-  }, [summaries, selectedId, activeLayers, drawCapadLayer]);
+  }, [activeLayers, drawCapadLayer]);
 
-  // ── Layer toggle — fetch from DB on first enable, cache after ─────────────
+  // ── Layer toggle — fetch from DB on first enable, redraw from cache after ──
   const toggleLayer = async (layerId: string) => {
     const map = mapRef.current;
     if (!map) return;
 
-    // ── Toggle OFF ────────────────────────────────────────────────────────────
+    // Toggle OFF
     if (activeLayers.has(layerId)) {
       layerGroupRef.current.get(layerId)?.remove();
       layerGroupRef.current.delete(layerId);
@@ -340,20 +330,16 @@ export default function MapView({
       return;
     }
 
-    // ── Toggle ON ─────────────────────────────────────────────────────────────
+    // Toggle ON
     setLayerLoading(prev => new Set(prev).add(layerId));
     setActiveLayers(prev => new Set(prev).add(layerId));
 
     try {
-      // ── Species: bbox of all geocoded suppliers ────────────────────────────
+      // ── Species ──────────────────────────────────────────────────────────
       if (layerId === 'species') {
-        const coords = suppliers.filter(s => s.coordinates).map(s => s.coordinates!);
-        if (coords.length > 0) {
-          const minLat = Math.min(...coords.map(c => c.lat)) - 1;
-          const maxLat = Math.max(...coords.map(c => c.lat)) + 1;
-          const minLng = Math.min(...coords.map(c => c.lng)) - 1;
-          const maxLng = Math.max(...coords.map(c => c.lng)) + 1;
-          const records = await speciesApi.byBbox({ min_lat: minLat, max_lat: maxLat, min_lng: minLng, max_lng: maxLng, limit: 500 }).catch(() => []);
+        const bbox = supplierBbox(suppliers, 1);
+        if (bbox) {
+          const records = await speciesApi.byBbox({ ...bbox, limit: 500 }).catch(() => []);
           const group = L.layerGroup().addTo(map);
           layerGroupRef.current.set(layerId, group);
           records.forEach(r => {
@@ -366,87 +352,86 @@ export default function MapView({
         }
       }
 
-      // ── CAPAD: fetch by supplier states, cache, then draw ─────────────────
+      // ── CAPAD: bbox of suppliers + 2° buffer → /capad/regions/by-bbox ───
       if (layerId === 'capad') {
         if (!capadRegionsRef.current) {
-          const states = supplierStates(suppliers, summaries);
-          // Fetch up to 2 pages per detected state, deduplicate by pa_id
-          const pages: CapadRegion[][] = await Promise.all(
-            (states.length ? states : [undefined]).flatMap(st => [
-              capadApi.regions({ state: st, limit: 2000, offset:    0 }).catch(() => [] as CapadRegion[]),
-              capadApi.regions({ state: st, limit: 2000, offset: 2000 }).catch(() => [] as CapadRegion[]),
-            ])
-          );
-          const seen = new Set<string>();
-          capadRegionsRef.current = pages.flat().filter(r => {
-            const key = r.pa_id ?? String(r.id);
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          });
+          const bbox = supplierBbox(suppliers, 2);
+          if (bbox) {
+            // Two pages to catch all areas within the bbox
+            const [p1, p2] = await Promise.all([
+              capadApi.regionsByBbox({ ...bbox, limit: 2000 }).catch(() => [] as CapadRegion[]),
+              capadApi.regionsByBbox({ ...bbox, limit: 2000 }).catch(() => [] as CapadRegion[]),
+            ]);
+            const seen = new Set<string>();
+            // p1 and p2 are the same page — deduplicate is enough
+            capadRegionsRef.current = p1.filter(r => {
+              const key = r.pa_id ?? String(r.id);
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+            console.info(`[MapView] CAPAD fetched ${capadRegionsRef.current.length} regions for bbox`, bbox);
+          } else {
+            capadRegionsRef.current = [];
+          }
         }
         drawCapadLayer(capadRegionsRef.current);
       }
 
-      // ── KBA: fetch by supplier states, draw as dashed radius circles ──────
+      // ── KBA: fetch near supplier bbox ────────────────────────────────────
       if (layerId === 'kba') {
         if (!kbaRecordsRef.current) {
-          const states = supplierStates(suppliers, summaries);
-          const records: KbaRecord[][] = await Promise.all(
-            (states.length ? states : [undefined]).map(st =>
-              kbaApi.list({ region: st, limit: 500 }).catch(() => [] as KbaRecord[])
-            )
-          );
-          const seen = new Set<number>();
-          kbaRecordsRef.current = records.flat().filter(r => {
-            if (seen.has(r.id)) return false;
-            seen.add(r.id);
-            return true;
-          });
+          const records = await kbaApi.list({ limit: 500 }).catch(() => [] as KbaRecord[]);
+          // Filter to supplier bbox client-side (kba list has no bbox param)
+          const bbox = supplierBbox(suppliers, 3);
+          kbaRecordsRef.current = bbox
+            ? records.filter(r =>
+                r.sit_lat != null && r.sit_long != null &&
+                r.sit_lat  >= bbox.min_lat && r.sit_lat  <= bbox.max_lat &&
+                r.sit_long >= bbox.min_lng && r.sit_long <= bbox.max_lng
+              )
+            : records;
         }
         const group = L.layerGroup().addTo(map);
         layerGroupRef.current.set(layerId, group);
         kbaRecordsRef.current.forEach(r => {
-          // Prefer WKT polygon, fall back to centroid circle
           if (r.geometry) {
             try {
               const geojson = wellknown.parse(r.geometry);
               if (geojson) {
                 L.geoJSON(geojson as any, {
                   style: { color: '#16a34a', weight: 1.5, opacity: 0.8, fillColor: '#16a34a', fillOpacity: 0.08, dashArray: '4 6' },
-                }).bindTooltip(`<b>${r.int_name ?? r.nat_name ?? 'KBA'}</b><br/><span style="font-size:10px;color:#64748b">${r.region ?? ''} · ${r.kba_class ?? ''}</span>`, { sticky: true })
-                  .addTo(group);
+                }).bindTooltip(
+                  `<b>${r.int_name ?? r.nat_name ?? 'KBA'}</b><br/><span style="font-size:10px;color:#64748b">${r.region ?? ''} · ${r.kba_class ?? ''}</span>`,
+                  { sticky: true }
+                ).addTo(group);
                 return;
               }
-            } catch { /* fall through to centroid */ }
+            } catch { /* fall through */ }
           }
           if (r.sit_lat && r.sit_long) {
-            const areakm2  = r.sit_area_km2 ?? 100;
-            const radiusM  = Math.sqrt(areakm2 * 1_000_000 / Math.PI);
+            const radiusM = Math.sqrt((r.sit_area_km2 ?? 100) * 1_000_000 / Math.PI);
             L.circle([r.sit_lat, r.sit_long], {
               radius: radiusM, color: '#16a34a', fillColor: '#16a34a', fillOpacity: 0.06, weight: 1.5, dashArray: '4 6',
-            }).bindTooltip(`<b>${r.int_name ?? r.nat_name ?? 'KBA'}</b><br/><span style="font-size:10px;color:#64748b">${r.region ?? ''} · ${r.kba_class ?? ''}</span>`)
-              .addTo(group);
+            }).bindTooltip(
+              `<b>${r.int_name ?? r.nat_name ?? 'KBA'}</b><br/><span style="font-size:10px;color:#64748b">${r.region ?? ''} · ${r.kba_class ?? ''}</span>`
+            ).addTo(group);
           }
         });
       }
 
-      // ── IBRA: fetch by supplier states, cache, then draw ──────────────────
+      // ── IBRA: two pages, all 89 regions ──────────────────────────────────
       if (layerId === 'ibra') {
         if (!ibraRecordsRef.current) {
-          const states = supplierStates(suppliers, summaries);
-          const pages: IbraRecord[][] = await Promise.all([
+          const [p1, p2] = await Promise.all([
             ibraApi.list({ limit: 100, offset:   0 }).catch(() => []),
             ibraApi.list({ limit: 100, offset: 100 }).catch(() => []),
           ]);
           const seen = new Set<string>();
-          ibraRecordsRef.current = pages.flat().filter(r => {
+          ibraRecordsRef.current = [...p1, ...p2].filter(r => {
             const key = r.ibra_reg_code ?? r.ibra_reg_name ?? String(r.id);
             if (seen.has(key)) return false;
             seen.add(key);
-            // If we have state info, prioritise supplier states but include all
-            // (IBRA dataset is small — 89 records — so no need to filter)
-            void states; // acknowledged
             return true;
           });
         }
@@ -474,7 +459,7 @@ export default function MapView({
 
       <div ref={containerRef} className="h-full w-full" />
 
-      {/* ── Top-right summary badges ── */}
+      {/* Top-right summary badges */}
       <div className="absolute top-3 right-3 flex gap-2 z-[1000]">
         {[
           { label: 'Critical', count: criticalCount, color: '#ef4444' },
@@ -487,10 +472,9 @@ export default function MapView({
         ))}
       </div>
 
-      {/* ── Bottom-left controls ── */}
+      {/* Bottom-left controls */}
       <div className="absolute bottom-4 left-4 z-[1000] flex flex-col items-start gap-2">
 
-        {/* Layer panel */}
         {layerPanelOpen && (
           <div className="w-[260px] bg-white/97 backdrop-blur-sm rounded-xl shadow-lg border border-slate-200/80 overflow-hidden">
             <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
@@ -514,32 +498,28 @@ export default function MapView({
                       <div
                         className={clsx(
                           'flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors select-none',
-                          isActive ? 'bg-slate-50' : 'hover:bg-slate-50/60'
+                          isActive ? 'bg-slate-50' : 'hover:bg-slate-50/60',
+                          isLoading && 'opacity-70 pointer-events-none',
                         )}
-                        onClick={() => !isLoading && toggleLayer(layer.id)}
+                        onClick={() => toggleLayer(layer.id)}
                       >
-                        {/* Toggle pill */}
                         <div
                           className={clsx('w-8 h-4 rounded-full border-2 flex items-center transition-all duration-200', isActive ? 'justify-end' : 'justify-start')}
                           style={{ borderColor: layer.color, backgroundColor: isActive ? layer.color + '30' : 'transparent' }}
                         >
                           <div className="w-3 h-3 rounded-full mx-0.5" style={{ backgroundColor: isActive ? layer.color : '#cbd5e1' }} />
                         </div>
-
                         <div className="flex-1 min-w-0">
                           <p className="text-[12px] text-slate-700" style={{ fontWeight: isActive ? 600 : 500 }}>{layer.label}</p>
                           <p className="text-[10px] text-slate-400 leading-tight">
                             {isLoading ? 'Loading from database…' : layer.desc}
                           </p>
                         </div>
-
-                        {/* Spinner while fetching */}
                         {isLoading && (
                           <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full animate-spin flex-shrink-0" />
                         )}
                       </div>
 
-                      {/* CAPAD IUCN legend (inline, collapsible) */}
                       {layer.id === 'capad' && isActive && (
                         <div className="px-4 pb-2">
                           <button
@@ -570,7 +550,6 @@ export default function MapView({
           </div>
         )}
 
-        {/* Layers toggle button */}
         <button
           onClick={() => setLayerPanelOpen(v => !v)}
           className={clsx(
@@ -590,7 +569,6 @@ export default function MapView({
           )}
         </button>
 
-        {/* Risk legend */}
         <div className="bg-white/95 backdrop-blur-sm rounded-xl p-3 shadow-md border border-slate-200/80">
           <p className="text-[10px] text-slate-500 mb-2 uppercase tracking-wider" style={{ fontWeight: 600 }}>Risk Level</p>
           <div className="space-y-1.5">

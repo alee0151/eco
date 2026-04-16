@@ -1,23 +1,9 @@
 /**
  * api.ts  —  Centralised typed API client
- *
- * All components import from here — never fetch() directly.
- * Base URL is read from VITE_API_URL env var (falls back to '' so the
- * Vite dev proxy handles /api/* requests in development).
- *
- * Note: suppliersApi has been removed. Supplier data is stored in
- * session-only React state (SupplierContext) and never written to the
- * backend database. enrichApi is the only supplier-related API — it
- * calls POST /api/enrich to look up ABN data from ABR and returns
- * enriched fields without persisting anything.
  */
 
-// Use empty string as fallback so /api/* paths are relative to the current
-// origin in development (handled by the Vite proxy) and in production
-// (handled by the reverse proxy / same-origin deployment).
 const BASE: string = import.meta.env.VITE_API_URL ?? '';
 
-/** Standard JSON request — parses response body as JSON. */
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...options?.headers },
@@ -30,7 +16,6 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-/** Multipart FormData request — returns JSON. Used for /api/extract. */
 async function requestFormData<T>(path: string, form: FormData): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { method: 'POST', body: form });
   if (!res.ok) {
@@ -112,10 +97,6 @@ export interface CapadRecord {
   geom_wkt:         string | null;
 }
 
-/**
- * Lightweight CAPAD record returned by GET /api/biodiversity/capad/regions.
- * Contains geom_wkt for polygon rendering — no centroid lat/lng needed.
- */
 export interface CapadRegion {
   id:           number;
   pa_id:        string | null;
@@ -128,7 +109,7 @@ export interface CapadRegion {
   governance:   string | null;
   authority:    string | null;
   epbc_trigger: string | null;
-  geom_wkt:     string | null;  // WKT MULTIPOLYGON — parsed by wellknown in MapView
+  geom_wkt:     string | null;
 }
 
 export interface IbraRecord {
@@ -156,9 +137,8 @@ export interface SupplierRiskSummary {
   threatened_species_names: string[];
 }
 
-/** Mirrors backend ExtractResult / FieldConfidence schemas */
 export interface ExtractFieldConfidence {
-  name:      number;  // 0.0 – 1.0
+  name:      number;
   abn:       number;
   address:   number;
   commodity: number;
@@ -173,11 +153,6 @@ export interface ExtractResult {
   warnings:   string[];
 }
 
-/**
- * Returned by POST /api/enrich.
- * The backend looks up the ABN against the Australian Business Register
- * and returns enriched fields. Nothing is written to any database.
- */
 export interface EnrichResult {
   abn:                 string;
   abn_found:           boolean;
@@ -189,14 +164,9 @@ export interface EnrichResult {
   confidence_score:    number | null;
 }
 
-// ── Extract API (Epic 1 — OCR + LLM via Ollama) ───────────────────────────────
+// ── Extract API ───────────────────────────────────────────────────────────────
 
 export const extractApi = {
-  /**
-   * Upload a PDF or image file to POST /api/extract.
-   * The backend runs Tesseract OCR then Ollama LLM to return structured fields.
-   * Note: CSV files are parsed client-side — do not send them here.
-   */
   fromFile: (file: File): Promise<ExtractResult> => {
     const form = new FormData();
     form.append('file', file);
@@ -204,16 +174,9 @@ export const extractApi = {
   },
 };
 
-// ── Enrich API (Epic 2 — ABN lookup via ABR) ──────────────────────────────────
+// ── Enrich API ────────────────────────────────────────────────────────────────
 
 export const enrichApi = {
-  /**
-   * POST /api/enrich  { abn: string, name: string, address: string }
-   *
-   * Looks up the ABN against the Australian Business Register.
-   * Returns enriched fields only — does NOT write anything to a database.
-   * All persistence is handled by SupplierContext (session-only state).
-   */
   enrich: (abn: string, name: string, address: string): Promise<EnrichResult> =>
     request<EnrichResult>('/api/enrich', {
       method: 'POST',
@@ -247,13 +210,16 @@ export const capadApi = {
   list: (params?: { state?: string; pa_type?: string; is_active?: boolean; limit?: number; offset?: number }) =>
     request<CapadRecord[]>(`/api/biodiversity/capad${buildQuery(params ?? {})}`),
 
-  /**
-   * Fetch CAPAD protected areas with geom_wkt for polygon map rendering.
-   * Returns up to 5000 records per page — use limit/offset for pagination.
-   * Only active rows with a non-null geom_wkt are returned.
-   */
   regions: (params?: { state?: string; limit?: number; offset?: number }) =>
     request<CapadRegion[]>(`/api/biodiversity/capad/regions${buildQuery(params ?? {})}`),
+
+  /**
+   * Fetch CAPAD protected area polygons whose centroid falls within a
+   * bounding box. Use this for on-demand map layer loading near suppliers.
+   * Adds a padding buffer around the bbox automatically on the frontend.
+   */
+  regionsByBbox: (bbox: { min_lat: number; max_lat: number; min_lng: number; max_lng: number; limit?: number }) =>
+    request<CapadRegion[]>(`/api/biodiversity/capad/regions/by-bbox${buildQuery(bbox)}`),
 
   byState: (state: string, limit = 500) =>
     request<CapadRecord[]>(`/api/biodiversity/capad/by-state/${state}?limit=${limit}`),

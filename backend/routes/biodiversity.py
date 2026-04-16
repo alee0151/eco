@@ -10,26 +10,12 @@ Endpoints:
   GET /api/biodiversity/kba                         — Key Biodiversity Areas (paginated)
   GET /api/biodiversity/capad                       — Protected areas (paginated)
   GET /api/biodiversity/capad/regions               — Protected area polygons (geom_wkt, for map rendering)
+  GET /api/biodiversity/capad/regions/by-bbox       — Protected area polygons within a bounding box
   GET /api/biodiversity/capad/by-state/{state}      — Protected areas filtered by state
   GET /api/biodiversity/ibra                        — IBRA bioregions
   GET /api/biodiversity/ibra/{code}                 — Single IBRA region by code
   GET /api/biodiversity/counts                      — Real DB row counts for stat cards
   GET /api/biodiversity/risk-summary                — Risk summary for a supplier lat/lng
-
-Performance notes
------------------
-* /counts        — three COUNT queries run sequentially on the shared session.
-* /risk-summary  — four sub-queries run sequentially on the shared session.
-  A single AsyncSession is NOT safe to use concurrently (asyncio.gather on the
-  same session causes an InvalidRequestError / connection-provisioning race).
-* IBRA lookup    — single query ordered by ST_Distance; returns the containing
-                   region first (distance=0) and falls back to nearest without
-                   a second round-trip.
-* CAPAD count    — uses ST_DWithin on the real polygon geometry (geom) rather
-                   than a bounding-box centroid filter.  Falls back to bbox
-                   centroid filter when PostGIS is unavailable.
-* Species count  — count and names derived from the same CTE in a single
-                   round-trip.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -44,9 +30,7 @@ from schemas import SpeciesOut, KbaOut, CapadOut, IbraOut, SupplierRiskSummary
 
 router = APIRouter()
 
-# Default spatial buffer: ~50 km at Australian latitudes
 DEFAULT_BUFFER_DEG = 0.5
-# 0.5 degrees ≈ 55 km — used as the ST_DWithin metre radius too
 DEFAULT_BUFFER_METRES = 55_000
 
 STATE_ABBREV_MAP: dict[str, str] = {
@@ -65,9 +49,6 @@ def _resolve_state(raw: str) -> str:
     return STATE_ABBREV_MAP.get(raw.upper().strip(), raw)
 
 
-# ---------------------------------------------------------------------------
-# Quality filters applied to all species proximity / risk queries
-# ---------------------------------------------------------------------------
 SPECIES_QUALITY_FILTERS = [
     Species.occurrencestatus.ilike("present"),
     Species.is_obscured.is_(False),
@@ -166,6 +147,43 @@ async def list_capad(
     return result.scalars().all()
 
 
+@router.get("/biodiversity/capad/regions/by-bbox")
+async def capad_regions_by_bbox(
+    min_lat: float = Query(..., description="South boundary of bounding box"),
+    max_lat: float = Query(..., description="North boundary of bounding box"),
+    min_lng: float = Query(..., description="West boundary of bounding box"),
+    max_lng: float = Query(..., description="East boundary of bounding box"),
+    limit:   int   = Query(2000, ge=1, le=5000),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return CAPAD protected area polygons whose centroid falls within the
+    supplied bounding box. Uses latitude/longitude centroid columns for
+    compatibility with installations that may not have PostGIS geom index.
+
+    Ordered by area DESC so large regions paint first and smaller parks
+    render on top.
+    """
+    q = (
+        select(
+            Capad.id, Capad.pa_id, Capad.pa_name, Capad.pa_type,
+            Capad.pa_type_abbr, Capad.iucn_cat, Capad.state,
+            Capad.gis_area_ha, Capad.governance, Capad.authority,
+            Capad.epbc_trigger, Capad.geom_wkt,
+        )
+        .where(Capad.geom_wkt.isnot(None))
+        .where(Capad.is_active == True)  # noqa: E712
+        .where(Capad.latitude.isnot(None))
+        .where(Capad.longitude.isnot(None))
+        .where(Capad.latitude.between(min_lat, max_lat))
+        .where(Capad.longitude.between(min_lng, max_lng))
+        .order_by(Capad.gis_area_ha.desc())
+        .limit(limit)
+    )
+    rows = (await db.execute(q)).mappings().all()
+    return [dict(r) for r in rows]
+
+
 @router.get("/biodiversity/capad/regions")
 async def capad_regions(
     state:  Optional[str] = Query(None),
@@ -250,11 +268,6 @@ async def get_ibra_by_code(code: str, db: AsyncSession = Depends(get_db)):
 
 @router.get("/biodiversity/counts")
 async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
-    """
-    Return live row counts for stat cards.
-    Queries run sequentially on a single AsyncSession.
-    (asyncio.gather on one session causes an InvalidRequestError race.)
-    """
     capad_res   = await db.execute(
         select(func.count()).select_from(Capad).where(Capad.is_active == True)  # noqa: E712
     )
@@ -264,7 +277,6 @@ async def biodiversity_counts(db: AsyncSession = Depends(get_db)):
     species_res = await db.execute(
         select(func.count()).select_from(Species)
     )
-
     return {
         "capad_active":  capad_res.scalar()   or 0,
         "kba_total":     kba_res.scalar()     or 0,
@@ -283,21 +295,6 @@ async def risk_summary(
     buffer_deg:    float = Query(DEFAULT_BUFFER_DEG),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Compute a biodiversity risk summary for a supplier location.
-
-    Sub-queries run sequentially on a single AsyncSession to avoid the
-    InvalidRequestError that asyncio.gather causes when coroutines share
-    one session.
-
-    1. IBRA region  — single query ordered by ST_Distance (0 = containing
-                      polygon, > 0 = nearest fallback).
-    2. Species      — distinct threatened-species count + representative
-                      names from one CTE round-trip.
-    3. CAPAD count  — ST_DWithin on real polygon geometry; falls back to
-                      bbox centroid filter when PostGIS unavailable.
-    4. KBA count    — bbox centroid filter (KBA table has no polygon geom).
-    """
     min_lat = lat - buffer_deg
     max_lat = lat + buffer_deg
     min_lng = lng - buffer_deg
@@ -376,7 +373,6 @@ async def risk_summary(
         )
         capad_count = capad_res.scalar() or 0
     except Exception:
-        # Fallback: centroid bbox when PostGIS geography cast is unavailable
         capad_res = await db.execute(
             select(func.count()).select_from(Capad)
             .where(Capad.latitude.isnot(None))
