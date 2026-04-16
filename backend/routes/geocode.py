@@ -1,10 +1,10 @@
 """
 routes/geocode.py  —  POST /api/geocode
 
-Geocodes a supplier address using the Geoscape Address Lookup API,
+Geocodes a supplier address using the Geoscape Address Geocoder v2 API,
 backed by the official Australian G-NAF (Geocoded National Address File).
 
-API docs: https://docs.geoscape.com.au/docs/address-lookup
+API docs: https://docs.geoscape.com.au/docs/geocoder
 
 Request body
 ------------
@@ -27,13 +27,37 @@ Query priority inside the endpoint:
   4. State centroid / Australia centre  (last resort)
 
 Fallback chain:
-  Geoscape G-NAF  →  Nominatim OSM  →  state centroid  →  Australia centre
+  Geoscape G-NAF v2  →  Nominatim OSM  →  state centroid  →  Australia centre
 
 Environment variables
 ---------------------
-GEOSCAPE_API_KEY   Geoscape API key.  Free tier: 1,000 calls/month.
+GEOSCAPE_API_KEY   Geoscape API key (Bearer token).  Free tier: 1,000 calls/month.
                    Register at https://geoscape.com.au/geoscape-developer-centre/
                    If unset, falls back to Nominatim automatically.
+
+v2 API response shape (GeoJSON FeatureCollection):
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [lng, lat] },
+      "properties": {
+        "addressId": "GAACT717940975",
+        "formattedAddress": "113 CANBERRA AV, GRIFFITH ACT 2603",
+        "geoFeature": "FRONTAGE CENTRE SETBACK",
+        "stateTerritory": "ACT",
+        "postcode": "2603",
+        ...
+      },
+      "matchType": "Primary Address",
+      "matchQuality": "Exact",
+      "matchScore": 100
+    }
+  ],
+  "query": "...",
+  "parsedQuery": { ... }
+}
 """
 
 import logging
@@ -50,7 +74,7 @@ router = APIRouter()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-GEOSCAPE_BASE = "https://api.geoscape.com.au/v1/addresses"
+GEOSCAPE_BASE_V2 = "https://api.psma.com.au/v2/addresses/geocoder"
 
 STATE_CENTROIDS = {
     "NSW": (-32.1656, 147.0000),
@@ -63,6 +87,16 @@ STATE_CENTROIDS = {
     "NT":  (-19.4914, 132.5510),
 }
 AUS_CENTRE = (-25.2744, 133.7751)
+
+# geoFeature values that indicate property-level precision
+_PROPERTY_GEO_FEATURES = {
+    "PROPERTY CENTROID",
+    "FRONTAGE CENTRE SETBACK",
+    "BUILDING CENTROID",
+    "PARCEL",
+    "UNIT",
+    "LOCALITY",
+}
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -143,36 +177,62 @@ def _build_queries(body: GeocodeRequest) -> list[str]:
     return queries
 
 
-# ── Geoscape G-NAF lookup ─────────────────────────────────────────────────
+# ── Geoscape G-NAF v2 lookup ──────────────────────────────────────────────────
 
-async def _geoscape_lookup(
+def _resolution_from_geo_feature(geo_feature: str) -> str:
+    """
+    Map Geoscape v2 geoFeature string to internal resolution level.
+
+    facility  → property / building / frontage precision
+    regional  → street / suburb / postcode precision
+    state     → state-level
+    """
+    gf = geo_feature.upper()
+    if any(k in gf for k in ("PROPERTY", "BUILDING", "FRONTAGE", "PARCEL", "UNIT", "LOCALITY")):
+        return "facility"
+    if any(k in gf for k in ("STREET", "ROAD", "SUBURB", "POSTCODE", "TOWN")):
+        return "regional"
+    if "STATE" in gf:
+        return "state"
+    # Default to facility for any unrecognised feature type (GNAF is address-level)
+    return "facility"
+
+
+async def _geoscape_lookup_v2(
     client: httpx.AsyncClient,
     api_key: str,
     query: str,
 ) -> Optional[GeocodeResponse]:
     """
-    POST /v1/addresses?query=<canonical address>&maxResults=1
-    Authorization: apikey <key>
+    GET /v2/addresses/geocoder?query=<address>&maxResults=1
+    Authorization: Bearer <api_key>
+
+    Returns a GeoJSON FeatureCollection.  Coordinates are [lng, lat].
+    matchScore is 0-100; matchQuality is one of: Exact, High, Medium, Low.
     """
     try:
         resp = await client.get(
-            GEOSCAPE_BASE,
+            GEOSCAPE_BASE_V2,
             params={"query": query, "maxResults": 1},
-            headers={"Authorization": f"apikey {api_key}"},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/geo+json, application/json",
+                "Accept-Crs": "EPSG:4326",
+            },
             timeout=10,
         )
     except httpx.RequestError as exc:
-        logger.warning("[geocode] Geoscape request error: %s", exc)
+        logger.warning("[geocode] Geoscape v2 request error: %s", exc)
         return None
 
     if resp.status_code == 401:
-        logger.error("[geocode] Geoscape 401 Unauthorized — check GEOSCAPE_API_KEY")
+        logger.error("[geocode] Geoscape v2 401 Unauthorized — check GEOSCAPE_API_KEY")
         return None
     if resp.status_code == 429:
-        logger.warning("[geocode] Geoscape 429 rate-limited")
+        logger.warning("[geocode] Geoscape v2 429 rate-limited")
         return None
     if not resp.is_success:
-        logger.warning("[geocode] Geoscape HTTP %s for %r", resp.status_code, query)
+        logger.warning("[geocode] Geoscape v2 HTTP %s for %r", resp.status_code, query)
         return None
 
     try:
@@ -180,55 +240,50 @@ async def _geoscape_lookup(
     except Exception:
         return None
 
-    results = data.get("addressResults") or data.get("candidates") or []
-    if not results:
-        logger.info("[geocode] Geoscape: no result for %r", query)
+    features = data.get("features") or []
+    if not features:
+        logger.info("[geocode] Geoscape v2: no features for %r", query)
         return None
 
-    hit     = results[0]
-    addr    = hit.get("address", {})
-    geocode = hit.get("geocode", {})
+    feature     = features[0]
+    geometry    = feature.get("geometry") or {}
+    props       = feature.get("properties") or {}
+    coordinates = geometry.get("coordinates") or []   # [lng, lat]
 
-    lat = geocode.get("latitude")  or geocode.get("lat")
-    lng = geocode.get("longitude") or geocode.get("lon") or geocode.get("lng")
-
-    if lat is None or lng is None:
+    if len(coordinates) < 2:
         return None
 
-    geocode_type = (geocode.get("geocodeType") or geocode.get("type") or "").upper()
-    if any(k in geocode_type for k in ("PROPERTY", "BUILDING", "PARCEL", "FRONTAGE", "LOCALITY")):
-        level = "facility"
-    elif any(k in geocode_type for k in ("STREET", "ROAD")):
-        level = "regional"
-    elif any(k in geocode_type for k in ("SUBURB", "POSTCODE", "TOWN")):
-        level = "regional"
-    elif any(k in geocode_type for k in ("STATE",)):
-        level = "state"
-    else:
-        level = "facility"
+    lng, lat = float(coordinates[0]), float(coordinates[1])
 
-    display  = addr.get("formattedAddress") or addr.get("addressLine") or query
-    gnaf_pid = addr.get("gnafAddressDetailPid") or addr.get("gnafId") or ""
-    score    = int(min(hit.get("score") or hit.get("matchScore") or 95, 100))
+    geo_feature      = props.get("geoFeature") or ""
+    match_quality    = feature.get("matchQuality") or ""
+    match_score      = int(feature.get("matchScore") or 0)
+    formatted_addr   = props.get("formattedAddress") or query
+    gnaf_pid         = props.get("addressId") or props.get("jurisdictionId") or ""
+    resolution_level = _resolution_from_geo_feature(geo_feature)
+
+    # Boost confidence for Exact/High quality matches
+    quality_bonus = {"Exact": 5, "High": 0, "Medium": -10, "Low": -20}.get(match_quality, 0)
+    confidence = max(0, min(100, match_score + quality_bonus))
 
     logger.info(
-        "[geocode] G-NAF hit: %r → (%.5f, %.5f) type=%s pid=%s",
-        query, lat, lng, geocode_type, gnaf_pid,
+        "[geocode] G-NAF v2 hit: %r → (%.5f, %.5f) geoFeature=%r quality=%s score=%d pid=%s",
+        query, lat, lng, geo_feature, match_quality, match_score, gnaf_pid,
     )
 
     return GeocodeResponse(
-        lat              = float(lat),
-        lng              = float(lng),
+        lat              = lat,
+        lng              = lng,
         gnaf_pid         = str(gnaf_pid),
-        confidence       = score,
-        resolution_level = level,
-        inference_method = "gnaf",
-        display_address  = display,
+        confidence       = confidence,
+        resolution_level = resolution_level,
+        inference_method = "gnaf-v2",
+        display_address  = formatted_addr,
         source           = "geoscape",
     )
 
 
-# ── Nominatim fallback ────────────────────────────────────────────────────
+# ── Nominatim fallback ────────────────────────────────────────────────────────
 
 async def _nominatim_fallback(
     client: httpx.AsyncClient,
@@ -242,11 +297,11 @@ async def _nominatim_fallback(
         resp = await client.get(
             "https://nominatim.openstreetmap.org/search",
             params={
-                "q":             query,
-                "format":        "jsonv2",
-                "countrycodes":  "au",
+                "q":              query,
+                "format":         "jsonv2",
+                "countrycodes":   "au",
                 "addressdetails": "1",
-                "limit":         "1",
+                "limit":          "1",
             },
             headers={
                 "Accept-Language": "en-AU",
@@ -293,7 +348,7 @@ async def _nominatim_fallback(
 @router.post("/geocode", response_model=GeocodeResponse)
 async def geocode(body: GeocodeRequest) -> GeocodeResponse:
     """
-    Geocode a supplier address via G-NAF (primary) → Nominatim (fallback)
+    Geocode a supplier address via G-NAF v2 (primary) → Nominatim (fallback)
     → state centroid → Australia centre.
 
     All query strings are built in canonical form:
@@ -316,13 +371,13 @@ async def geocode(body: GeocodeRequest) -> GeocodeResponse:
 
     async with httpx.AsyncClient() as client:
 
-        # ─ Primary: Geoscape G-NAF ────────────────────────────────────────
+        # ─ Primary: Geoscape G-NAF v2 ────────────────────────────────────
         if api_key:
             for q in queries:
-                result = await _geoscape_lookup(client, api_key, q)
+                result = await _geoscape_lookup_v2(client, api_key, q)
                 if result:
                     return result
-            logger.info("[geocode] G-NAF exhausted all queries — falling back to Nominatim")
+            logger.info("[geocode] G-NAF v2 exhausted all queries — falling back to Nominatim")
         else:
             logger.warning(
                 "[geocode] GEOSCAPE_API_KEY not set — Nominatim fallback active. "
