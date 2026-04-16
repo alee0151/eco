@@ -24,6 +24,7 @@ from database import check_db_connection, DATABASE_URL
 from routes.extract      import router as extract_router
 from routes.suppliers    import router as suppliers_router
 from routes.biodiversity import router as biodiversity_router
+from routes.enrich       import router as enrich_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,12 +47,23 @@ async def lifespan(app: FastAPI):
         )
         # App still starts so /api/health can report the failure;
         # individual routes handle the OperationalError gracefully.
+
+    import os
+    if os.getenv("ABR_GUID", "").strip():
+        logger.info("[startup] ✅ ABR_GUID configured — /api/enrich is live")
+    else:
+        logger.warning(
+            "[startup] ⚠️  ABR_GUID not set — /api/enrich will return 503. "
+            "Register at https://www.abr.business.gov.au/Tools/WebServices "
+            "and add ABR_GUID=<your-guid> to backend/.env"
+        )
+
     yield  # application is now running
 
 
 app = FastAPI(
     title="eco API",
-    version="0.3.0",
+    version="0.4.0",
     description="Supply Chain Biodiversity Risk Assessment API",
     lifespan=lifespan,
 )
@@ -85,22 +97,27 @@ app.add_middleware(
 app.include_router(extract_router,      prefix="/api")
 app.include_router(suppliers_router,    prefix="/api")
 app.include_router(biodiversity_router, prefix="/api")
+app.include_router(enrich_router,       prefix="/api")
 
 
 @app.get("/api/health")
 async def health():
     """Returns API status + live database reachability check."""
+    import os
     db_ok, db_err = await check_db_connection()
     safe_url = DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL
     return {
         "status": "ok",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "database": {
             "connected": db_ok,
             "host": safe_url,
             **({
                 "error": db_err
             } if not db_ok else {}),
+        },
+        "abr": {
+            "configured": bool(os.getenv("ABR_GUID", "").strip()),
         },
     }
 
