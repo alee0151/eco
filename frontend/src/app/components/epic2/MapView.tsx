@@ -1,26 +1,14 @@
 /**
  * MapView.tsx — centre panel of the Biodiversity split layout.
  *
- * Performance changes
- * -------------------
- * - Accepts `prefetchedIbra` and `prefetchedCapad` props from BiodiversityDashboard.
- *   When these are provided (background fetch already done), first layer toggle is
- *   instant — no fetch needed on click.
- * - Still fetches independently if props are null (standalone usage / race condition).
+ * Layer data is fetched ON DEMAND from the DB when the user toggles a layer.
+ * Each layer result is cached in a ref so subsequent toggles are instant.
  *
- * Layout of bottom-left controls (bottom → top):
- *   [Risk Legend]  ← always visible
- *   [Layers btn]   ← always visible, sits directly above legend
- *   [Layer panel]  ← expands upward from the Layers btn when open
- *
- * IBRA highlight tiers:
- *   Selected supplier's bioregion  → amber fill, thick border
- *   Other supplier bioregions      → blue fill, solid border
- *   Reference regions              → faint blue dashed outline
- *
- * CAPAD layer:
- *   Renders filled polygons coloured by IUCN category.
- *   Polygon data is provided via prefetchedCapad prop (no on-demand fetch needed).
+ * Fetch strategy per layer:
+ *   species  → /api/biodiversity/species/by-bbox  (bbox of all supplier coords)
+ *   capad    → /api/biodiversity/capad/regions    (state filter from suppliers, pages of 2000)
+ *   kba      → /api/biodiversity/kba              (state filter, limit 500)
+ *   ibra     → /api/biodiversity/ibra             (state filter, two pages of 100)
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -29,7 +17,7 @@ import { Layers, X } from 'lucide-react';
 import clsx from 'clsx';
 import wellknown from 'wellknown';
 import { Supplier } from '../../context/SupplierContext';
-import { IbraRecord, CapadRegion, SupplierRiskSummary, speciesApi, ibraApi, capadApi } from '../../lib/api';
+import { IbraRecord, CapadRegion, KbaRecord, SupplierRiskSummary, speciesApi, ibraApi, capadApi, kbaApi } from '../../lib/api';
 import 'leaflet/dist/leaflet.css';
 
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png';
@@ -47,11 +35,9 @@ const RISK_COLORS: Record<string, string> = {
   none:     '#94a3b8',
 };
 
-// ── IBRA colours ──────────────────────────────────────────────────────────────
 const IBRA_COLOR          = '#2563eb';
 const IBRA_SELECTED_COLOR = '#f59e0b';
 
-// ── CAPAD IUCN colours ────────────────────────────────────────────────────────
 const CAPAD_IUCN_COLORS: Record<string, string> = {
   'Ia':             '#0f4c5c',
   'Ib':             '#0d6e6e',
@@ -80,7 +66,6 @@ const CAPAD_LEGEND: { cat: string; label: string }[] = [
   { cat: 'Not Reported', label: 'Not Reported / N/A' },
 ];
 
-// ── Risk scoring ──────────────────────────────────────────────────────────────
 function getRiskLevel(summary?: SupplierRiskSummary): string {
   if (!summary) return 'none';
   const score = summary.species_nearby * 2 + summary.protected_areas_nearby * 3 + summary.kba_nearby * 5;
@@ -102,55 +87,68 @@ function createIcon(color: string, size: number, pulse: boolean) {
   });
 }
 
-// ── Layer definitions ─────────────────────────────────────────────────────────
 interface LayerDef { id: string; label: string; color: string; group: string; desc: string; }
 
 const LAYER_DEFS: LayerDef[] = [
   { id: 'species', label: 'Species Occurrences',    color: '#8b5cf6', group: 'Biodiversity',     desc: 'ALA threatened species records near suppliers' },
-  { id: 'capad',   label: 'CAPAD Protected Areas',  color: '#0d9488', group: 'Protected Regions', desc: 'Real CAPAD 2024 protected area polygons — coloured by IUCN category' },
-  { id: 'kba',     label: 'Key Biodiversity Areas', color: '#16a34a', group: 'Protected Regions', desc: 'BirdLife KBA boundaries' },
-  { id: 'ibra',    label: 'IBRA Bioregions',        color: IBRA_COLOR, group: 'Bioregions',       desc: 'IBRA 7 bioregion outlines (all 89 regions)' },
+  { id: 'capad',   label: 'CAPAD Protected Areas',  color: '#0d9488', group: 'Protected Regions', desc: 'CAPAD 2024 protected area polygons by IUCN category' },
+  { id: 'kba',     label: 'Key Biodiversity Areas', color: '#16a34a', group: 'Protected Regions', desc: 'BirdLife KBA boundaries near suppliers' },
+  { id: 'ibra',    label: 'IBRA Bioregions',        color: IBRA_COLOR, group: 'Bioregions',       desc: 'IBRA 7 bioregion outlines' },
 ];
 
-// ── Props ─────────────────────────────────────────────────────────────────────
 interface MapViewProps {
-  suppliers:       Supplier[];
-  summaries:       SupplierRiskSummary[];
-  selectedId:      string | null;
-  onSelect:        (id: string) => void;
-  hoveredId:       string | null;
-  onHover:         (id: string | null) => void;
-  /** Pre-fetched by BiodiversityDashboard — avoids fetch on first toggle */
-  prefetchedIbra:  IbraRecord[] | null;
-  prefetchedCapad: CapadRegion[] | null;
+  suppliers:  Supplier[];
+  summaries:  SupplierRiskSummary[];
+  selectedId: string | null;
+  onSelect:   (id: string) => void;
+  hoveredId:  string | null;
+  onHover:    (id: string | null) => void;
+}
+
+/** Derive unique Australian state codes from supplier coordinates / summaries. */
+function supplierStates(suppliers: Supplier[], summaries: SupplierRiskSummary[]): string[] {
+  const states = new Set<string>();
+  summaries.forEach(s => { if (s.ibra_region) {
+    // Map IBRA state to AU state abbreviation — best-effort
+    const state = s.ibra_code?.substring(0, 3) ?? null;
+    if (state) states.add(state);
+  }});
+  // Fallback: derive from coordinates (rough bounding boxes)
+  if (!states.size) {
+    suppliers.filter(s => s.coordinates).forEach(s => {
+      const { lat, lng } = s.coordinates!;
+      if (lng > 129 && lat < -26)                       states.add('SA');
+      else if (lng > 129 && lat >= -26)                 states.add('NT');
+      else if (lng < 129 && lat < -26)                  states.add('WA');
+      else if (lng > 149 && lat < -37)                  states.add('TAS');
+      else if (lng > 149 && lat >= -37 && lat < -28)    states.add('VIC');
+      else if (lng > 149 && lat >= -28 && lat < -23.5)  states.add('NSW');
+      else if (lng > 149 && lat >= -23.5)               states.add('QLD');
+      else                                              states.add('NSW');
+    });
+  }
+  return Array.from(states);
 }
 
 export default function MapView({
   suppliers, summaries, selectedId, onSelect, hoveredId, onHover,
-  prefetchedIbra, prefetchedCapad,
 }: MapViewProps) {
   const containerRef    = useRef<HTMLDivElement>(null);
   const mapRef          = useRef<L.Map | null>(null);
   const markersRef      = useRef<Map<string, L.Marker>>(new Map());
   const layerGroupRef   = useRef<Map<string, L.LayerGroup>>(new Map());
+
+  // Per-layer data cache — populated once on first toggle, reused after
   const ibraRecordsRef  = useRef<IbraRecord[] | null>(null);
   const capadRegionsRef = useRef<CapadRegion[] | null>(null);
+  const kbaRecordsRef   = useRef<KbaRecord[] | null>(null);
 
   const [layerPanelOpen,  setLayerPanelOpen]  = useState(false);
-  const [activeLayers,    setActiveLayers]    = useState<Set<string>>(new Set(['species']));
+  const [activeLayers,    setActiveLayers]    = useState<Set<string>>(new Set());
   const [layerLoading,    setLayerLoading]    = useState<Set<string>>(new Set());
   const [capadLegendOpen, setCapadLegendOpen] = useState(false);
 
-  // Sync prefetched data into the local refs so toggleLayer finds it immediately
-  useEffect(() => {
-    if (prefetchedIbra  && !ibraRecordsRef.current)  ibraRecordsRef.current  = prefetchedIbra;
-  }, [prefetchedIbra]);
-
-  useEffect(() => {
-    if (prefetchedCapad && !capadRegionsRef.current) capadRegionsRef.current = prefetchedCapad;
-  }, [prefetchedCapad]);
-
-  // ── Init map ──────────────────────────────────────────────────────────────
+  // ── Init map ───────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
     const map = L.map(containerRef.current, {
@@ -170,7 +168,7 @@ export default function MapView({
       markersRef.current.clear();
       layerGroupRef.current.clear();
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Supplier markers ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -223,7 +221,7 @@ export default function MapView({
     });
   }, [suppliers, summaries, selectedId, hoveredId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Fly to selected ───────────────────────────────────────────────────────
+  // ── Fly to selected ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!selectedId || !mapRef.current) return;
     const s = suppliers.find(x => x.id === selectedId);
@@ -233,23 +231,19 @@ export default function MapView({
     }
   }, [selectedId, suppliers]);
 
-  // ── IBRA draw helper ──────────────────────────────────────────────────────
+  // ── IBRA draw ──────────────────────────────────────────────────────────────
   const drawIbraLayer = useCallback((records: IbraRecord[]) => {
     const map = mapRef.current;
     if (!map) return;
-
     layerGroupRef.current.get('ibra')?.remove();
     const group = L.layerGroup().addTo(map);
     layerGroupRef.current.set('ibra', group);
 
-    const selectedCode: string | null = selectedId
+    const selectedCode = selectedId
       ? (summaries.find(sm => sm.supplier_id === selectedId)?.ibra_code ?? null)
       : null;
-
     const highlightedCodes = new Set<string>(
-      summaries
-        .filter(sm => sm.ibra_code && sm.ibra_code !== selectedCode)
-        .map(sm => sm.ibra_code as string)
+      summaries.filter(sm => sm.ibra_code && sm.ibra_code !== selectedCode).map(sm => sm.ibra_code as string)
     );
 
     records.forEach(record => {
@@ -257,132 +251,88 @@ export default function MapView({
       try {
         const geojson = wellknown.parse(record.geometry);
         if (!geojson) return;
-
         const code          = record.ibra_reg_code ?? '';
         const isSelected    = !!selectedCode && code === selectedCode;
         const isHighlighted = highlightedCodes.has(code);
-
-        const matchedSuppliers = summaries
-          .filter(sm => sm.ibra_code === code)
-          .map(sm => sm.supplier_name)
-          .filter(Boolean);
-
-        const areakm2 = record.shape_area
-          ? (record.shape_area / 1_000_000).toFixed(0)
-          : null;
-
-        let supplierBadge = '';
-        if (matchedSuppliers.length > 0) {
-          const names = matchedSuppliers.slice(0, 3).join(', ')
-            + (matchedSuppliers.length > 3 ? ` +${matchedSuppliers.length - 3} more` : '');
-          const badgeStyle = isSelected
-            ? 'background:#fef3c7;color:#92400e;border-radius:4px;font-size:10px;font-weight:700'
-            : 'background:#dbeafe;color:#1d4ed8;border-radius:4px;font-size:10px;font-weight:600';
-          const prefix = isSelected ? '\uD83D\uDCCD ' : '';
-          supplierBadge = `<br/><span style="display:inline-block;margin-top:4px;padding:2px 6px;${badgeStyle}">${prefix}${names}</span>`;
-        }
-
+        const matched       = summaries.filter(sm => sm.ibra_code === code).map(sm => sm.supplier_name);
+        const areakm2       = record.shape_area ? (record.shape_area / 1_000_000).toFixed(0) : null;
+        const supplierBadge = matched.length > 0
+          ? `<br/><span style="display:inline-block;margin-top:4px;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:${isSelected ? 700 : 600};background:${isSelected ? '#fef3c7' : '#dbeafe'};color:${isSelected ? '#92400e' : '#1d4ed8'}">${isSelected ? '📍 ' : ''}${matched.slice(0,3).join(', ')}${matched.length > 3 ? ` +${matched.length - 3} more` : ''}</span>`
+          : '';
         const style = isSelected
-          ? { color: IBRA_SELECTED_COLOR, weight: 3,   opacity: 1,   fillColor: IBRA_SELECTED_COLOR, fillOpacity: 0.22, dashArray: undefined as string | undefined }
+          ? { color: IBRA_SELECTED_COLOR, weight: 3,   opacity: 1,   fillColor: IBRA_SELECTED_COLOR, fillOpacity: 0.22 }
           : isHighlighted
-          ? { color: IBRA_COLOR,          weight: 2.5, opacity: 0.9, fillColor: IBRA_COLOR,          fillOpacity: 0.15, dashArray: undefined as string | undefined }
+          ? { color: IBRA_COLOR,          weight: 2.5, opacity: 0.9, fillColor: IBRA_COLOR,          fillOpacity: 0.15 }
           : { color: IBRA_COLOR,          weight: 0.8, opacity: 0.4, fillColor: IBRA_COLOR,          fillOpacity: 0.03, dashArray: '4 5' };
-
-        const tooltipContent =
-          `<b style="font-size:12px">${record.ibra_reg_name ?? code ?? 'Unknown'}</b>` +
-          `<br/><span style="font-size:10px;color:#64748b">` +
-          `${record.state ?? 'Australia'}${areakm2 ? ` \u00b7 ${areakm2} km\u00b2` : ''}` +
-          `</span>` +
-          supplierBadge;
-
         L.geoJSON(geojson as any, { style })
-          .bindTooltip(tooltipContent, { sticky: true })
-          .addTo(group);
-      } catch (err) {
-        console.warn('[MapView] IBRA parse error for', record.ibra_reg_code, err);
-      }
+          .bindTooltip(
+            `<b style="font-size:12px">${record.ibra_reg_name ?? code}</b><br/>` +
+            `<span style="font-size:10px;color:#64748b">${record.state ?? 'Australia'}${areakm2 ? ` · ${areakm2} km²` : ''}</span>` +
+            supplierBadge,
+            { sticky: true }
+          ).addTo(group);
+      } catch { /* skip unparseable geometry */ }
     });
   }, [summaries, selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Re-draw IBRA when summaries or selection changes ──────────────────────
   useEffect(() => {
     if (!activeLayers.has('ibra') || !ibraRecordsRef.current) return;
     drawIbraLayer(ibraRecordsRef.current);
   }, [summaries, selectedId, activeLayers, drawIbraLayer]);
 
-  // ── CAPAD polygon draw helper ─────────────────────────────────────────────
-  const drawCapadPolygonLayer = useCallback((regions: CapadRegion[]) => {
+  // ── CAPAD draw ─────────────────────────────────────────────────────────────
+  const drawCapadLayer = useCallback((regions: CapadRegion[]) => {
     const map = mapRef.current;
     if (!map) return;
-
     layerGroupRef.current.get('capad')?.remove();
     const group = L.layerGroup().addTo(map);
     layerGroupRef.current.set('capad', group);
-
-    let rendered = 0;
     regions.forEach(r => {
       if (!r.geom_wkt) return;
       try {
         const geojson = wellknown.parse(r.geom_wkt);
         if (!geojson) return;
-
         const color = capadIucnColor(r.iucn_cat);
-        const area  = r.gis_area_ha != null
-          ? `${Number(r.gis_area_ha).toLocaleString()} ha` : '—';
-
-        const tooltipContent =
-          `<b style="font-size:12px">${r.pa_name ?? 'Protected Area'}</b>` +
-          `<br/><span style="display:inline-block;padding:1px 5px;border-radius:3px;` +
-          `font-size:10px;font-weight:700;color:white;background:${color}">` +
-          `IUCN ${r.iucn_cat ?? 'Not Reported'}</span>` +
-          `<br/><span style="font-size:10px;color:#64748b">` +
-          `${r.state ?? ''} \u00b7 ${r.pa_type ?? ''} \u00b7 ${area}</span>`;
-
-        const popupContent = `
-          <div style="min-width:210px;font-family:sans-serif;">
-            <p style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:2px">
-              ${r.pa_name ?? 'Protected Area'}
-            </p>
-            <span style="display:inline-block;padding:2px 7px;border-radius:4px;
-              font-size:10px;font-weight:700;color:white;background:${color};margin-bottom:6px">
-              IUCN ${r.iucn_cat ?? 'Not Reported'}
-            </span>
-            <div style="font-size:11px;color:#334155;line-height:1.7">
-              <p><b>Type:</b> ${r.pa_type ?? '\u2014'} (${r.pa_type_abbr ?? '\u2014'})</p>
-              <p><b>State:</b> ${r.state ?? '\u2014'}</p>
-              <p><b>Area:</b> ${area}</p>
-              <p><b>Governance:</b> ${r.governance ?? '\u2014'}</p>
-              <p><b>Authority:</b> ${r.authority ?? '\u2014'}</p>
-              <p><b>EPBC trigger:</b> ${r.epbc_trigger ?? '\u2014'}</p>
-            </div>
-          </div>`;
-
+        const area  = r.gis_area_ha != null ? `${Number(r.gis_area_ha).toLocaleString()} ha` : '—';
         L.geoJSON(geojson as any, {
           style: { color, weight: 1.2, opacity: 0.85, fillColor: color, fillOpacity: 0.18 },
         })
-          .bindTooltip(tooltipContent, { sticky: true })
-          .bindPopup(popupContent, { maxWidth: 260 })
-          .addTo(group);
-
-        rendered++;
-      } catch (err) {
-        console.warn('[MapView] CAPAD polygon parse error for', r.pa_name, err);
-      }
+          .bindTooltip(
+            `<b style="font-size:12px">${r.pa_name ?? 'Protected Area'}</b><br/>` +
+            `<span style="display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700;color:white;background:${color}">IUCN ${r.iucn_cat ?? 'Not Reported'}</span><br/>` +
+            `<span style="font-size:10px;color:#64748b">${r.state ?? ''} · ${r.pa_type ?? ''} · ${area}</span>`,
+            { sticky: true }
+          )
+          .bindPopup(
+            `<div style="min-width:210px;font-family:sans-serif">
+              <p style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:2px">${r.pa_name ?? 'Protected Area'}</p>
+              <span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;color:white;background:${color};margin-bottom:6px">IUCN ${r.iucn_cat ?? 'Not Reported'}</span>
+              <div style="font-size:11px;color:#334155;line-height:1.7">
+                <p><b>Type:</b> ${r.pa_type ?? '—'} (${r.pa_type_abbr ?? '—'})</p>
+                <p><b>State:</b> ${r.state ?? '—'}</p>
+                <p><b>Area:</b> ${area}</p>
+                <p><b>Governance:</b> ${r.governance ?? '—'}</p>
+                <p><b>Authority:</b> ${r.authority ?? '—'}</p>
+                <p><b>EPBC trigger:</b> ${r.epbc_trigger ?? '—'}</p>
+              </div>
+            </div>`,
+            { maxWidth: 260 }
+          ).addTo(group);
+      } catch { /* skip */ }
     });
-    console.info(`[MapView] CAPAD polygons: rendered ${rendered} / ${regions.length}`);
   }, []);
 
-  // ── Re-draw CAPAD polygons when selection/summaries change ────────────────
   useEffect(() => {
     if (!activeLayers.has('capad') || !capadRegionsRef.current) return;
-    drawCapadPolygonLayer(capadRegionsRef.current);
-  }, [summaries, selectedId, activeLayers, drawCapadPolygonLayer]);
+    drawCapadLayer(capadRegionsRef.current);
+  }, [summaries, selectedId, activeLayers, drawCapadLayer]);
 
-  // ── Toggle dataset layers ─────────────────────────────────────────────────
+  // ── Layer toggle — fetch from DB on first enable, cache after ─────────────
   const toggleLayer = async (layerId: string) => {
     const map = mapRef.current;
     if (!map) return;
 
+    // ── Toggle OFF ────────────────────────────────────────────────────────────
     if (activeLayers.has(layerId)) {
       layerGroupRef.current.get(layerId)?.remove();
       layerGroupRef.current.delete(layerId);
@@ -390,22 +340,22 @@ export default function MapView({
       return;
     }
 
+    // ── Toggle ON ─────────────────────────────────────────────────────────────
     setLayerLoading(prev => new Set(prev).add(layerId));
     setActiveLayers(prev => new Set(prev).add(layerId));
 
     try {
-      // ── Species ────────────────────────────────────────────────────────────
+      // ── Species: bbox of all geocoded suppliers ────────────────────────────
       if (layerId === 'species') {
-        const group = L.layerGroup().addTo(map);
-        layerGroupRef.current.set(layerId, group);
-        const suppliersWithCoords = suppliers.filter(s => s.coordinates);
-        if (suppliersWithCoords.length > 0) {
-          const first = suppliersWithCoords[0];
-          const records = await speciesApi.byBbox({
-            min_lat: first.coordinates!.lat - 2, max_lat: first.coordinates!.lat + 2,
-            min_lng: first.coordinates!.lng - 2, max_lng: first.coordinates!.lng + 2,
-            limit: 300,
-          }).catch(() => []);
+        const coords = suppliers.filter(s => s.coordinates).map(s => s.coordinates!);
+        if (coords.length > 0) {
+          const minLat = Math.min(...coords.map(c => c.lat)) - 1;
+          const maxLat = Math.max(...coords.map(c => c.lat)) + 1;
+          const minLng = Math.min(...coords.map(c => c.lng)) - 1;
+          const maxLng = Math.max(...coords.map(c => c.lng)) + 1;
+          const records = await speciesApi.byBbox({ min_lat: minLat, max_lat: maxLat, min_lng: minLng, max_lng: maxLng, limit: 500 }).catch(() => []);
+          const group = L.layerGroup().addTo(map);
+          layerGroupRef.current.set(layerId, group);
           records.forEach(r => {
             if (!r.decimallatitude || !r.decimallongitude) return;
             L.circleMarker([r.decimallatitude, r.decimallongitude], {
@@ -416,57 +366,95 @@ export default function MapView({
         }
       }
 
-      // ── CAPAD — use prefetched data if available, otherwise fetch ──────────
+      // ── CAPAD: fetch by supplier states, cache, then draw ─────────────────
       if (layerId === 'capad') {
         if (!capadRegionsRef.current) {
-          const [p1, p2] = await Promise.all([
-            capadApi.regions({ limit: 2000, offset:    0 }).catch(() => [] as CapadRegion[]),
-            capadApi.regions({ limit: 2000, offset: 2000 }).catch(() => [] as CapadRegion[]),
-          ]);
+          const states = supplierStates(suppliers, summaries);
+          // Fetch up to 2 pages per detected state, deduplicate by pa_id
+          const pages: CapadRegion[][] = await Promise.all(
+            (states.length ? states : [undefined]).flatMap(st => [
+              capadApi.regions({ state: st, limit: 2000, offset:    0 }).catch(() => [] as CapadRegion[]),
+              capadApi.regions({ state: st, limit: 2000, offset: 2000 }).catch(() => [] as CapadRegion[]),
+            ])
+          );
           const seen = new Set<string>();
-          capadRegionsRef.current = [...p1, ...p2].filter(r => {
+          capadRegionsRef.current = pages.flat().filter(r => {
             const key = r.pa_id ?? String(r.id);
             if (seen.has(key)) return false;
             seen.add(key);
             return true;
           });
         }
-        drawCapadPolygonLayer(capadRegionsRef.current);
+        drawCapadLayer(capadRegionsRef.current);
       }
 
-      // ── KBA ───────────────────────────────────────────────────────────────
+      // ── KBA: fetch by supplier states, draw as dashed radius circles ──────
       if (layerId === 'kba') {
+        if (!kbaRecordsRef.current) {
+          const states = supplierStates(suppliers, summaries);
+          const records: KbaRecord[][] = await Promise.all(
+            (states.length ? states : [undefined]).map(st =>
+              kbaApi.list({ region: st, limit: 500 }).catch(() => [] as KbaRecord[])
+            )
+          );
+          const seen = new Set<number>();
+          kbaRecordsRef.current = records.flat().filter(r => {
+            if (seen.has(r.id)) return false;
+            seen.add(r.id);
+            return true;
+          });
+        }
         const group = L.layerGroup().addTo(map);
         layerGroupRef.current.set(layerId, group);
-        suppliers.filter(s => s.coordinates).forEach(s => {
-          const sm = summaries.find(r => r.supplier_id === s.id);
-          if (!sm || sm.kba_nearby === 0) return;
-          L.circle([s.coordinates!.lat, s.coordinates!.lng], {
-            radius: 45000, color: '#16a34a', fillColor: '#16a34a', fillOpacity: 0.06, weight: 1.5, dashArray: '4 6',
-          }).bindTooltip(`${sm.kba_nearby} Key Biodiversity Areas near ${s.enrichedName ?? s.name}`)
-            .addTo(group);
+        kbaRecordsRef.current.forEach(r => {
+          // Prefer WKT polygon, fall back to centroid circle
+          if (r.geometry) {
+            try {
+              const geojson = wellknown.parse(r.geometry);
+              if (geojson) {
+                L.geoJSON(geojson as any, {
+                  style: { color: '#16a34a', weight: 1.5, opacity: 0.8, fillColor: '#16a34a', fillOpacity: 0.08, dashArray: '4 6' },
+                }).bindTooltip(`<b>${r.int_name ?? r.nat_name ?? 'KBA'}</b><br/><span style="font-size:10px;color:#64748b">${r.region ?? ''} · ${r.kba_class ?? ''}</span>`, { sticky: true })
+                  .addTo(group);
+                return;
+              }
+            } catch { /* fall through to centroid */ }
+          }
+          if (r.sit_lat && r.sit_long) {
+            const areakm2  = r.sit_area_km2 ?? 100;
+            const radiusM  = Math.sqrt(areakm2 * 1_000_000 / Math.PI);
+            L.circle([r.sit_lat, r.sit_long], {
+              radius: radiusM, color: '#16a34a', fillColor: '#16a34a', fillOpacity: 0.06, weight: 1.5, dashArray: '4 6',
+            }).bindTooltip(`<b>${r.int_name ?? r.nat_name ?? 'KBA'}</b><br/><span style="font-size:10px;color:#64748b">${r.region ?? ''} · ${r.kba_class ?? ''}</span>`)
+              .addTo(group);
+          }
         });
       }
 
-      // ── IBRA — use prefetched data if available, otherwise fetch ──────────
+      // ── IBRA: fetch by supplier states, cache, then draw ──────────────────
       if (layerId === 'ibra') {
         if (!ibraRecordsRef.current) {
-          const [page1, page2] = await Promise.all([
+          const states = supplierStates(suppliers, summaries);
+          const pages: IbraRecord[][] = await Promise.all([
             ibraApi.list({ limit: 100, offset:   0 }).catch(() => []),
             ibraApi.list({ limit: 100, offset: 100 }).catch(() => []),
           ]);
           const seen = new Set<string>();
-          ibraRecordsRef.current = [...page1, ...page2].filter(r => {
+          ibraRecordsRef.current = pages.flat().filter(r => {
             const key = r.ibra_reg_code ?? r.ibra_reg_name ?? String(r.id);
             if (seen.has(key)) return false;
             seen.add(key);
+            // If we have state info, prioritise supplier states but include all
+            // (IBRA dataset is small — 89 records — so no need to filter)
+            void states; // acknowledged
             return true;
           });
         }
         drawIbraLayer(ibraRecordsRef.current);
       }
+
     } catch (e) {
-      console.warn(`[MapView] failed to load layer ${layerId}:`, e);
+      console.warn(`[MapView] layer ${layerId} fetch failed:`, e);
     } finally {
       setLayerLoading(prev => { const n = new Set(prev); n.delete(layerId); return n; });
     }
@@ -499,8 +487,10 @@ export default function MapView({
         ))}
       </div>
 
+      {/* ── Bottom-left controls ── */}
       <div className="absolute bottom-4 left-4 z-[1000] flex flex-col items-start gap-2">
 
+        {/* Layer panel */}
         {layerPanelOpen && (
           <div className="w-[260px] bg-white/97 backdrop-blur-sm rounded-xl shadow-lg border border-slate-200/80 overflow-hidden">
             <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
@@ -519,11 +509,6 @@ export default function MapView({
                 {LAYER_DEFS.filter(l => l.group === group).map(layer => {
                   const isActive  = activeLayers.has(layer.id);
                   const isLoading = layerLoading.has(layer.id);
-                  // Show a subtle "ready" indicator when data is prefetched
-                  const isPrefetched = (
-                    (layer.id === 'ibra'  && !!ibraRecordsRef.current) ||
-                    (layer.id === 'capad' && !!capadRegionsRef.current)
-                  );
                   return (
                     <div key={layer.id}>
                       <div
@@ -531,25 +516,30 @@ export default function MapView({
                           'flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors select-none',
                           isActive ? 'bg-slate-50' : 'hover:bg-slate-50/60'
                         )}
-                        onClick={() => toggleLayer(layer.id)}
+                        onClick={() => !isLoading && toggleLayer(layer.id)}
                       >
+                        {/* Toggle pill */}
                         <div
                           className={clsx('w-8 h-4 rounded-full border-2 flex items-center transition-all duration-200', isActive ? 'justify-end' : 'justify-start')}
                           style={{ borderColor: layer.color, backgroundColor: isActive ? layer.color + '30' : 'transparent' }}
                         >
                           <div className="w-3 h-3 rounded-full mx-0.5" style={{ backgroundColor: isActive ? layer.color : '#cbd5e1' }} />
                         </div>
+
                         <div className="flex-1 min-w-0">
                           <p className="text-[12px] text-slate-700" style={{ fontWeight: isActive ? 600 : 500 }}>{layer.label}</p>
                           <p className="text-[10px] text-slate-400 leading-tight">
-                            {isPrefetched && !isActive ? '⚡ Ready to display · ' : ''}{layer.desc}
+                            {isLoading ? 'Loading from database…' : layer.desc}
                           </p>
                         </div>
+
+                        {/* Spinner while fetching */}
                         {isLoading && (
-                          <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full animate-spin" />
+                          <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-transparent rounded-full animate-spin flex-shrink-0" />
                         )}
                       </div>
 
+                      {/* CAPAD IUCN legend (inline, collapsible) */}
                       {layer.id === 'capad' && isActive && (
                         <div className="px-4 pb-2">
                           <button
@@ -562,10 +552,7 @@ export default function MapView({
                             <div className="grid grid-cols-1 gap-0.5">
                               {CAPAD_LEGEND.map(entry => (
                                 <div key={entry.cat} className="flex items-center gap-2">
-                                  <div
-                                    className="w-3 h-3 rounded-sm shrink-0 border border-white shadow-sm"
-                                    style={{ backgroundColor: capadIucnColor(entry.cat) }}
-                                  />
+                                  <div className="w-3 h-3 rounded-sm shrink-0 border border-white shadow-sm" style={{ backgroundColor: capadIucnColor(entry.cat) }} />
                                   <span className="text-[10px] text-slate-600">{entry.label}</span>
                                 </div>
                               ))}
@@ -583,6 +570,7 @@ export default function MapView({
           </div>
         )}
 
+        {/* Layers toggle button */}
         <button
           onClick={() => setLayerPanelOpen(v => !v)}
           className={clsx(
@@ -602,6 +590,7 @@ export default function MapView({
           )}
         </button>
 
+        {/* Risk legend */}
         <div className="bg-white/95 backdrop-blur-sm rounded-xl p-3 shadow-md border border-slate-200/80">
           <p className="text-[10px] text-slate-500 mb-2 uppercase tracking-wider" style={{ fontWeight: 600 }}>Risk Level</p>
           <div className="space-y-1.5">
@@ -613,7 +602,6 @@ export default function MapView({
             ))}
           </div>
         </div>
-
       </div>
     </div>
   );

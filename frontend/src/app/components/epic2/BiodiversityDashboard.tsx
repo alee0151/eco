@@ -6,20 +6,9 @@
  *   CENTRE — MapView       (real geocoded coords, layer toggles)
  *   RIGHT  — RiskProfile   (risk summary OR approved-supplier detail)
  *
- * Performance design
- * ------------------
- * 1. DB counts + IBRA/CAPAD layer data are prefetched in the background as
- *    soon as the component mounts — no user action required.
- * 2. Risk summaries are computed in a CONCURRENCY-LIMITED queue (3 at a time)
- *    so the backend is not hammered with N simultaneous requests.
- * 3. Supplier cards are ALWAYS visible. A slim banner indicates loading
- *    without replacing the supplier list.
- * 4. Approved supplier data is shown immediately in both SupplierList and
- *    RiskProfile while geocoding / risk computation is still pending.
- * 5. computeRisk watches geocodedCount (not suppliers.length) so it
- *    re-fires whenever coordinates land on an existing supplier.
- * 6. Risk summaries are UPSERTED into state one-by-one as each API call
- *    resolves — never batch-replaced — so cards never disappear mid-run.
+ * Layer data is fetched ON DEMAND inside MapView when the user toggles a
+ * layer — no background prefetch here. MapView caches each layer so
+ * subsequent toggles are instant.
  */
 
 import { useState, useEffect, useRef } from 'react';
@@ -27,7 +16,7 @@ import { Download, List, Map as MapIcon, RefreshCw, Loader2 } from 'lucide-react
 import { motion, AnimatePresence } from 'motion/react';
 import clsx from 'clsx';
 import { useSuppliers } from '../../context/SupplierContext';
-import { riskApi, ibraApi, capadApi, SupplierRiskSummary, IbraRecord, CapadRegion } from '../../lib/api';
+import { riskApi, SupplierRiskSummary } from '../../lib/api';
 import SupplierList from './SupplierList';
 import MapView from './MapView';
 import RiskProfile from './RiskProfile';
@@ -44,10 +33,6 @@ function riskLevel(s: SupplierRiskSummary): 'critical' | 'high' | 'medium' | 'lo
   return 'low';
 }
 
-/**
- * Run async tasks with a maximum concurrency of `limit`.
- * Prevents slamming the backend with N simultaneous risk-summary requests.
- */
 async function pMap<T, R>(
   items: T[],
   fn: (item: T) => Promise<R>,
@@ -65,12 +50,6 @@ async function pMap<T, R>(
   return results;
 }
 
-/**
- * Upsert a single risk summary into the summaries array.
- * Updates in-place if supplier_id already exists, otherwise appends.
- * Used by computeRisk to stream results in one-by-one so cards are
- * never removed while the batch is still resolving.
- */
 function upsertSummary(
   prev: SupplierRiskSummary[],
   result: SupplierRiskSummary,
@@ -92,83 +71,36 @@ export default function BiodiversityDashboard() {
   const [countsLoading, setCountsLoading] = useState(true);
   const [riskLoading, setRiskLoading]     = useState(false);
 
-  // Prefetched layer data — passed to MapView so first toggle is instant
-  const [prefetchedIbra,  setPrefetchedIbra]  = useState<IbraRecord[] | null>(null);
-  const [prefetchedCapad, setPrefetchedCapad] = useState<CapadRegion[] | null>(null);
-
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hoveredId,  setHoveredId]  = useState<string | null>(null);
   const [mobileTab,  setMobileTab]  = useState<'map' | 'list'>('list');
 
-  // Track whether a prefetch has started so we don't double-fire
   const prefetchStarted = useRef(false);
+  const currentRunId    = useRef(0);
 
-  // Monotonically-incrementing run ID — lets us discard results from a
-  // stale run if a newer computeRisk() fires before the old one finishes.
-  const currentRunId = useRef(0);
-
-  // ── Background prefetch: counts + layer datasets ──────────────────────
+  // ── Counts only — small, fast ─────────────────────────────────────────────
   useEffect(() => {
     if (prefetchStarted.current) return;
     prefetchStarted.current = true;
-
-    // Counts — small, fetch immediately
     setCountsLoading(true);
     fetch(`${BASE}/api/biodiversity/counts`)
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then((d: DbCounts) => setDbCounts(d))
       .catch(() => setDbCounts(null))
       .finally(() => setCountsLoading(false));
+  }, []);
 
-    // IBRA regions — all 89 regions, two pages of 100
-    Promise.all([
-      ibraApi.list({ limit: 100, offset:   0 }).catch(() => [] as IbraRecord[]),
-      ibraApi.list({ limit: 100, offset: 100 }).catch(() => [] as IbraRecord[]),
-    ]).then(([p1, p2]) => {
-      const seen = new Set<string>();
-      setPrefetchedIbra([...p1, ...p2].filter(r => {
-        const key = r.ibra_reg_code ?? r.ibra_reg_name ?? String(r.id);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      }));
-    }).catch(() => {/* non-fatal */});
-
-    // CAPAD regions — two pages of 2000 each
-    Promise.all([
-      capadApi.regions({ limit: 2000, offset:    0 }).catch(() => [] as CapadRegion[]),
-      capadApi.regions({ limit: 2000, offset: 2000 }).catch(() => [] as CapadRegion[]),
-    ]).then(([p1, p2]) => {
-      const seen = new Set<string>();
-      setPrefetchedCapad([...p1, ...p2].filter(r => {
-        const key = r.pa_id ?? String(r.id);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      }));
-    }).catch(() => {/* non-fatal */});
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Compute risk summaries (concurrency-limited, streaming upsert) ────
-  //
-  // KEY FIX: results are upserted into state one-by-one as each individual
-  // API call resolves, rather than batch-replacing the entire summaries array
-  // at the end. This means existing cards are NEVER removed — they are only
-  // updated in place — so there is no 1-second disappearance window between
-  // the start of a new run and the final setSummaries() call.
+  // ── Risk summaries ────────────────────────────────────────────────────────
   const computeRisk = async () => {
     const runId = ++currentRunId.current;
     setRiskLoading(true);
-
     const candidates = suppliers.filter(
       s => s.coordinates && (
         s.status === 'approved' || s.status === 'validated' ||
         s.isValidated || s.status === 'pending'
       )
     );
-
     if (!candidates.length) { setRiskLoading(false); return; }
-
     await pMap(
       candidates,
       async s => {
@@ -178,34 +110,23 @@ export default function BiodiversityDashboard() {
           lat:           s.coordinates!.lat,
           lng:           s.coordinates!.lng,
         }).catch(() => null);
-
-        // Discard result if a newer run has already started
         if (result && runId === currentRunId.current) {
           setSummaries(prev => upsertSummary(prev, result));
         }
-
         return result;
       },
       3,
     );
-
-    // Only clear the loading flag if this run is still the current one
     if (runId === currentRunId.current) setRiskLoading(false);
   };
 
-  // Re-fire computeRisk whenever:
-  //   (a) a new supplier is added (suppliers.length changes), OR
-  //   (b) coordinates land on an existing supplier (geocodedCount changes).
-  // Watching geocodedCount instead of only suppliers.length ensures the
-  // risk queue runs even when geocoding resolves without adding new rows.
   const geocodedCount = suppliers.filter(s => !!s.coordinates).length;
-
   useEffect(() => {
     if (geocodedCount > 0) computeRisk();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geocodedCount, suppliers.length]);
 
-  // ── CSV export ────────────────────────────────────────────────────────
+  // ── CSV export ────────────────────────────────────────────────────────────
   const handleExport = () => {
     if (!summaries.length) return;
     const header = ['Supplier ID','Name','Lat','Lng','IBRA Region','Risk Level',
@@ -228,7 +149,6 @@ export default function BiodiversityDashboard() {
     URL.revokeObjectURL(url);
   };
 
-  // ── Derived stats ──────────────────────────────────────────────────────
   const criticalCount = summaries.filter(s => riskLevel(s) === 'critical').length;
   const assessedCount = summaries.length;
 
@@ -247,7 +167,6 @@ export default function BiodiversityDashboard() {
         </div>
 
         <div className="flex items-center gap-3">
-          {/* Stat pills */}
           <div className="hidden md:flex items-center gap-2">
             {countsLoading
               ? <span className="h-6 w-36 rounded-full bg-slate-100 animate-pulse block" />
@@ -305,12 +224,10 @@ export default function BiodiversityDashboard() {
       {/* ── Three-panel split ── */}
       <div className="flex-1 flex gap-4 min-h-0">
 
-        {/* LEFT — Supplier list (always visible) */}
         <div className={clsx(
           'md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm w-[280px] shrink-0 min-h-0 overflow-hidden',
           mobileTab === 'list' ? 'flex' : 'hidden md:flex'
         )}>
-          {/* Slim loading banner — above cards, doesn't replace them */}
           <AnimatePresence>
             {riskLoading && (
               <motion.div
@@ -327,8 +244,6 @@ export default function BiodiversityDashboard() {
               </motion.div>
             )}
           </AnimatePresence>
-
-          {/* Supplier list — always rendered */}
           <SupplierList
             suppliers={suppliers}
             summaries={summaries}
@@ -340,7 +255,6 @@ export default function BiodiversityDashboard() {
           />
         </div>
 
-        {/* CENTRE — Map (receives prefetched layer data) */}
         <div className={clsx(
           'md:flex flex-col rounded-2xl overflow-hidden border border-slate-200 shadow-sm flex-1 min-h-0',
           mobileTab === 'map' ? 'flex' : 'hidden md:flex'
@@ -352,12 +266,9 @@ export default function BiodiversityDashboard() {
             onSelect={setSelectedId}
             hoveredId={hoveredId}
             onHover={setHoveredId}
-            prefetchedIbra={prefetchedIbra}
-            prefetchedCapad={prefetchedCapad}
           />
         </div>
 
-        {/* RIGHT — Risk profile (or approved supplier detail) */}
         <div className="hidden md:flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm w-[320px] shrink-0 min-h-0 overflow-hidden">
           <RiskProfile
             supplier={selectedSupplier}
