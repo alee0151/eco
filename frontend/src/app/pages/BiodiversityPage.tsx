@@ -1,5 +1,5 @@
 import { useNavigate } from "react-router";
- import { Upload } from "lucide-react";
+import { Upload } from "lucide-react";
 import BiodiversityDashboard from "../components/epic2/BiodiversityDashboard";
 import { useSuppliers } from "../context/SupplierContext";
 
