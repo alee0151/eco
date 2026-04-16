@@ -3,36 +3,36 @@ POST /api/extract
 
 Accepts a multipart upload of a PDF or image file.
 
-OCR  : Tesseract (pytesseract) — free, runs 100 % locally.
-LLM  : HuggingFace Inference Router — free tier, no credits required.
-        Uses: https://router.huggingface.co/hf-inference/models/{model}/v1/chat/completions
-        Set HF_TOKEN in backend/.env  (get one at https://huggingface.co/settings/tokens)
+Pipeline
+--------
+  1. Validate file type & size.
+  2. Run Tesseract OCR  →  raw text.
+  3. PRIMARY:  Send OCR text to HuggingFace Inference Router (generative LLM)
+               Model: Qwen/Qwen2.5-7B-Instruct  (or HF_MODEL env override)
+               Produces structured JSON with name, abn, address, commodity.
+  4. FALLBACK: For any field that the LLM returns as empty or with confidence < 0.5,
+               run extractive QA using deepset/roberta-base-squad2.
+               This model extracts exact text spans — no hallucination.
+  5. Validate ABN checksum (ATO algorithm).
+  6. Sanitise address  →  "suburb state postcode" only.
+  7. Return ExtractResult.
+
+OCR  : Tesseract (pytesseract) — runs 100% locally.
+LLM  : HuggingFace Inference Router — free tier.
+        Set HF_TOKEN in backend/.env  (https://huggingface.co/settings/tokens)
         Set HF_MODEL  in backend/.env  (default: Qwen/Qwen2.5-7B-Instruct)
-
-Why Qwen2.5-7B-Instruct?
-  ✓ Generative model — produces free-form JSON output
-  ✓ Strong instruction following and structured output
-  ✓ Reliably available on HF free inference router
-  ✓ No credits required
-
-NOTE: Do NOT use extractive QA models (e.g. roberta-base-squad2, bert-*).
-      Those models only extract text spans — they cannot generate JSON.
+QA   : deepset/roberta-base-squad2 via huggingface_hub InferenceClient.
+        Same HF_TOKEN is reused — no extra credentials needed.
 
 Address extraction scope
 ------------------------
 Only suburb, state abbreviation, and postcode are extracted.
 Format: "<suburb> <state> <postcode>"  e.g. "Keperra QLD 4054"
-No street name, no street number, no unit, no country.
 
 Environment variables
 ---------------------
-HF_TOKEN   Required. HuggingFace token (read access is enough).
-           Free tier: https://huggingface.co/settings/tokens
+HF_TOKEN   Required.
 HF_MODEL   Generative model repo (default: Qwen/Qwen2.5-7B-Instruct)
-           Other confirmed working free options:
-             microsoft/Phi-3-mini-4k-instruct
-             HuggingFaceH4/zephyr-7b-beta
-             meta-llama/Llama-3.1-8B-Instruct
 """
 
 import io
@@ -45,12 +45,16 @@ import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
+from hf_supply_chain_qa import extract_supplier_entities
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Default: generative model on HF free inference router
-DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_MODEL  = "Qwen/Qwen2.5-7B-Instruct"
 HF_ROUTER_BASE = "https://router.huggingface.co/hf-inference/models"
+
+# Confidence threshold below which roberta fallback is triggered
+ROBERTA_FALLBACK_THRESHOLD = 0.5
 
 
 # ── Response schema ───────────────────────────────────────────────────────────
@@ -70,6 +74,7 @@ class ExtractResult(BaseModel):
     commodity: str = ""
     confidence: FieldConfidence = FieldConfidence()
     warnings:  list[str] = []
+    extraction_method: dict = {}   # records which model filled each field
 
 
 # ── OCR — Tesseract only ──────────────────────────────────────────────────────
@@ -150,68 +155,26 @@ The SUPPLIER'S location in THIS EXACT FORMAT:
 
 EXACT FORMAT RULES — read every rule carefully:
   RULE 1:  Output ONLY suburb, state abbreviation, and postcode.
-  RULE 2:  Do NOT include the street name (e.g. NOT "Collins Street Melbourne VIC 3000").
-  RULE 3:  Do NOT include the street number (e.g. NOT "441 Melbourne VIC 3000").
+  RULE 2:  Do NOT include the street name.
+  RULE 3:  Do NOT include the street number.
   RULE 4:  Do NOT include unit, suite, level, floor, or lot numbers.
-  RULE 5:  Do NOT include the country name "Australia" or "AU".
+  RULE 5:  Do NOT include the country name.
   RULE 6:  Do NOT include a comma anywhere in the address field.
   RULE 7:  State MUST be a standard abbreviation: NSW VIC QLD WA SA TAS ACT NT
   RULE 8:  Postcode MUST be exactly 4 digits.
-  RULE 9:  If only state + postcode are visible (no suburb), return "<state> <postcode>".
+  RULE 9:  If only state + postcode are visible, return "<state> <postcode>".
   RULE 10: If nothing identifiable is found, return empty string "".
-
-HOW TO FIND THE CORRECT ADDRESS (supplier's OWN address only):
-  PRIORITY 1 — Address with label: "From:", "Supplier Address:", "Our Address:",
-                "Business Address:", "Registered Address:",
-                "Principal Place of Business:"
-  PRIORITY 2 — Address printed directly below or beside the supplier name or ABN.
-  PRIORITY 3 — Address in the document header or letterhead.
-  ALWAYS IGNORE addresses with labels: "To:", "Bill To:", "Ship To:",
-                "Deliver To:", "Remittance Address:", "Customer Address:",
-                "Attention:", "Consignee:"
-
-CORRECT EXAMPLES — study these carefully:
-  Full address in document:  "Unit 3, 441 St Kilda Road, Melbourne VIC 3004"
-  Correct address field:     "Melbourne VIC 3004"
-
-  Full address in document:  "42 Settlement Road, Keperra QLD 4054, Australia"
-  Correct address field:     "Keperra QLD 4054"
-
-  Full address in document:  "Level 5, 123 Collins Street, Melbourne VIC 3000"
-  Correct address field:     "Melbourne VIC 3000"
-
-  Full address in document:  "113 Canberra Ave Griffith ACT 2603"
-  Correct address field:     "Griffith ACT 2603"
-
-  Full address in document:  "Snowy Hydro Limited, Cooma NSW 2630"
-  Correct address field:     "Cooma NSW 2630"
-
-  Full address in document:  "PO Box 332, Cooma NSW 2630"
-  Correct address field:     "Cooma NSW 2630"  (use suburb/state/postcode; add PO Box warning)
-
-  Only postcode + state visible: "NSW 2630"
-  Correct address field:     "NSW 2630"
-
-  Buyer address is "Sydney NSW 2000", supplier address is "Keperra QLD 4054":
-  Correct address field:     "Keperra QLD 4054"  (supplier only, never the buyer)
-
-WRONG EXAMPLES — never produce these:
-  ✗ "441 St Kilda Road Melbourne VIC 3004"  (contains street name and number)
-  ✗ "Melbourne VIC 3004, Australia"          (contains country)
-  ✗ "Unit 3, Melbourne VIC 3004"             (contains unit number and comma)
-  ✗ "Collins Street Melbourne VIC 3000"      (contains street name)
 
 ════════════════════════════════════════════════════════
 FIELD 4 — commodity
 ════════════════════════════════════════════════════════
 The primary product or service supplied.
 Use a short noun phrase of 1–4 words.
-Examples: "Timber", "Seafood", "Grain", "Steel", "Electrical Components",
-          "Hydro Power", "Construction Materials", "Fresh Produce".
+Examples: "Timber", "Seafood", "Grain", "Steel", "Electrical Components".
 
 HARD RULES:
-  ✗ Do NOT describe the document type (e.g. NOT "Invoice", NOT "Purchase Order").
-  ✗ Do NOT return a vague term like "Goods" or "Services" unless no better term exists.
+  ✗ Do NOT describe the document type.
+  ✗ Do NOT return vague terms like "Goods" or "Services" unless no better term exists.
 
 ════════════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -232,18 +195,9 @@ Return ONLY valid JSON — no prose, no markdown fences, no explanation:
 }}
 
 CONFIDENCE SCORING:
-  name      1.0 = clearly labelled supplier name
-            0.5 = inferred from context
-            0.0 = not found
-  abn       1.0 = 11 digits found near supplier name
-            0.5 = 11 digits found but association uncertain
-            0.0 = not found
-  address   1.0 = suburb + state + postcode all present
-            0.5 = state + postcode only (no suburb)
-            0.0 = not found
-  commodity 1.0 = explicitly named product/commodity
-            0.5 = inferred from context
-            0.0 = not found
+  name/commodity  1.0 = clearly labelled  |  0.5 = inferred  |  0.0 = not found
+  abn             1.0 = 11 digits near supplier  |  0.5 = uncertain  |  0.0 = not found
+  address         1.0 = suburb+state+postcode  |  0.5 = state+postcode  |  0.0 = not found
 
 WARNINGS — add a warning string for each of these situations:
   "Address is a PO Box — used suburb/state/postcode only"
@@ -258,7 +212,6 @@ WARNINGS — add a warning string for each of these situations:
 GENERAL RULES:
   • If a field cannot be found, use empty string "".
   • Do NOT invent or guess data that is not present in the text.
-  • Do NOT copy the buyer’s data into any field.
 
 OCR TEXT:
 ---
@@ -267,17 +220,12 @@ OCR TEXT:
 """
 
 
-# ── LLM call — HuggingFace Inference Router ─────────────────────────────────────
+# ── LLM call — HuggingFace Inference Router ────────────────────────────────────
 
 def run_llm(ocr_text: str) -> dict:
     """
     Send OCR text to the HuggingFace Inference Router and return parsed JSON.
-
-    URL pattern (same as the HF snippet example):
-      https://router.huggingface.co/hf-inference/models/{model}/v1/chat/completions
-
-    Uses a FREE HF read token — no payment required.
-    Model MUST be a generative/instruction-tuned LLM (not extractive QA like roberta).
+    Model must be a generative/instruction-tuned LLM (not extractive QA like roberta).
     """
     api_key = os.getenv("HF_TOKEN", "").strip()
     if not api_key:
@@ -311,51 +259,24 @@ def run_llm(ocr_text: str) -> dict:
         raise HTTPException(status_code=503, detail=f"Cannot reach HuggingFace router: {exc}")
 
     if resp.status_code == 401:
-        raise HTTPException(
-            status_code=401,
-            detail="HuggingFace authentication failed — check HF_TOKEN in backend/.env",
-        )
+        raise HTTPException(status_code=401, detail="HuggingFace authentication failed — check HF_TOKEN.")
     if resp.status_code == 404:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Model '{model}' not found on HF router. "
-                "Use a generative instruction model e.g. Qwen/Qwen2.5-7B-Instruct"
-            ),
-        )
+        raise HTTPException(status_code=404, detail=f"Model '{model}' not found on HF router.")
     if resp.status_code == 429:
-        raise HTTPException(
-            status_code=429,
-            detail="HuggingFace free tier rate limit hit — please retry in a moment.",
-        )
+        raise HTTPException(status_code=429, detail="HuggingFace free tier rate limit — retry in a moment.")
     if resp.status_code == 503:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Model '{model}' is loading on HuggingFace (cold start). "
-                "Wait 20–60 seconds and retry."
-            ),
-        )
+        raise HTTPException(status_code=503, detail=f"Model '{model}' is loading (cold start) — retry in 20–60s.")
     if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"HuggingFace router error {resp.status_code}: {resp.text[:300]}",
-        )
+        raise HTTPException(status_code=502, detail=f"HuggingFace router error {resp.status_code}: {resp.text[:300]}")
 
     try:
         data = resp.json()
         raw  = data["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, ValueError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Unexpected HuggingFace response shape: {exc} — {resp.text[:300]}",
-        )
+        raise HTTPException(status_code=502, detail=f"Unexpected HuggingFace response shape: {exc}")
 
-    # Strip markdown code fences if model wraps output
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$",       "", raw).strip()
-
-    # Some models echo the prompt — extract the first { ... } block
     json_match = re.search(r"(\{.*\})", raw, re.DOTALL)
     if json_match:
         raw = json_match.group(1)
@@ -364,10 +285,66 @@ def run_llm(ocr_text: str) -> dict:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         logger.error("HF non-JSON response: %s", raw[:500])
-        raise HTTPException(
-            status_code=502,
-            detail=f"HuggingFace model returned unparseable JSON: {exc}",
-        )
+        raise HTTPException(status_code=502, detail=f"HuggingFace model returned unparseable JSON: {exc}")
+
+
+# ── Roberta QA fallback ───────────────────────────────────────────────────────
+
+def apply_roberta_fallback(
+    llm_result: dict,
+    conf_raw: dict,
+    ocr_text: str,
+    extraction_method: dict,
+) -> tuple[dict, dict, dict]:
+    """
+    For any field that the LLM left empty or returned with confidence < threshold,
+    run deepset/roberta-base-squad2 on the raw OCR text and fill the gap.
+
+    Returns updated (llm_result, conf_raw, extraction_method).
+    """
+    fields_to_check = ["name", "abn", "address", "commodity"]
+    needs_fallback  = [
+        f for f in fields_to_check
+        if not str(llm_result.get(f, "")).strip()
+        or float(conf_raw.get(f, 0)) < ROBERTA_FALLBACK_THRESHOLD
+    ]
+
+    if not needs_fallback:
+        for f in fields_to_check:
+            extraction_method[f] = "llm"
+        return llm_result, conf_raw, extraction_method
+
+    logger.info(
+        "[extract] roberta fallback triggered for fields: %s",
+        needs_fallback,
+    )
+
+    roberta_results = extract_supplier_entities(ocr_text)
+
+    for field in fields_to_check:
+        if field in needs_fallback:
+            rb = roberta_results.get(field, {})
+            rb_answer = str(rb.get("answer", "")).strip()
+            rb_score  = float(rb.get("score",  0.0))
+
+            current_val  = str(llm_result.get(field, "")).strip()
+            current_conf = float(conf_raw.get(field, 0.0))
+
+            # Use roberta answer if it has a higher score or the LLM returned nothing
+            if rb_answer and (not current_val or rb_score > current_conf):
+                llm_result[field] = rb_answer
+                conf_raw[field]   = rb_score
+                extraction_method[field] = "roberta-base-squad2"
+                logger.info(
+                    "[extract] roberta filled field='%s' answer=%r score=%.3f",
+                    field, rb_answer, rb_score,
+                )
+            else:
+                extraction_method[field] = "llm"
+        else:
+            extraction_method[field] = "llm"
+
+    return llm_result, conf_raw, extraction_method
 
 
 # ── ABN validation (ATO checksum) ────────────────────────────────────────────
@@ -389,23 +366,19 @@ def _validate_abn(abn: str) -> list[str]:
     return warnings
 
 
-# ── Address post-processing ────────────────────────────────────────────────────────
+# ── Address post-processing ───────────────────────────────────────────────────
 
 _AU_STATES = {"NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT"}
 
 _STATE_POSTCODE_RE = re.compile(
-    r"\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\s+(\d{4})\b",
-    re.IGNORECASE,
+    r"\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\s+(\d{4})\b", re.IGNORECASE
 )
-
-_PO_BOX_RE = re.compile(r"\bP\.?\s*O\.?\s*Box\b", re.IGNORECASE)
-
-_BUYER_LABEL_RE = re.compile(
+_PO_BOX_RE       = re.compile(r"\bP\.?\s*O\.?\s*Box\b", re.IGNORECASE)
+_BUYER_LABEL_RE  = re.compile(
     r"^(bill\s+to|ship\s+to|deliver\s+to|delivery\s+address"
     r"|remittance|customer|attention|attn|consignee)",
     re.IGNORECASE,
 )
-
 _STREET_POLLUTION_RE = re.compile(
     r"(^\d+[A-Za-z]?\s)"
     r"|(\b(street|st|road|rd|avenue|ave|drive|dr"
@@ -418,7 +391,6 @@ _STREET_POLLUTION_RE = re.compile(
 
 def _sanitise_address(address: str, existing_warnings: list[str]) -> tuple[str, list[str], float]:
     warnings = list(existing_warnings)
-
     if not address:
         return "", warnings, 0.0
 
@@ -480,14 +452,15 @@ async def extract(
     file: UploadFile = File(..., description="PDF or image of a supplier document"),
 ) -> ExtractResult:
     """
-    Pipeline:
+    Full extraction pipeline:
       1. Validate file type & size.
       2. Run Tesseract OCR  →  raw text.
-      3. Send to HF router (Qwen2.5-7B-Instruct)  →  structured JSON.
-         address = "suburb state postcode" only.
-      4. Validate ABN checksum.
-      5. Sanitise address.
-      6. Return ExtractResult.
+      3. PRIMARY:  Qwen2.5-7B-Instruct (generative)  →  structured JSON.
+      4. FALLBACK: deepset/roberta-base-squad2 (extractive QA) fills any
+                   empty or low-confidence fields from the LLM.
+      5. Validate ABN checksum.
+      6. Sanitise address  →  suburb state postcode.
+      7. Return ExtractResult (includes extraction_method per field).
     """
     ct = (file.content_type or "").lower()
     if file.filename and file.filename.lower().endswith(".pdf"):
@@ -504,6 +477,7 @@ async def extract(
     if len(file_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit.")
 
+    # ── Step 1: OCR ────────────────────────────────────────────────────────────
     ocr_text = run_ocr(file_bytes, ct)
     logger.debug("OCR produced %d chars for '%s'", len(ocr_text), file.filename)
 
@@ -515,16 +489,24 @@ async def extract(
             ]
         )
 
-    raw = run_llm(ocr_text)
+    # ── Step 2: Primary LLM extraction ────────────────────────────────────────
+    raw      = run_llm(ocr_text)
+    conf_raw = dict(raw.get("confidence", {}))
+    warnings = list(raw.get("warnings",   []))
+    extraction_method: dict = {}
 
-    conf_raw  = raw.get("confidence", {})
-    warnings  = list(raw.get("warnings", []))
+    # ── Step 3: Roberta fallback for empty / low-confidence fields ─────────────
+    raw, conf_raw, extraction_method = apply_roberta_fallback(
+        raw, conf_raw, ocr_text, extraction_method
+    )
+
+    # ── Step 4: ABN validation ─────────────────────────────────────────────────
     abn_value = str(raw.get("abn", "")).strip()
-    llm_addr  = str(raw.get("address", "")).strip()
-
     if abn_value:
         warnings.extend(_validate_abn(abn_value))
 
+    # ── Step 5: Address sanitisation ──────────────────────────────────────────
+    llm_addr      = str(raw.get("address", "")).strip()
     llm_addr_conf = float(conf_raw.get("address", 0))
     cleaned_addr, warnings, addr_conf_floor = _sanitise_address(llm_addr, warnings)
     final_addr_conf = max(llm_addr_conf, addr_conf_floor) if cleaned_addr else 0.0
@@ -540,12 +522,14 @@ async def extract(
             address   = round(final_addr_conf, 2),
             commodity = float(conf_raw.get("commodity", 0)),
         ),
-        warnings = warnings,
+        warnings          = warnings,
+        extraction_method = extraction_method,
     )
 
     logger.info(
-        "extract: file=%s name=%r abn=%r address=%r addr_conf=%.2f warnings=%d",
+        "extract: file=%s name=%r abn=%r address=%r addr_conf=%.2f method=%s warnings=%d",
         file.filename, result.name, result.abn,
-        result.address, result.confidence.address, len(warnings),
+        result.address, result.confidence.address,
+        extraction_method, len(warnings),
     )
     return result
